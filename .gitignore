@@ -1,0 +1,18 @@
+dist/
+node_modules/
+*.tsbuildinfo
+
+# Real config and token cache hold a chat allowlist and a live refresh token.
+# Only the .example files belong in git.
+teams-mcp.config.json
+.token-cache.json
+*.token-cache.json
+
+# npm pack output
+*.tgz
+
+# Real credentials live here - never in git.
+.env
+
+# get_chat_attachment smoke-test downloads
+downloads/

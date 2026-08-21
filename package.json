@@ -1,0 +1,46 @@
+{
+  "name": "teams-assistant-mcp",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Stdio MCP server that lets a Claude Code agent read and post in a fixed allowlist of Microsoft Teams group chats.",
+  "license": "MIT",
+  "author": "Agentic Delivery",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Agentic-Delivery/teams-assistant-mcp.git"
+  },
+  "bin": {
+    "teams-assistant-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "teams-mcp.config.example.json",
+    "env.example"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "lint": "oxlint src scripts",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "probe": "tsx src/probe.ts",
+    "discover-chats": "tsx scripts/discover-chats.ts",
+    "install-local": "npm run build && tsx scripts/install-local.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "oxlint": "^1.75.0",
+    "tsx": "^4.20.6",
+    "typescript": "~6.0.2",
+    "vitest": "^4.1.10"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

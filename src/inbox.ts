@@ -1,0 +1,212 @@
+import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { dirname } from 'node:path';
+import type { ChatAllowlist } from './allowlist.js';
+import type { TeamsChatsPort } from './graph/teams-chats.js';
+
+/**
+ * Background inbox poller. Runs inside the MCP server process and appends every new message from
+ * the allowlisted chats to a JSONL file at a stable path, so an orchestrator can arm a file
+ * watcher once and stop reinventing a polling daemon per session.
+ *
+ * One line per message: {"chat","id","from","at","text","attachments"} — the shape the old
+ * scratchpad daemon wrote, kept so existing consumers keep parsing. A failed poll appends
+ * {"error","at"} instead, because a watcher must be able to tell auth death from a quiet chat.
+ */
+
+export interface SignedInAccount {
+  id?: string;
+  displayName?: string;
+}
+
+export interface InboxPollerDeps {
+  chats: Pick<TeamsChatsPort, 'readMessages'>;
+  allowlist: ChatAllowlist;
+  /**
+   * Resolves who the server is signed in as. The assistant's own posts must not come back as
+   * inbox events, or every send would wake the orchestrator to read its own words.
+   */
+  self: () => Promise<SignedInAccount>;
+  inboxPath: string;
+  statePath: string;
+  pollMs?: number;
+  maxBackoffMs?: number;
+  log?: (line: string) => void;
+}
+
+interface ChatState {
+  /** ISO-8601 createdDateTime of the newest delivered message; exclusive, like read watermarks. */
+  watermark: string;
+  /** Id of that newest message, so an exact replay is dropped even if the port re-serves it. */
+  lastId?: string;
+}
+
+export const DEFAULT_POLL_MS = 30_000;
+export const DEFAULT_MAX_BACKOFF_MS = 600_000;
+
+export class InboxPoller {
+  private readonly pollMs: number;
+  private readonly maxBackoffMs: number;
+  private readonly log: (line: string) => void;
+  private state: Record<string, ChatState> | undefined;
+  private me: SignedInAccount | undefined;
+  private timer: NodeJS.Timeout | undefined;
+  private backoffMs: number;
+  private lastErrorSignature: string | undefined;
+
+  constructor(private readonly deps: InboxPollerDeps) {
+    this.pollMs = deps.pollMs ?? DEFAULT_POLL_MS;
+    this.maxBackoffMs = deps.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
+    this.log = deps.log ?? (() => {});
+    this.backoffMs = this.pollMs;
+  }
+
+  /**
+   * The timers are unref'd: the poller must never be the thing keeping the process alive after
+   * the MCP client hangs up, or every session leaks a server.
+   */
+  start(): void {
+    if (this.timer) {
+      return;
+    }
+    const run = (): void => {
+      void this.pollOnce().then((clean) => {
+        // Same backoff the standalone daemon used: double the wait while failing, capped, and
+        // snap back to the normal interval on the first clean poll.
+        const delay = clean ? this.pollMs : this.backoffMs;
+        this.backoffMs = clean ? this.pollMs : Math.min(this.backoffMs * 2, this.maxBackoffMs);
+        this.timer = setTimeout(run, delay);
+        this.timer.unref();
+      });
+    };
+    this.timer = setTimeout(run, 0);
+    this.timer.unref();
+  }
+
+  stop(): void {
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = undefined;
+    }
+  }
+
+  /**
+   * One poll over every allowlisted chat. Never throws — a poller that can take down the MCP
+   * server is worse than no poller.
+   *
+   * Returns false only when the whole poll failed (auth death, network gone), which is what
+   * start() backs off on. A single failing chat — typically one the account is not a member of
+   * yet — must not slow down the healthy ones, so it is surfaced but does not count.
+   */
+  async pollOnce(): Promise<boolean> {
+    try {
+      await mkdir(dirname(this.deps.inboxPath), { recursive: true });
+      this.state ??= await this.loadState();
+      // Without knowing who "self" is, delivered messages could include the assistant's own
+      // posts, so a failed /me fails the whole poll rather than delivering wrongly.
+      this.me ??= await this.deps.self();
+
+      const failures: string[] = [];
+      const lines: string[] = [];
+
+      for (const entry of this.deps.allowlist.entries()) {
+        const known = this.state[entry.id];
+        try {
+          const result = await this.deps.chats.readMessages(entry.id, known?.watermark);
+          for (const message of result.messages) {
+            if (message.id === known?.lastId) {
+              continue;
+            }
+            if (this.isSelf(message.fromId, message.from)) {
+              continue;
+            }
+            if (message.isDeleted || (!message.text.trim() && message.attachments.length === 0)) {
+              continue;
+            }
+            lines.push(
+              JSON.stringify({
+                chat: entry.id,
+                id: message.id,
+                from: message.from,
+                at: message.createdDateTime,
+                text: message.text.slice(0, 2000),
+                attachments: message.attachments.length,
+              }),
+            );
+          }
+          const newest = result.messages.at(-1);
+          if (result.watermark) {
+            this.state[entry.id] = {
+              watermark: result.watermark,
+              ...(newest?.id ? { lastId: newest.id } : {}),
+            };
+          }
+        } catch (error) {
+          // One unreachable chat must not blank out the poll for the others.
+          failures.push(
+            `${entry.label}: ` + (error instanceof Error ? error.message : String(error)),
+          );
+        }
+      }
+
+      if (lines.length > 0) {
+        await appendFile(this.deps.inboxPath, lines.map((line) => `${line}\n`).join(''));
+      }
+      await this.saveState();
+
+      if (failures.length > 0) {
+        await this.reportFailure(failures.join(' | '));
+        return failures.length < this.deps.allowlist.entries().length;
+      }
+      this.lastErrorSignature = undefined;
+      return true;
+    } catch (error) {
+      await this.reportFailure(error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  }
+
+  private isSelf(fromId: string | undefined, from: string): boolean {
+    if (this.me?.id !== undefined && fromId === this.me.id) {
+      return true;
+    }
+    return this.me?.displayName !== undefined && from === this.me.displayName;
+  }
+
+  private async loadState(): Promise<Record<string, ChatState>> {
+    try {
+      const parsed: unknown = JSON.parse(await readFile(this.deps.statePath, 'utf8'));
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        return parsed as Record<string, ChatState>;
+      }
+    } catch {
+      // Missing or corrupt state means starting from "now-ish": the first poll re-reads the
+      // recent window once. Better a rare duplicate after losing the file than never starting.
+    }
+    return {};
+  }
+
+  private async saveState(): Promise<void> {
+    await writeFile(this.deps.statePath, JSON.stringify(this.state ?? {}, null, 2));
+  }
+
+  /**
+   * Silence must not be ambiguous: a watcher on the inbox file has to see auth death too. But a
+   * chat that fails identically poll after poll (an allowlisted chat the account has not been
+   * added to yet) would flood the file, so the same failure is only written once until it
+   * changes or clears.
+   */
+  private async reportFailure(message: string): Promise<void> {
+    this.log(`inbox poll failed: ${message}`);
+    if (message === this.lastErrorSignature) {
+      return;
+    }
+    this.lastErrorSignature = message;
+    const line = JSON.stringify({ error: message, at: new Date().toISOString() });
+    try {
+      await appendFile(this.deps.inboxPath, `${line}\n`);
+    } catch (writeError) {
+      // Even the error line failing must not throw past pollOnce.
+      this.log(`inbox poller cannot write ${this.deps.inboxPath}: ${String(writeError)}`);
+    }
+  }
+}

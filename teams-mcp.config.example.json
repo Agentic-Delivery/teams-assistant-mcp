@@ -1,0 +1,15 @@
+{
+  "assistantDisplayName": "Assistant (AI)",
+  "allowedChats": [
+    {
+      "id": "19:REPLACE-WITH-REAL-CHAT-ID@thread.v2",
+      "label": "Pilot chat",
+      "canPost": true
+    },
+    {
+      "id": "19:ANOTHER-CHAT-ID@thread.v2",
+      "label": "Leadership — read only",
+      "canPost": false
+    }
+  ]
+}
