@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "description": "Stdio MCP server that lets a Claude Code agent read and post in a fixed allowlist of Microsoft Teams group chats.",
-  "license": "MIT",
+  "license": "Elastic-2.0",
   "author": "Agentic Delivery",
   "repository": {
     "type": "git",

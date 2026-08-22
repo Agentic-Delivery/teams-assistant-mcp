@@ -220,3 +220,12 @@ SETUP.md covers the whole path, from requesting the account to a passing smoke c
 version: build this repo, fill in `.env` and `teams-mcp.config.json` here, and run
 `npm run install-local` — it prints the exact `claude mcp add` command (and `.mcp.json`
 equivalent) for your checkout.
+
+## Licensing
+
+This project is licensed under the [Elastic License 2.0](LICENSE). In plain
+language: you are free to use it, copy it, modify it, and adapt it to make it
+work for your own organization — including commercially, inside any company.
+The one thing you may not do is sell it or offer it to others as a hosted or
+managed product. We share it with the community for free and would like it to
+stay that way.
