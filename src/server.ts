@@ -45,7 +45,7 @@ export function buildServer(deps: ServerDeps): McpServer {
   const downloadDir = deps.downloadDir ?? join(tmpdir(), 'teams-assistant-mcp');
 
   const server = new McpServer(
-    { name: 'teams-assistant-mcp', version: '0.2.1' },
+    { name: 'teams-assistant-mcp', version: '0.2.2' },
     {
       instructions:
         `Reads and posts in a fixed set of Microsoft Teams group chats as the account ` +
@@ -360,12 +360,12 @@ export function buildServer(deps: ServerDeps): McpServer {
       title: 'Download a Teams chat attachment',
       description:
         'Downloads an attachment from a message in an allowlisted chat and writes it to a local ' +
-        'file, returning the path. Omit attachmentId to take the first attachment on the message. ' +
+        'file, returning the path. Omit attachmentId to take the first downloadable attachment on the message (a quoted reply quote card is skipped). ' +
         'Images pasted into a message show up as attachments named inline-image-1, inline-image-2, …',
       inputSchema: {
         chatId: z.string().describe('Graph chat id, must be on the allowlist'),
         messageId: z.string().describe('Message id from read_chat_messages'),
-        attachmentId: z.string().optional().describe('Attachment id; defaults to the first one'),
+        attachmentId: z.string().optional().describe('Attachment id; defaults to the first downloadable one — never a quote card'),
       },
       annotations: { readOnlyHint: true },
     },

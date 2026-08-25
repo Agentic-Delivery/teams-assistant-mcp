@@ -753,3 +753,15 @@ describe('teams chats — getAttachment without an id skips the quote card', () 
     expect(fetchFn.mock.calls.some(([url]) => String(url).includes('/hostedContents/'))).toBe(false);
   });
 });
+
+describe('teams chats — a quoted reply with no file says so honestly', () => {
+  it('reports "only a quoted-message card", never "no attachments"', async () => {
+    const msg = { id: 'm-3', createdDateTime: '2026-08-25T07:48:25Z', from: { user: { displayName: 'Celine', id: 'u1' } }, body: { contentType: 'html', content: 'see above' },
+      attachments: [{ id: 'quote-1', contentType: 'messageReference', name: null, contentUrl: null }] };
+    const fetchFn = vi.fn(async () => json(msg));
+    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }));
+
+    await expect(chats.getAttachment('19:a@thread.v2', 'm-3')).rejects.toThrow(/only a quoted-message card/);
+    expect(fetchFn.mock.calls.some(([url]) => String(url).includes('/hostedContents/'))).toBe(false);
+  });
+});
