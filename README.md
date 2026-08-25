@@ -126,8 +126,8 @@ locally, as `GraphError` code `LocallyThrottled`, without touching the network. 
 per resource family (`/chats/{id}/messages/{id}` and `/chats/{id}/messages` are two gates —
 Graph throttles them separately, and 2026-08-25 proved it: the single-message fetch was
 refused for hours while the message list and plain posts on the same chat stayed healthy);
-an application-wide throttle (`ApplicationThrottled` and friends, by error code) closes the
-global gate every request checks. A quoted reply and an attachment download both start with
+an application-wide throttle (error code `ApplicationThrottled` — the one code seen live; nothing
+speculative) closes the global gate every request checks. A quoted reply and an attachment download both start with
 that single-message fetch, so under its throttle they fall back to scanning the chat's last
 50 messages; a reply to something older than that fails with `MessageFetchThrottled` —
 nothing posted, the wait named. A throttled send waits the
@@ -135,7 +135,7 @@ window out BEFORE reading the chat back, then retries once — unless the named 
 what one call may sleep (60 s), in which case it fails immediately with the 429 and its
 Retry-After, no theatre first. If a send's outcome is genuinely
 unknown (the response path died) and the gate then blocks the readback, the send reports
-`UnknownOutcome` naming the original failure — never "not sent". The gate is per process: see
+`UnknownOutcome` naming the original failure — never "not sent". The gates are per process: see
 KNOWN-ISSUES.
 
 ## Auth, and the fact that ROPC is temporary
