@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { GraphError } from './graph-client.js';
+import { GraphClient, GraphError } from './graph-client.js';
 import { ReliableTeamsChats } from './reliable-sends.js';
-import type { TeamsChatsPort } from './teams-chats.js';
+import { GraphTeamsChats, type TeamsChatsPort } from './teams-chats.js';
+import type { TokenProvider } from '../auth/token-provider.js';
 import type { ChatMessage, ReadResult } from '../messages.js';
 
 function message(overrides: Partial<ChatMessage>): ChatMessage {
@@ -133,7 +134,9 @@ describe('reliable sends — readback before any retry', () => {
     expect(sendMessage).toHaveBeenCalledTimes(3);
   });
 
-  it('a failed readback never masks the send outcome — it just means retry', async () => {
+  it('a readback that fails for a non-throttle reason never masks the send outcome — it just means retry', async () => {
+    // (A readback refused by a 429 is different: that is an UNKNOWN outcome, pinned in the
+    // real-assembly suite below — reading the chat is impossible until the throttle clears.)
     const sendMessage = vi
       .fn()
       .mockRejectedValueOnce(new GraphError('hang up', 0))
@@ -141,7 +144,7 @@ describe('reliable sends — readback before any retry', () => {
     const inner = portWith({
       sendMessage,
       readMessages: async () => {
-        throw new GraphError('reads throttled too', 429);
+        throw new GraphError('read died on the same dead link', 0);
       },
     });
     const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
@@ -283,22 +286,15 @@ describe('reliable sends — the match must be OUR copy, nothing else (review ro
     expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
-  it('an absurd Retry-After is capped instead of parking the caller', async () => {
+  it('an absurd Retry-After on a refused send: fail NOW with the 429, no sleep, no retry', async () => {
     const waits: number[] = [];
-    const sendMessage = vi
-      .fn()
-      .mockRejectedValueOnce(new GraphError('throttled', 429, 'TooManyRequests', 300))
-      .mockResolvedValueOnce(message({ id: 'second-try' }));
+    const sendMessage = vi.fn(async () => { throw new GraphError('throttled', 429, 'TooManyRequests', 300); });
     const inner = portWith({ sendMessage });
-    const chats = new ReliableTeamsChats(inner, {
-      selfDisplayName: 'Assistant',
-      sleepFn: async (ms) => void waits.push(ms),
-      nowFn: fixedNow,
-    });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async (ms) => void waits.push(ms), nowFn: fixedNow });
 
-    await chats.sendMessage('19:a@thread.v2', 'hello channel');
-
-    expect(waits).toEqual([60000]);
+    await expect(chats.sendMessage('19:a@thread.v2', 'hello channel')).rejects.toMatchObject({ status: 429, retryAfterSeconds: 300 });
+    expect(waits).toEqual([]);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
   it('a retry re-checks the chat right before re-sending, catching a late-landing copy', async () => {
@@ -316,5 +312,161 @@ describe('reliable sends — the match must be OUR copy, nothing else (review ro
 
     expect(await chats.sendMessage('19:a@thread.v2', 'hello channel')).toBe(landed);
     expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('reliable sends — under a 429 the chat is NOT read back before the wait (2026-08-25)', () => {
+  it('a throttled send waits the named window first, reads back once, then retries once — bounded', async () => {
+    const calls: string[] = [];
+    const sendMessage = vi
+      .fn()
+      .mockImplementationOnce(async () => { calls.push('send'); throw new GraphError('throttled', 429, 'TooManyRequests', 20); })
+      .mockImplementationOnce(async () => { calls.push('send'); return message({ id: 'second-try' }); });
+    const readMessages = vi.fn(async () => { calls.push('read'); return { messages: [] } as unknown as ReadResult; });
+    const inner = portWith({ sendMessage, readMessages });
+    const waits: number[] = [];
+    const chats = new ReliableTeamsChats(inner, {
+      selfDisplayName: 'Assistant',
+      sleepFn: async (ms) => void waits.push(ms),
+      nowFn: fixedNow,
+    });
+
+    expect((await chats.sendMessage('19:a@thread.v2', 'hello channel')).id).toBe('second-try');
+    expect(calls).toEqual(['send', 'read', 'send']); // no readback BEFORE the wait
+    expect(waits).toEqual([20000]);
+  });
+
+  it('two 429s in a row: give up after the second, three requests total, never a storm', async () => {
+    const sendMessage = vi.fn(async () => { throw new GraphError('throttled', 429, 'TooManyRequests', 5); });
+    const readMessages = vi.fn(async () => ({ messages: [] }) as unknown as ReadResult);
+    const inner = portWith({ sendMessage, readMessages });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    await expect(chats.sendMessage('19:a@thread.v2', 'hello channel')).rejects.toMatchObject({ status: 429 });
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    expect(readMessages).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe('the real assembly — GraphClient + GraphTeamsChats + ReliableTeamsChats over a fake fetch (review round 1)', () => {
+  const stubToken: TokenProvider = { kind: 'stub', getAccessToken: async () => 't' };
+  const jsonResponse = (body: unknown, status = 200) =>
+    new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+  const created = (id: string, text: string) => ({
+    id, createdDateTime: '2026-08-25T06:00:05Z', from: { user: { displayName: 'Assistant', id: 'me' } },
+    body: { contentType: 'html', content: text }, attachments: [],
+  });
+
+  function stack(fetchFn: ReturnType<typeof vi.fn>, sleeps: number[]) {
+    let now = Date.parse('2026-08-25T06:00:00Z');
+    const client = new GraphClient({
+      tokenProvider: stubToken, fetchFn: fetchFn as never,
+      sleepFn: async (ms) => { sleeps.push(ms); now += ms; },
+      nowFn: () => now,
+    });
+    const chats = new ReliableTeamsChats(new GraphTeamsChats(client), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async (ms) => { sleeps.push(ms); now += ms; },
+      nowFn: () => new Date(now),
+    });
+    return { client, chats };
+  }
+
+  it('a 429 without Retry-After: the decorator waits the gate default, readback and retry then reach Graph and succeed', async () => {
+    const sleeps: number[] = [];
+    const fetchFn = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ error: { code: 'TooManyRequests', message: 'throttled' } }, 429)) // POST #1
+      .mockResolvedValueOnce(jsonResponse({ value: [] }))                                                    // readback
+      .mockResolvedValueOnce(jsonResponse(created('m2', 'hello')));                                          // POST #2
+    const { chats } = stack(fetchFn, sleeps);
+
+    const sent = await chats.sendMessage('19:a@thread.v2', 'hello');
+
+    expect(sent.id).toBe('m2');
+    expect(fetchFn).toHaveBeenCalledTimes(3);
+    expect(sleeps[0]).toBeGreaterThanOrEqual(30_000); // reconciled with the client's default gate
+  });
+
+  it('a send whose response path dies while a concurrent 429 has closed the gate: UNKNOWN outcome, naming the hang-up — never "not sent"', async () => {
+    // The POST reaches Graph and dies on the way back (the write may be standing); every GET —
+    // the readbacks — meets a 429, which closes the gate. Nothing can be known until it reopens.
+    const fetchFn = vi.fn(async (_url: string, init: RequestInit) => {
+      if (init.method === 'POST') { throw new TypeError('socket hang up'); }
+      return jsonResponse({ error: { code: 'TooManyRequests', message: 'poller throttled' } }, 429);
+    });
+    let now = Date.parse('2026-08-25T06:00:00Z');
+    const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async (ms) => { now += ms; }, nowFn: () => now, readRetries: 0 });
+    const chats = new ReliableTeamsChats(new GraphTeamsChats(client), { selfDisplayName: 'Assistant', sleepFn: async () => { /* no clock advance: the gate stays closed */ }, nowFn: () => new Date(now) });
+
+    const error = (await chats.sendMessage('19:a@thread.v2', 'hello').catch((c: unknown) => c)) as GraphError;
+
+    expect(error).toBeInstanceOf(GraphError);
+    expect(error.code).toBe('UnknownOutcome');
+    expect(error.message).toMatch(/socket hang up/);
+    expect(error.message).not.toMatch(/not sent/);
+  });
+});
+
+describe('the real assembly — round 2', () => {
+  const stubToken: TokenProvider = { kind: 'stub', getAccessToken: async () => 't' };
+  const throttled = (retryAfter?: string) =>
+    new Response(JSON.stringify({ error: { code: 'ApplicationThrottled', message: 'Rate limit is exceeded.' } }), {
+      status: 429, headers: { 'content-type': 'application/json', ...(retryAfter ? { 'retry-after': retryAfter } : {}) },
+    });
+  const jsonResponse = (body: unknown, status = 200) =>
+    new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+
+  function stack(fetchFn: (url: string, init: RequestInit) => Promise<Response>, opts: { advance: boolean } = { advance: true }) {
+    let now = Date.parse('2026-08-25T06:00:00Z');
+    const sleeps: number[] = [];
+    const sleepFn = async (ms: number) => { sleeps.push(ms); if (opts.advance) now += ms; };
+    const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn, nowFn: () => now, readRetries: 0 });
+    const chats = new ReliableTeamsChats(new GraphTeamsChats(client), { selfDisplayName: 'Assistant', sleepFn, nowFn: () => new Date(now) });
+    return { chats, sleeps };
+  }
+
+  it('a send Graph REFUSED with a long Retry-After: reported as the 429 with that Retry-After, nothing slept, never "unknown"', async () => {
+    const posts: number[] = [];
+    const { chats, sleeps } = stack(async (_u, init) => { if (init.method === 'POST') { posts.push(1); return throttled('300'); } return jsonResponse({ value: [] }); });
+
+    const error = (await chats.sendMessage('19:a@thread.v2', 'hello').catch((c: unknown) => c)) as GraphError;
+
+    expect(error.status).toBe(429);
+    expect(error.code).toBe('ApplicationThrottled');
+    expect(error.retryAfterSeconds).toBe(300);
+    expect(error.message).not.toMatch(/UNKNOWN/);
+    expect(posts).toHaveLength(1);
+    expect(sleeps).toEqual([]); // no minute of theatre before the honest answer
+  });
+
+  it('a send refused with a SHORT Retry-After, then the gate still closed at retry time: still the 429, still not "unknown"', async () => {
+    const { chats } = stack(async (_u, init) => (init.method === 'POST' ? throttled('20') : throttled('20')), { advance: false });
+
+    const error = (await chats.sendMessage('19:a@thread.v2', 'hello').catch((c: unknown) => c)) as GraphError;
+
+    expect(error.status).toBe(429);
+    expect(error.code).toBe('ApplicationThrottled'); // Graph's refusal, not our gate's
+    expect(error.retryAfterSeconds).toBe(20);
+  });
+
+  it('first attempt: response path dies and the readback is blocked at once → UnknownOutcome immediately, no sleep, no second send', async () => {
+    let posts = 0;
+    const { chats, sleeps } = stack(async (_u, init) => { if (init.method === 'POST') { posts += 1; throw new TypeError('socket hang up'); } return throttled('1'); }, { advance: false });
+
+    const error = (await chats.sendMessage('19:a@thread.v2', 'hello').catch((c: unknown) => c)) as GraphError;
+
+    expect(error.code).toBe('UnknownOutcome');
+    expect(posts).toBe(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  it('response path dies, then the readback meets a REAL Graph 429 (not our gate): UnknownOutcome naming the hang-up', async () => {
+    const { chats } = stack(async (_u, init) => { if (init.method === 'POST') { throw new TypeError('socket hang up'); } return throttled('1'); });
+
+    const error = (await chats.sendMessage('19:a@thread.v2', 'hello').catch((c: unknown) => c)) as GraphError;
+
+    expect(error.code).toBe('UnknownOutcome');
+    expect(error.message).toMatch(/socket hang up/);
   });
 });

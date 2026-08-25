@@ -386,25 +386,44 @@ describe('graph client — empty-success bodies (the 11-copy broadcast incident,
 });
 
 describe('graph client — throttle handling on reads', () => {
-  it('caps an absurd Retry-After on the read retry instead of parking the caller', async () => {
+  it('a Retry-After longer than one call may sleep: no retry, honest 429 now, gate closed for the FULL window', async () => {
+    let now = 0;
+    const waits: number[] = [];
+    const fetchFn = vi.fn().mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'throttled' } }), {
+        status: 429,
+        headers: { 'retry-after': '300', 'content-type': 'application/json' },
+      }),
+    );
+    const client = new GraphClient({
+      tokenProvider: stubToken,
+      fetchFn: fetchFn as never,
+      sleepFn: async (ms) => { waits.push(ms); now += ms; },
+      nowFn: () => now,
+    });
+
+    await expect(client.get('/me')).rejects.toMatchObject({ status: 429, retryAfterSeconds: 300 });
+    expect(fetchFn).toHaveBeenCalledTimes(1); // sleeping a minute to fail locally would be theatre
+    expect(waits).toEqual([]);
+    expect(client.throttledForMs()).toBe(300_000); // the window Graph named, not a 60 s stand-in
+  });
+
+  it('a 429 with NO Retry-After still waits the gate out before the single retry (not a 1 s exponential)', async () => {
+    let now = 0;
     const waits: number[] = [];
     const fetchFn = vi
       .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'throttled' } }), {
-          status: 429,
-          headers: { 'retry-after': '300', 'content-type': 'application/json' },
-        }),
-      )
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'throttled' } }), { status: 429 }))
       .mockResolvedValueOnce(json({ id: 'fine' }));
     const client = new GraphClient({
       tokenProvider: stubToken,
       fetchFn: fetchFn as never,
-      sleepFn: async (ms) => void waits.push(ms),
+      sleepFn: async (ms) => { waits.push(ms); now += ms; },
+      nowFn: () => now,
     });
 
     expect(await client.get('/me')).toEqual({ id: 'fine' });
-    expect(waits).toEqual([60000]);
+    expect(waits).toEqual([30_000]); // DEFAULT_THROTTLE_WINDOW_MS — a shorter sleep retries into a closed gate
   });
 
   it('retries a 429 GET after the Retry-After the server names, then succeeds', async () => {
@@ -418,10 +437,12 @@ describe('graph client — throttle handling on reads', () => {
         }),
       )
       .mockResolvedValueOnce(json({ id: 'fine' }));
+    let now = 0;
     const client = new GraphClient({
       tokenProvider: stubToken,
       fetchFn: fetchFn as never,
-      sleepFn: async (ms) => void waits.push(ms),
+      sleepFn: async (ms) => { waits.push(ms); now += ms; },
+      nowFn: () => now,
     });
 
     expect(await client.get('/me')).toEqual({ id: 'fine' });
@@ -435,17 +456,19 @@ describe('graph client — throttle handling on reads', () => {
         headers: { 'retry-after': '3', 'content-type': 'application/json' },
       }),
     );
+    let now = 0;
     const client = new GraphClient({
       tokenProvider: stubToken,
       fetchFn: fetchFn as never,
-      sleepFn: async () => {},
+      sleepFn: async (ms) => { now += ms; },
+      nowFn: () => now,
     });
 
     const error = (await client.get('/me').catch((c: unknown) => c)) as GraphError;
     expect(error).toBeInstanceOf(GraphError);
     expect(error.status).toBe(429);
     expect(error.retryAfterSeconds).toBe(3);
-    expect(fetchFn.mock.calls.length).toBe(3); // 1 try + 2 retries, then honesty
+    expect(fetchFn.mock.calls.length).toBe(2); // 1 try + ONE retry, then honesty
   });
 
   it('never auto-retries a POST — a write is not idempotent', async () => {
@@ -480,5 +503,104 @@ describe('reactions', () => {
     // The payload is {reactionType} directly — wrapping it in {body: …} answers
     // "ReactionType cannot be null", the 2026-08-24 react.mjs bug.
     expect(JSON.parse(init.body as string)).toEqual({ reactionType: '👍' });
+  });
+});
+
+describe('graph client — the throttle gate (2026-08-25: retries under 429 amplified an escalating throttle)', () => {
+  const throttled = (retryAfter: string) =>
+    new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'throttled' } }), {
+      status: 429,
+      headers: { 'retry-after': retryAfter, 'content-type': 'application/json' },
+    });
+
+  it('after one 429, every request from this client fails fast until Retry-After has passed — no network hit', async () => {
+    let now = 1_000_000;
+    const fetchFn = vi.fn().mockResolvedValueOnce(throttled('30'));
+    const client = new GraphClient({
+      tokenProvider: stubToken,
+      fetchFn: fetchFn as never,
+      sleepFn: async () => {},
+      readRetries: 0,
+      nowFn: () => now,
+    });
+
+    await expect(client.get('/chats/a/messages')).rejects.toMatchObject({ status: 429 });
+    // A second request inside the window: refused locally, fetch NOT called again.
+    await expect(client.get('/chats/b/messages')).rejects.toMatchObject({ status: 429, code: 'LocallyThrottled' });
+    await expect(client.post('/chats/b/messages', {})).rejects.toMatchObject({ status: 429, code: 'LocallyThrottled' });
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+
+    now += 31_000;
+    fetchFn.mockResolvedValueOnce(json({ value: [] }));
+    expect(await client.get('/chats/b/messages')).toEqual({ value: [] });
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  it('a GET retries at most ONCE after a 429, and never while the gate is closed', async () => {
+    let now = 0;
+    const waits: number[] = [];
+    const fetchFn = vi.fn().mockResolvedValue(throttled('5'));
+    const client = new GraphClient({
+      tokenProvider: stubToken,
+      fetchFn: fetchFn as never,
+      sleepFn: async (ms) => { waits.push(ms); now += ms; },
+      nowFn: () => now,
+    });
+
+    await expect(client.get('/me')).rejects.toMatchObject({ status: 429 });
+    expect(fetchFn).toHaveBeenCalledTimes(2); // first try + exactly one retry
+    expect(waits).toEqual([5000]);
+  });
+
+  it('a 429 without Retry-After closes the gate for a default window, not zero', async () => {
+    let now = 0;
+    const fetchFn = vi.fn().mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'throttled' } }), { status: 429 }),
+    );
+    const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, readRetries: 0, nowFn: () => now });
+
+    await expect(client.get('/me')).rejects.toMatchObject({ status: 429 });
+    await expect(client.get('/me')).rejects.toMatchObject({ code: 'LocallyThrottled' });
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    expect(client.throttledForMs()).toBeGreaterThan(0);
+  });
+});
+
+describe('graph client — Retry-After is honoured on 503/504 as well (round 2)', () => {
+  it('a 503 naming Retry-After 30 waits those 30 s, not a 1 s exponential', async () => {
+    let now = 0;
+    const waits: number[] = [];
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(new Response('', { status: 503, headers: { 'retry-after': '30' } }))
+      .mockResolvedValueOnce(json({ id: 'fine' }));
+    const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async (ms) => { waits.push(ms); now += ms; }, nowFn: () => now });
+
+    expect(await client.get('/me')).toEqual({ id: 'fine' });
+    expect(waits).toEqual([30_000]);
+  });
+
+  it('the fail-now path keeps Graph\'s own message and code', async () => {
+    const fetchFn = vi.fn(async () =>
+      new Response(JSON.stringify({ error: { code: 'ApplicationThrottled', message: 'Rate limit is exceeded. Try again in 300 seconds.' } }), {
+        status: 429, headers: { 'retry-after': '300', 'content-type': 'application/json' },
+      }));
+    const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 });
+
+    const error = (await client.get('/me').catch((c: unknown) => c)) as GraphError;
+    expect(error.code).toBe('ApplicationThrottled');
+    expect(error.message).toMatch(/300 seconds/);
+  });
+});
+
+describe('graph client — 503 WITHOUT Retry-After (the non-triggering side)', () => {
+  it('waits the short exponential pause, not the throttle default', async () => {
+    let now = 0;
+    const waits: number[] = [];
+    const fetchFn = vi.fn().mockResolvedValueOnce(new Response('', { status: 503 })).mockResolvedValueOnce(json({ id: 'fine' }));
+    const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async (ms) => { waits.push(ms); now += ms; }, nowFn: () => now });
+
+    expect(await client.get('/me')).toEqual({ id: 'fine' });
+    expect(waits).toEqual([1000]);
   });
 });

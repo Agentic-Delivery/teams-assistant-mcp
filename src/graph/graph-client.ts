@@ -28,9 +28,21 @@ export interface GraphClientOptions {
   fetchFn?: typeof fetch;
   baseUrl?: string;
   sleepFn?: (ms: number) => Promise<void>;
-  /** Extra attempts after the first for throttled/unavailable READS. Writes never auto-retry. */
+  /** Extra attempts after the first for throttled/unavailable READS. Writes never auto-retry. Default 1. */
   readRetries?: number;
+  nowFn?: () => number;
 }
+
+/** When a 429 names no Retry-After, close the gate for this long rather than for nothing. */
+export const DEFAULT_THROTTLE_WINDOW_MS = 30_000;
+/**
+ * The gate honours the FULL Retry-After (sanity-capped at an hour): resuming inside the window
+ * Graph named is what escalates a throttle. What IS capped is how long one call will sleep
+ * waiting for a retry — a tool call must not hang for minutes; beyond this the call fails fast
+ * with the 429 and the gate keeps everyone else honest until the window really passes.
+ */
+const MAX_THROTTLE_WINDOW_MS = 60 * 60_000;
+export const MAX_RETRY_SLEEP_MS = 60_000;
 
 const RETRYABLE_READ_STATUSES = new Set([429, 503, 504]);
 
@@ -45,12 +57,48 @@ export class GraphClient {
   private readonly baseUrl: string;
   private readonly sleepFn: (ms: number) => Promise<void>;
   private readonly readRetries: number;
+  private readonly nowFn: () => number;
+  /**
+   * The throttle gate. Graph ESCALATES its penalty window when a caller keeps sending while
+   * throttled — and on 2026-08-25 this client's own retries, stacked under a poller and a
+   * readback loop, kept an account throttled for hours. One 429 now closes the gate for the
+   * whole client: every request until the window passes fails fast, locally, without touching
+   * the network. Silence is the only thing that ends a throttle.
+   */
+  private throttledUntil = 0;
 
   constructor(private readonly options: GraphClientOptions) {
     this.fetchFn = options.fetchFn ?? fetch;
     this.baseUrl = options.baseUrl ?? GRAPH_BASE_URL;
     this.sleepFn = options.sleepFn ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-    this.readRetries = options.readRetries ?? 2;
+    this.readRetries = options.readRetries ?? 1;
+    this.nowFn = options.nowFn ?? (() => Date.now());
+  }
+
+  /** Milliseconds until the gate reopens; 0 when open. Callers pacing themselves read this. */
+  throttledForMs(): number {
+    return Math.max(0, this.throttledUntil - this.nowFn());
+  }
+
+  private assertGateOpen(path: string): void {
+    const remaining = this.throttledForMs();
+    if (remaining > 0) {
+      throw new GraphError(
+        `Locally throttled: a recent 429 closed this client for another ${Math.ceil(remaining / 1000)}s (${path} not sent)`,
+        429,
+        'LocallyThrottled',
+        Math.ceil(remaining / 1000),
+      );
+    }
+  }
+
+  private noteThrottle(response: Response): void {
+    if (response.status !== 429) {
+      return;
+    }
+    const named = retryAfterSecondsOf(response);
+    const windowMs = named ? Math.min(named * 1000, MAX_THROTTLE_WINDOW_MS) : DEFAULT_THROTTLE_WINDOW_MS;
+    this.throttledUntil = Math.max(this.throttledUntil, this.nowFn() + windowMs);
   }
 
   private url(path: string): string {
@@ -58,14 +106,17 @@ export class GraphClient {
   }
 
   private async authorized(path: string, init: RequestInit): Promise<Response> {
+    this.assertGateOpen(path);
     const token = await this.options.tokenProvider.getAccessToken();
-    return this.fetchFn(this.url(path), {
+    const response = await this.fetchFn(this.url(path), {
       ...init,
       headers: {
         ...(init.headers as Record<string, string> | undefined),
         authorization: `Bearer ${token}`,
       },
     });
+    this.noteThrottle(response);
+    return response;
   }
 
   private async fail(response: Response): Promise<never> {
@@ -95,8 +146,16 @@ export class GraphClient {
       if (attempt >= this.readRetries || !RETRYABLE_READ_STATUSES.has(response.status)) {
         await this.fail(response);
       }
-      const retryAfter = retryAfterSecondsOf(response);
-      const waitMs = retryAfter ? Math.min(retryAfter, 60) * 1000 : 2 ** attempt * 1000;
+      // The wait honours a named Retry-After on ANY retryable status (a 503 that asks for
+      // room gets it), must outlast the gate a 429 just closed (or the retry fails fast
+      // locally), and never shrinks below a short exponential pause. If that wait would exceed
+      // what one call may hang for, there is no honest retry: fail now — with Graph's own
+      // message and code intact — rather than sleep a minute and then fail locally anyway.
+      const named = retryAfterSecondsOf(response);
+      const waitMs = Math.max(named ? named * 1000 : 0, this.throttledForMs(), 2 ** attempt * 1000);
+      if (waitMs > MAX_RETRY_SLEEP_MS) {
+        await this.fail(response);
+      }
       await response.body?.cancel().catch(() => undefined);
       await this.sleepFn(waitMs);
     }
