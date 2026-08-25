@@ -716,6 +716,7 @@ describe('graph client — the peek must never break the gate (round 2 of the pe
 
     await expect(client.get('/chats/x/messages/1')).rejects.toMatchObject({ status: 429 });
     expect(client.throttledForMs('/chats/x/messages/1')).toBe(45_000);
+    expect(client.throttledForMs('/me/chats')).toBe(0); // the FAMILY gate, never the global one, for a body with no code
     await expect(client.get('/chats/x/messages/2')).rejects.toMatchObject({ code: 'LocallyThrottled' });
     expect(fetchFn).toHaveBeenCalledTimes(1);
   });

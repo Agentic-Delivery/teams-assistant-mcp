@@ -120,10 +120,13 @@ export class GraphClient {
   private assertGateOpen(path: string): void {
     const remaining = this.throttledForMs(path);
     if (remaining > 0) {
+      const now = this.nowFn();
+      const globalClosed = (this.throttledUntil.get(GLOBAL_GATE_KEY) ?? 0) > now;
+      const which = globalClosed
+        ? 'the GLOBAL gate (an application-wide throttle) — every resource family is closed'
+        : `the gate for ${GraphClient.gateKeyFor(path)} — other resource families may still be fine`;
       throw new GraphError(
-        `Locally throttled: a recent 429 closed the gate for ${GraphClient.gateKeyFor(path)} ` +
-          `(or the global gate) for another ${Math.ceil(remaining / 1000)}s — ${path} not sent; ` +
-          'other resource families may still be fine',
+        `Locally throttled: a recent 429 closed ${which}; ${Math.ceil(remaining / 1000)}s remain — ${path} not sent`,
         429,
         'LocallyThrottled',
         Math.ceil(remaining / 1000),
