@@ -11,9 +11,11 @@ Microsoft documentation.
 
 **Capability note**: styled output requires posting Graph `contentType: "html"` content
 *unescaped*. The server's standard send path deliberately escapes everything (plain text
-in, plain text out), so styling needs the raw-HTML send path. If your install doesn't have
-one, plain text is the fallback — never post markdown syntax into Teams (it renders as
-literal `**asterisks**`).
+in, plain text out); the raw-HTML path this skill assumes is `format: 'html'` on
+`send_chat_message`/`edit_chat_message` (MCP tools) and `--html` on `teams-post`/`teams-edit`
+(standalone CLIs) — shipped since teams-assistant-mcp 0.3.0. On that path YOU own
+entity-escaping `<`, `>`, `&` inside your own content (quirk 3 below); the server posts it
+verbatim. Never post markdown syntax into Teams (it renders as literal `**asterisks**`).
 
 ## When to style — and when not to
 

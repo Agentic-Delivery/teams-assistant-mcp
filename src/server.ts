@@ -4,7 +4,7 @@ import { basename, extname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { z } from 'zod';
 import type { ChatAllowlist } from './allowlist.js';
-import type { TeamsChatsPort } from './graph/teams-chats.js';
+import type { ChatMessage, TeamsChatsPort } from './graph/teams-chats.js';
 
 export interface ServerDeps {
   chats: TeamsChatsPort;
@@ -45,7 +45,7 @@ export function buildServer(deps: ServerDeps): McpServer {
   const downloadDir = deps.downloadDir ?? join(tmpdir(), 'teams-assistant-mcp');
 
   const server = new McpServer(
-    { name: 'teams-assistant-mcp', version: '0.2.2' },
+    { name: 'teams-assistant-mcp', version: '0.3.0' },
     {
       instructions:
         `Reads and posts in a fixed set of Microsoft Teams group chats as the account ` +
@@ -125,24 +125,37 @@ export function buildServer(deps: ServerDeps): McpServer {
     {
       title: 'Post a message to a Teams chat',
       description:
-        'Posts a message to an allowlisted chat that has canPost enabled. The text is always ' +
-        'posted as HTML rendered from it: blank lines become paragraph breaks, single newlines ' +
-        'become line breaks, http(s) URLs become clickable links, everything else is escaped ' +
-        'verbatim — no markdown. Real people read this immediately and it cannot be unsent ' +
-        'through this server.',
+        'Posts a message to an allowlisted chat that has canPost enabled. Default format ' +
+        '"text": the text is rendered into HTML: blank lines become paragraph breaks, single ' +
+        'newlines become line breaks, http(s) URLs become clickable links, everything else is ' +
+        'escaped verbatim — no markdown. format "html": text is raw Teams-subset HTML posted ' +
+        'VERBATIM — no escaping happens here, so the caller is responsible for entity-escaping ' +
+        '`<`, `>` and `&` inside their own content. The teams-styling plugin shipped in this ' +
+        'repo documents the verified HTML vocabulary (bold, lists, tables, code, inline CSS ' +
+        'color) and the usage doctrine for it; read it before using format "html". Real people ' +
+        'read this immediately and it cannot be unsent through this server.',
       inputSchema: {
         chatId: z.string().describe('Graph chat id, must be allowlisted with canPost: true'),
         text: z
           .string()
           .min(1)
-          .describe('Plain text; newlines and URLs render properly, markdown does not'),
+          .describe('Message content; plain text by default, raw HTML when format is "html"'),
+        format: z
+          .enum(['text', 'html'])
+          .optional()
+          .describe('"text" (default) escapes and renders text; "html" posts text as raw HTML, verbatim'),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
-    ({ chatId, text }) =>
+    ({ chatId, text, format }) =>
       guard(async () => {
         allowlist.assertPostable(chatId);
-        const sent = await chats.sendMessage(chatId, text);
+        let sent: ChatMessage;
+        if (format === 'html') {
+          sent = await chats.sendHtmlMessage(chatId, text);
+        } else {
+          sent = await chats.sendMessage(chatId, text);
+        }
         return ok({ posted: true, chatId, messageId: sent.id, createdDateTime: sent.createdDateTime });
       }),
   );
@@ -189,23 +202,34 @@ export function buildServer(deps: ServerDeps): McpServer {
       description:
         'Replaces the text of a message in an allowlisted chat. Graph only allows editing ' +
         'messages the signed-in account sent itself; trying anyone else\'s message returns ' +
-        'Graph\'s own refusal. Teams shows the message with an "Edited" marker. The new text is ' +
-        'always posted as HTML, same rendering as send_chat_message (newlines and links render, ' +
-        'markdown does not).',
+        'Graph\'s own refusal. Teams shows the message with an "Edited" marker. Default format ' +
+        '"text": newText is rendered into HTML same as send_chat_message (newlines and links ' +
+        'render, markdown does not). format "html": newText is raw Teams-subset HTML posted ' +
+        'VERBATIM — no escaping happens here, so the caller is responsible for entity-escaping ' +
+        '`<`, `>` and `&` inside their own content. See the teams-styling plugin shipped in ' +
+        'this repo for the verified HTML vocabulary and usage doctrine.',
       inputSchema: {
         chatId: z.string().describe('Graph chat id, must be allowlisted with canPost: true'),
         messageId: z.string().describe('Id of a message this account sent'),
         newText: z
           .string()
           .min(1)
-          .describe('Replacement plain text; newlines and URLs render properly, markdown does not'),
+          .describe('Replacement content; plain text by default, raw HTML when format is "html"'),
+        format: z
+          .enum(['text', 'html'])
+          .optional()
+          .describe('"text" (default) escapes and renders newText; "html" posts newText as raw HTML, verbatim'),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
     },
-    ({ chatId, messageId, newText }) =>
+    ({ chatId, messageId, newText, format }) =>
       guard(async () => {
         allowlist.assertPostable(chatId);
-        await chats.editMessage(chatId, messageId, newText);
+        if (format === 'html') {
+          await chats.editHtmlMessage(chatId, messageId, newText);
+        } else {
+          await chats.editMessage(chatId, messageId, newText);
+        }
         return ok({ edited: true, chatId, messageId });
       }),
   );

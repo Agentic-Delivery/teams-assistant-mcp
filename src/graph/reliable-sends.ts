@@ -6,7 +6,7 @@ import type {
   OutboundImage,
   TeamsChatsPort,
 } from './teams-chats.js';
-import type { ChatMessage, ReadResult } from '../messages.js';
+import { htmlToText, type ChatMessage, type ReadResult } from '../messages.js';
 
 export interface ReliableSendOptions {
   /**
@@ -35,6 +35,65 @@ function describe(failure: unknown): string {
 
 function normalized(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Tags whose stored body Teams is confirmed to re-serialize — and, in doing so, pretty-print
+ * with a raw newline between every bare-adjacent tag pair inside it. Table structure ONLY, per
+ * two live captures (2026-08-25, see reliable-sends.test.ts's captured-readback fixtures):
+ *
+ *  - A MINIFIED table (`<td>build</td><td>ok</td>`, zero whitespace between adjacent tags) came
+ *    back rewritten with an inserted `<tbody>` and a newline at every boundary inside it,
+ *    including `</td><td>` and `</th><th>` — htmlToText's BLOCK_END does not treat those as
+ *    word boundaries (only p/div/li/tr/h1-6/br are), so reducing the SENT html straight through
+ *    htmlToText under-counts word boundaries a landed copy WILL have ("buildok" locally vs.
+ *    "build ok" once Teams has rewritten it), and a mid-flight response failure would retry
+ *    into a real duplicate (2026-08-24's incident, through the html door).
+ *  - `<p><b>a</b><i>b</i></p>` (zero whitespace at three bare boundaries: p→b, b→i, i→p) came
+ *    back COMPLETELY UNCHANGED — not even the p→b boundary was touched, despite p being one of
+ *    BLOCK_END's own tags. So "block tag" is not what triggers rewriting; table normalization
+ *    (Teams inserting the implicit `<tbody>` HTML5 requires, which apparently forces the whole
+ *    subtree through a re-serializer) is the only mechanism observed. Inserting at EVERY bare
+ *    boundary — the first attempt at this fix — was therefore itself wrong: it would insert a
+ *    space at, say, a `</b><code>` boundary Teams never touches, producing a match key with an
+ *    extra word Teams' real readback text will never have.
+ *
+ * What remains UNVERIFIED: thead/tbody/table themselves are in the set on capture 1's subtree
+ * evidence, not their own (low risk — they only occur inside a table whose rewriting IS
+ * proven). List tags (ul/ol/li) are deliberately NOT in the set, and cannot break either way:
+ * htmlToText's BLOCK_END already breaks on `</li>`, so the key gets its word boundary whether
+ * or not Teams rewrites a list. The one gap neither capture covers is a text→tag boundary
+ * inside a rewritten table cell (`<td><b>x</b>y</td>`) — capture 2 makes it very likely safe,
+ * since Teams demonstrably leaves inline content untouched. If a future duplicate incident
+ * traces back here, capture the payload and extend this set with its own evidence rather than
+ * guessing further.
+ */
+const REWRITTEN_TAG_BOUNDARY = new Set(['table', 'thead', 'tbody', 'tr', 'td', 'th']);
+
+/** Matches one tag, capturing its name, when it is immediately followed by another tag with no
+ *  characters in between — i.e. a bare tag-to-tag boundary; the second capture is that next
+ *  tag's name, via a non-consuming lookahead so overlapping boundaries are still each matched. */
+const TAG_BOUNDARY = /<\/?([a-zA-Z][a-zA-Z0-9]*)\b[^>]*>(?=<\/?([a-zA-Z][a-zA-Z0-9]*)\b)/g;
+
+/**
+ * The match key for an html send, reduced the same way a landed copy's own readback will be.
+ *
+ * Only boundaries in REWRITTEN_TAG_BOUNDARY get a space inserted before reducing through
+ * htmlToText — see that set's doc comment for the two captures this is built from. Getting this
+ * wrong in EITHER direction breaks the match equally: inserting a space Teams' own rewrite would
+ * not have produces a key with an extra word a genuinely landed copy's text will never contain;
+ * omitting one Teams DOES insert leaves the key missing a word the landed copy WILL contain. Both
+ * are a false mismatch, and a false mismatch here means a landed html send retries into a real
+ * duplicate — so this only inserts where the tag names on the boundary say Teams will.
+ */
+function htmlMatchText(html: string): string {
+  const withKnownBoundarySpaces = html.replace(TAG_BOUNDARY, (match, leftName, rightName) =>
+    REWRITTEN_TAG_BOUNDARY.has(leftName.toLowerCase()) ||
+    REWRITTEN_TAG_BOUNDARY.has(rightName.toLowerCase())
+      ? `${match} `
+      : match,
+  );
+  return htmlToText(withKnownBoundarySpaces);
 }
 
 type MatchShape = 'whole-message' | 'reply-tail';
@@ -81,6 +140,27 @@ export class ReliableTeamsChats implements TeamsChatsPort {
     );
   }
 
+  sendHtmlMessage(chatId: string, html: string): Promise<ChatMessage> {
+    const matchText = htmlMatchText(html);
+    if (normalized(matchText) === '') {
+      // html like '<img src="...">' or '<hr>' reduces to no text at all — there is no readback
+      // key to guard with. Worse than merely "no retry": an EMPTY wanted string is a match
+      // against EVERY candidate whose own text also reduces to empty (findLandedCopy compares
+      // by equality), so a genuinely failed send could claim an EARLIER own message — an
+      // unrelated image, say — sent minutes ago as "this attempt's landed copy". Same shape as
+      // sendImage's own comment below: one attempt, honest error, no blind retry.
+      return this.inner.sendHtmlMessage(chatId, html);
+    }
+    // sendGuarded's second argument is the MATCH text, not necessarily what gets posted: a
+    // landed copy's readback always comes back as htmlToText(body) (toChatMessage runs every
+    // html body through it — see messages.ts), so comparing raw markup against that readback
+    // would never match and every retry would re-post a duplicate. htmlMatchText reduces the
+    // caller's html the same way (see its own doc comment for the empirically-found subtlety).
+    return this.sendGuarded(chatId, matchText, 'whole-message', () =>
+      this.inner.sendHtmlMessage(chatId, html),
+    );
+  }
+
   sendImage(chatId: string, image: OutboundImage, text?: string): Promise<ChatMessage> {
     // No readback key exists for an image (the text may be empty), so no blind retry either:
     // one attempt, honest error. Callers who need certainty read the chat themselves.
@@ -104,6 +184,13 @@ export class ReliableTeamsChats implements TeamsChatsPort {
     return this.inner.editMessage(chatId, messageId, newText);
   }
 
+  editHtmlMessage(chatId: string, messageId: string, html: string): Promise<void> {
+    // A PATCH has no send/duplicate hazard to guard against — it targets an existing message
+    // id, so there is nothing here for sendGuarded's readback dance to do. Same passthrough as
+    // editMessage.
+    return this.inner.editHtmlMessage(chatId, messageId, html);
+  }
+
   deleteMessage(chatId: string, messageId: string): Promise<void> {
     return this.inner.deleteMessage(chatId, messageId);
   }
@@ -122,9 +209,16 @@ export class ReliableTeamsChats implements TeamsChatsPort {
     return this.inner.getAttachment(chatId, messageId, attachmentId);
   }
 
+  /**
+   * matchText is what the readback is compared against, not necessarily what doSend actually
+   * posts: for a plain send it IS the sent text, but sendHtmlMessage passes htmlToText(html)
+   * here because a landed copy's readback always comes back through that same converter (see
+   * sendHtmlMessage's own comment). Keeping the two separate is what lets one guard mechanism
+   * serve both formats honestly.
+   */
   private async sendGuarded(
     chatId: string,
-    text: string,
+    matchText: string,
     shape: MatchShape,
     doSend: () => Promise<ChatMessage>,
   ): Promise<ChatMessage> {
@@ -136,7 +230,7 @@ export class ReliableTeamsChats implements TeamsChatsPort {
         // A retry only ever runs against a chat PROVEN not to hold our copy — including the
         // case where the previous readback itself failed (say, on the same dead connection
         // the send died on) and the backoff gave both a chance to recover.
-        const late = await this.findLandedCopy(chatId, text, shape, windowStart);
+        const late = await this.findLandedCopy(chatId, matchText, shape, windowStart);
         if (late.landed) {
           return late.landed;
         }
@@ -187,7 +281,7 @@ export class ReliableTeamsChats implements TeamsChatsPort {
 
       // Any other failure IS an unknown outcome — a claim about the response path, not the
       // chat. Only the chat itself can say whether the write landed.
-      const readback = await this.findLandedCopy(chatId, text, shape, windowStart);
+      const readback = await this.findLandedCopy(chatId, matchText, shape, windowStart);
       if (readback.landed) {
         return readback.landed;
       }
@@ -212,11 +306,11 @@ export class ReliableTeamsChats implements TeamsChatsPort {
 
   private async findLandedCopy(
     chatId: string,
-    text: string,
+    matchText: string,
     shape: MatchShape,
     windowStartMs: number,
   ): Promise<{ landed?: ChatMessage; blocked: boolean }> {
-    const wanted = normalized(text);
+    const wanted = normalized(matchText);
     try {
       const { messages } = await this.inner.readMessages(chatId, undefined, READBACK_LIMIT);
       // Messages arrive oldest-first (applyWatermark sorts ascending); the newest match is

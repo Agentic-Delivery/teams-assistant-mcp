@@ -11,7 +11,7 @@
       "name": "teams-styling",
       "source": "./plugins/teams-styling",
       "description": "Styling doctrine for agent-posted Teams messages: when to style and when not to, the empirically verified HTML vocabulary Teams renders, known quirks, and the live status-board pattern for agent-progress transparency.",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "author": {
         "name": "Johan Spännare",
         "url": "https://github.com/Agentic-Delivery"
