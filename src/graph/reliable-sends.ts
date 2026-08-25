@@ -164,6 +164,11 @@ export class ReliableTeamsChats implements TeamsChatsPort {
         lastFailure = caught;
       }
 
+      if (failure instanceof GraphError && failure.code === 'MessageFetchThrottled') {
+        // The reply never got as far as a send — its original could not be fetched. Retrying
+        // the whole reply (readback included) would only re-hit the family that is throttled.
+        throw failure;
+      }
       // A 429 is not an unknown outcome — Graph refused the write outright, nothing landed,
       // and reading the chat back now would only be another throttled request feeding the
       // penalty window. Wait the named window out FIRST; the readback then doubles as the

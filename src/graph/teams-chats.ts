@@ -1,4 +1,4 @@
-import { GraphClient } from './graph-client.js';
+import { GraphClient, GraphError } from './graph-client.js';
 import { textToHtml } from '../formatting.js';
 import { type ChatMessage, type ReadResult, applyWatermark, toChatMessage } from '../messages.js';
 
@@ -197,6 +197,46 @@ export class GraphTeamsChats implements TeamsChatsPort {
     return toChatMessage(created, chatId);
   }
 
+  /**
+   * One message by id. The single-message endpoint is throttled on its own budget — on
+   * 2026-08-25 it answered 429 for hours while the list endpoint for the same chat stayed
+   * healthy, which silently broke every quoted reply and every attachment download. So a 429
+   * there falls back to scanning the recent list for the id: a page costs one healthy request
+   * and the message we want is almost always among the last fifty.
+   */
+  private async fetchMessage(chatId: string, messageId: string): Promise<ChatMessage> {
+    try {
+      return toChatMessage(
+        await this.graph.get<unknown>(
+          `/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}`,
+          { readRetries: 0 }, // the list fallback below is cheaper than sleeping and re-hitting a throttled family
+        ),
+        chatId,
+      );
+    } catch (caught) {
+      if (!(caught instanceof GraphError) || caught.status !== 429) {
+        throw caught;
+      }
+      const recent = await this.graph.get<{ value?: unknown[] }>(
+        `/chats/${encodeURIComponent(chatId)}/messages?$top=50`,
+      );
+      const found = (recent.value ?? [])
+        .map((raw) => toChatMessage(raw, chatId))
+        .find((message) => message.id === messageId);
+      if (!found) {
+        throw new GraphError(
+          `Message ${messageId} could not be fetched (that endpoint is throttled` +
+            `${caught.retryAfterSeconds ? `, retry in ${caught.retryAfterSeconds}s` : ''}) and is not ` +
+            'among the chat\'s last 50 messages — nothing was posted.',
+          429,
+          'MessageFetchThrottled',
+          caught.retryAfterSeconds,
+        );
+      }
+      return found;
+    }
+  }
+
   async replyToMessage(
     chatId: string,
     replyToMessageId: string,
@@ -205,12 +245,7 @@ export class GraphTeamsChats implements TeamsChatsPort {
     // Chats have no reply threads (that is channels-only). What the Teams UI calls a reply in a
     // chat is a new message carrying a messageReference attachment - a quote card built from the
     // original message - so that is what gets posted here.
-    const original = toChatMessage(
-      await this.graph.get<unknown>(
-        `/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(replyToMessageId)}`,
-      ),
-      chatId,
-    );
+    const original = await this.fetchMessage(chatId, replyToMessageId);
 
     const reference = JSON.stringify({
       messageId: original.id,
@@ -273,10 +308,7 @@ export class GraphTeamsChats implements TeamsChatsPort {
     messageId: string,
     attachmentId?: string,
   ): Promise<AttachmentPayload> {
-    const message = await this.graph.get<unknown>(
-      `/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}`,
-    );
-    const parsed = toChatMessage(message, chatId);
+    const parsed = await this.fetchMessage(chatId, messageId);
     const attachment = attachmentId
       ? parsed.attachments.find((candidate) => candidate.id === attachmentId)
       : parsed.attachments[0];
