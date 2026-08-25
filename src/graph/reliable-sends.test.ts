@@ -24,10 +24,12 @@ function portWith(overrides: Partial<TeamsChatsPort>): TeamsChatsPort {
     listChats: reject,
     readMessages: () => Promise.resolve({ messages: [] } as unknown as ReadResult),
     sendMessage: reject,
+    sendHtmlMessage: reject,
     sendImage: reject,
     sendFile: reject,
     replyToMessage: reject,
     editMessage: reject,
+    editHtmlMessage: reject,
     deleteMessage: reject,
     setReaction: reject,
     getAttachment: reject,
@@ -199,6 +201,64 @@ describe('reliable sends — readback before any retry', () => {
 
     expect(inner.editMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1', 'new');
     expect(inner.deleteMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1');
+  });
+});
+
+describe('reliable sends — html format: readback dedup compares TEXT, not raw markup', () => {
+  it('passes a clean html send straight through, untouched', async () => {
+    const sent = message({ id: 'fresh-html' });
+    const inner = portWith({ sendHtmlMessage: vi.fn(async () => sent) });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    expect(await chats.sendHtmlMessage('19:a@thread.v2', '<b>Deploy</b> done')).toBe(sent);
+    expect(inner.sendHtmlMessage).toHaveBeenCalledWith('19:a@thread.v2', '<b>Deploy</b> done');
+    expect(inner.sendHtmlMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('an html send that "fails" but landed is found by its TEXT rendering — a raw-markup compare would never match and would duplicate', async () => {
+    // The chat readback always comes back as text (toChatMessage runs every html body through
+    // htmlToText — see messages.ts): a landed "<b>Deploy</b> done" reads back as "Deploy done".
+    // If the guard compared the raw markup instead, this never matches and the retry re-posts.
+    const landed = message({ text: 'Deploy done' });
+    const sendHtmlMessage = vi.fn(async () => {
+      throw new GraphError('socket hang up mid-response', 0);
+    });
+    const inner = portWith({
+      sendHtmlMessage,
+      readMessages: vi.fn(async () => ({ messages: [landed] }) as unknown as ReadResult),
+    });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    const result = await chats.sendHtmlMessage('19:a@thread.v2', '<b>Deploy</b> done');
+
+    expect(result).toBe(landed);
+    expect(sendHtmlMessage).toHaveBeenCalledTimes(1); // found the standing copy — never duplicated
+  });
+
+  it('an html send whose landed copy is not found (genuinely unsent) still retries and posts the same raw html again', async () => {
+    const sendHtmlMessage = vi
+      .fn()
+      .mockRejectedValueOnce(new GraphError('hang up', 0))
+      .mockResolvedValueOnce(message({ id: 'second-try' }));
+    const inner = portWith({
+      sendHtmlMessage,
+      readMessages: async () => ({ messages: [] }) as unknown as ReadResult,
+    });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    const result = await chats.sendHtmlMessage('19:a@thread.v2', '<b>Deploy</b> done');
+
+    expect(result.id).toBe('second-try');
+    expect(sendHtmlMessage).toHaveBeenNthCalledWith(2, '19:a@thread.v2', '<b>Deploy</b> done');
+  });
+
+  it('editHtmlMessage delegates untouched — a PATCH targets an existing id, nothing to guard', async () => {
+    const inner = portWith({ editHtmlMessage: vi.fn(async () => undefined) });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    await chats.editHtmlMessage('19:a@thread.v2', 'm1', '<b>corrected</b>');
+
+    expect(inner.editHtmlMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1', '<b>corrected</b>');
   });
 });
 
@@ -405,6 +465,33 @@ describe('the real assembly — GraphClient + GraphTeamsChats + ReliableTeamsCha
     expect(error.code).toBe('UnknownOutcome');
     expect(error.message).toMatch(/socket hang up/);
     expect(error.message).not.toMatch(/not sent/);
+  });
+
+  it('sendHtmlMessage posts the raw html verbatim — contentType html, content untouched by textToHtml', async () => {
+    const sleeps: number[] = [];
+    const fetchFn = vi.fn().mockResolvedValueOnce(jsonResponse(created('m1', 'irrelevant')));
+    const { chats } = stack(fetchFn, sleeps);
+    const html = '<b>Deploy</b> &amp; <span style="color:#c00">done</span>';
+
+    await chats.sendHtmlMessage('19:a@thread.v2', html);
+
+    const [, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
+    const posted = JSON.parse(init.body as string) as { body: { contentType: string; content: string } };
+    expect(posted.body).toEqual({ contentType: 'html', content: html }); // no escaping, no textToHtml
+  });
+
+  it('editHtmlMessage PATCHes the raw html verbatim', async () => {
+    const sleeps: number[] = [];
+    const fetchFn = vi.fn().mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const { chats } = stack(fetchFn, sleeps);
+    const html = '<table border="1"><tr><td>ok</td></tr></table>';
+
+    await chats.editHtmlMessage('19:a@thread.v2', 'm1', html);
+
+    const [, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
+    expect(init.method).toBe('PATCH');
+    const patched = JSON.parse(init.body as string) as { body: { contentType: string; content: string } };
+    expect(patched.body).toEqual({ contentType: 'html', content: html });
   });
 });
 

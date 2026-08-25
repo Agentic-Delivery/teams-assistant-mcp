@@ -6,7 +6,7 @@ import type {
   OutboundImage,
   TeamsChatsPort,
 } from './teams-chats.js';
-import type { ChatMessage, ReadResult } from '../messages.js';
+import { htmlToText, type ChatMessage, type ReadResult } from '../messages.js';
 
 export interface ReliableSendOptions {
   /**
@@ -81,6 +81,17 @@ export class ReliableTeamsChats implements TeamsChatsPort {
     );
   }
 
+  sendHtmlMessage(chatId: string, html: string): Promise<ChatMessage> {
+    // sendGuarded's second argument is the MATCH text, not necessarily what gets posted: a
+    // landed copy's readback always comes back as htmlToText(body) (toChatMessage runs every
+    // html body through it — see messages.ts), so comparing raw markup against that readback
+    // would never match and every retry would re-post a duplicate. Reducing the caller's html
+    // through the SAME converter the reader uses is what makes the comparison meaningful.
+    return this.sendGuarded(chatId, htmlToText(html), 'whole-message', () =>
+      this.inner.sendHtmlMessage(chatId, html),
+    );
+  }
+
   sendImage(chatId: string, image: OutboundImage, text?: string): Promise<ChatMessage> {
     // No readback key exists for an image (the text may be empty), so no blind retry either:
     // one attempt, honest error. Callers who need certainty read the chat themselves.
@@ -104,6 +115,13 @@ export class ReliableTeamsChats implements TeamsChatsPort {
     return this.inner.editMessage(chatId, messageId, newText);
   }
 
+  editHtmlMessage(chatId: string, messageId: string, html: string): Promise<void> {
+    // A PATCH has no send/duplicate hazard to guard against — it targets an existing message
+    // id, so there is nothing here for sendGuarded's readback dance to do. Same passthrough as
+    // editMessage.
+    return this.inner.editHtmlMessage(chatId, messageId, html);
+  }
+
   deleteMessage(chatId: string, messageId: string): Promise<void> {
     return this.inner.deleteMessage(chatId, messageId);
   }
@@ -122,9 +140,16 @@ export class ReliableTeamsChats implements TeamsChatsPort {
     return this.inner.getAttachment(chatId, messageId, attachmentId);
   }
 
+  /**
+   * matchText is what the readback is compared against, not necessarily what doSend actually
+   * posts: for a plain send it IS the sent text, but sendHtmlMessage passes htmlToText(html)
+   * here because a landed copy's readback always comes back through that same converter (see
+   * sendHtmlMessage's own comment). Keeping the two separate is what lets one guard mechanism
+   * serve both formats honestly.
+   */
   private async sendGuarded(
     chatId: string,
-    text: string,
+    matchText: string,
     shape: MatchShape,
     doSend: () => Promise<ChatMessage>,
   ): Promise<ChatMessage> {
@@ -136,7 +161,7 @@ export class ReliableTeamsChats implements TeamsChatsPort {
         // A retry only ever runs against a chat PROVEN not to hold our copy — including the
         // case where the previous readback itself failed (say, on the same dead connection
         // the send died on) and the backoff gave both a chance to recover.
-        const late = await this.findLandedCopy(chatId, text, shape, windowStart);
+        const late = await this.findLandedCopy(chatId, matchText, shape, windowStart);
         if (late.landed) {
           return late.landed;
         }
@@ -187,7 +212,7 @@ export class ReliableTeamsChats implements TeamsChatsPort {
 
       // Any other failure IS an unknown outcome — a claim about the response path, not the
       // chat. Only the chat itself can say whether the write landed.
-      const readback = await this.findLandedCopy(chatId, text, shape, windowStart);
+      const readback = await this.findLandedCopy(chatId, matchText, shape, windowStart);
       if (readback.landed) {
         return readback.landed;
       }
@@ -212,11 +237,11 @@ export class ReliableTeamsChats implements TeamsChatsPort {
 
   private async findLandedCopy(
     chatId: string,
-    text: string,
+    matchText: string,
     shape: MatchShape,
     windowStartMs: number,
   ): Promise<{ landed?: ChatMessage; blocked: boolean }> {
-    const wanted = normalized(text);
+    const wanted = normalized(matchText);
     try {
       const { messages } = await this.inner.readMessages(chatId, undefined, READBACK_LIMIT);
       // Messages arrive oldest-first (applyWatermark sorts ascending); the newest match is

@@ -97,6 +97,63 @@ describe('the CLI contract — exit codes, and nothing but the JSON line on stdo
     expect(result.code).toBe(2);
     expect(result.stdout).toBe('');
   });
+
+  it('teams-post --html: still gated by the allowlist exactly like plain text (exit 3, no network reached)', async () => {
+    // Proves --html is consumed as a flag, not swallowed as part of usage parsing: an
+    // allowlisted-but-not-postable chat is refused the same way with or without it.
+    const result = await runCli(
+      'post.ts',
+      ['19:readonly@thread.v2', '--html'],
+      fixtureEnv(),
+    );
+
+    expect(result.code).toBe(3);
+    expect(result.stdout).toBe('');
+  });
+
+  it('teams-edit missing arguments: exit 2, stdout empty', async () => {
+    const result = await runCli('edit.ts', [], {});
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/usage/);
+  });
+
+  it('teams-edit missing messageId: exit 2, stdout empty', async () => {
+    const result = await runCli('edit.ts', ['19:readonly@thread.v2'], {});
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+  });
+
+  it('teams-edit a chat outside the allowlist: exit 3, stdout empty', async () => {
+    const result = await runCli(
+      'edit.ts',
+      ['19:never-heard-of@thread.v2', 'msg-1'],
+      fixtureEnv(),
+    );
+
+    expect(result.code).toBe(3);
+    expect(result.stdout).toBe('');
+  });
+
+  it('teams-edit an allowlisted chat without canPost: exit 3, stdout empty (same gate as teams-post)', async () => {
+    const result = await runCli('edit.ts', ['19:readonly@thread.v2', 'msg-1'], fixtureEnv());
+
+    expect(result.code).toBe(3);
+    expect(result.stdout).toBe('');
+  });
+
+  it('teams-edit --html: reaches the same allowlist gate as plain text (exit 3, no network reached)', async () => {
+    const result = await runCli(
+      'edit.ts',
+      ['19:readonly@thread.v2', 'msg-1', '--html'],
+      fixtureEnv(),
+    );
+
+    expect(result.code).toBe(3);
+    expect(result.stdout).toBe('');
+  });
 });
 
 describe('succeed() drains stdout before exiting', () => {
