@@ -45,6 +45,8 @@ const MAX_THROTTLE_WINDOW_MS = 60 * 60_000;
 export const MAX_RETRY_SLEEP_MS = 60_000;
 
 const RETRYABLE_READ_STATUSES = new Set([429, 503, 504]);
+/** Graph collections whose next path segment is an id — the shape of a resource family. */
+const GATE_COLLECTIONS = new Set(['chats', 'messages', 'users', 'drives', 'items', 'shares', 'hostedContents', 'members', 'replies']);
 
 /** One reading of Retry-After for the whole client: a positive finite number of seconds, else nothing. */
 function retryAfterSecondsOf(response: Response): number | undefined {
@@ -65,7 +67,7 @@ export class GraphClient {
    * whole client: every request until the window passes fails fast, locally, without touching
    * the network. Silence is the only thing that ends a throttle.
    */
-  private throttledUntil = 0;
+  private readonly throttledUntil = new Map<string, number>();
 
   constructor(private readonly options: GraphClientOptions) {
     this.fetchFn = options.fetchFn ?? fetch;
@@ -75,13 +77,30 @@ export class GraphClient {
     this.nowFn = options.nowFn ?? (() => Date.now());
   }
 
-  /** Milliseconds until the gate reopens; 0 when open. Callers pacing themselves read this. */
-  throttledForMs(): number {
-    return Math.max(0, this.throttledUntil - this.nowFn());
+  /**
+   * Graph throttles per resource family, and 2026-08-25 showed the families really are
+   * separate: the single-message GET (`/chats/{id}/messages/{id}`) stayed 429 for hours while
+   * the message LIST and plain posts on the very same chat answered 200/201. One gate for the
+   * whole client would have kept the healthy families locked out, so the gate is keyed by the
+   * path with its ids blanked — `/chats/{id}/messages/{id}` and `/chats/{id}/messages` are two gates.
+   */
+  static gateKeyFor(path: string): string {
+    const pathname = (path.replace(/^https?:\/\/[^/]+/, '').split('?')[0] ?? path).replace(/^\/v1\.0/, '');
+    const segments = pathname.split('/');
+    // Structural, not length-based: the segment AFTER a collection name is an id.
+    return segments
+      .map((segment, index) => (index > 0 && GATE_COLLECTIONS.has(segments[index - 1] ?? '') ? '*' : segment))
+      .join('/');
+  }
+
+  /** Milliseconds until the gate for this path's resource family reopens; 0 when open. */
+  throttledForMs(path = '/'): number {
+    const until = this.throttledUntil.get(GraphClient.gateKeyFor(path)) ?? 0;
+    return Math.max(0, until - this.nowFn());
   }
 
   private assertGateOpen(path: string): void {
-    const remaining = this.throttledForMs();
+    const remaining = this.throttledForMs(path);
     if (remaining > 0) {
       throw new GraphError(
         `Locally throttled: a recent 429 closed this client for another ${Math.ceil(remaining / 1000)}s (${path} not sent)`,
@@ -92,13 +111,14 @@ export class GraphClient {
     }
   }
 
-  private noteThrottle(response: Response): void {
+  private noteThrottle(path: string, response: Response): void {
     if (response.status !== 429) {
       return;
     }
     const named = retryAfterSecondsOf(response);
     const windowMs = named ? Math.min(named * 1000, MAX_THROTTLE_WINDOW_MS) : DEFAULT_THROTTLE_WINDOW_MS;
-    this.throttledUntil = Math.max(this.throttledUntil, this.nowFn() + windowMs);
+    const key = GraphClient.gateKeyFor(path);
+    this.throttledUntil.set(key, Math.max(this.throttledUntil.get(key) ?? 0, this.nowFn() + windowMs));
   }
 
   private url(path: string): string {
@@ -115,7 +135,7 @@ export class GraphClient {
         authorization: `Bearer ${token}`,
       },
     });
-    this.noteThrottle(response);
+    this.noteThrottle(path, response);
     return response;
   }
 
@@ -152,7 +172,7 @@ export class GraphClient {
       // what one call may hang for, there is no honest retry: fail now — with Graph's own
       // message and code intact — rather than sleep a minute and then fail locally anyway.
       const named = retryAfterSecondsOf(response);
-      const waitMs = Math.max(named ? named * 1000 : 0, this.throttledForMs(), 2 ** attempt * 1000);
+      const waitMs = Math.max(named ? named * 1000 : 0, this.throttledForMs(path), 2 ** attempt * 1000);
       if (waitMs > MAX_RETRY_SLEEP_MS) {
         await this.fail(response);
       }

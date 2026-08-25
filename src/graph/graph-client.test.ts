@@ -405,7 +405,7 @@ describe('graph client — throttle handling on reads', () => {
     await expect(client.get('/me')).rejects.toMatchObject({ status: 429, retryAfterSeconds: 300 });
     expect(fetchFn).toHaveBeenCalledTimes(1); // sleeping a minute to fail locally would be theatre
     expect(waits).toEqual([]);
-    expect(client.throttledForMs()).toBe(300_000); // the window Graph named, not a 60 s stand-in
+    expect(client.throttledForMs('/me')).toBe(300_000); // the window Graph named, not a 60 s stand-in
   });
 
   it('a 429 with NO Retry-After still waits the gate out before the single retry (not a 1 s exponential)', async () => {
@@ -562,7 +562,7 @@ describe('graph client — the throttle gate (2026-08-25: retries under 429 ampl
     await expect(client.get('/me')).rejects.toMatchObject({ status: 429 });
     await expect(client.get('/me')).rejects.toMatchObject({ code: 'LocallyThrottled' });
     expect(fetchFn).toHaveBeenCalledTimes(1);
-    expect(client.throttledForMs()).toBeGreaterThan(0);
+    expect(client.throttledForMs('/me')).toBeGreaterThan(0);
   });
 });
 
@@ -602,5 +602,55 @@ describe('graph client — 503 WITHOUT Retry-After (the non-triggering side)', (
 
     expect(await client.get('/me')).toEqual({ id: 'fine' });
     expect(waits).toEqual([1000]);
+  });
+});
+
+describe('graph client — the gate is per resource family (2026-08-25: single-message GETs throttled, lists healthy)', () => {
+  it('a 429 on /chats/{id}/messages/{id} does not close /chats/{id}/messages', async () => {
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 't' } }), { status: 429, headers: { 'retry-after': '60', 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(json({ value: [{ id: '1' }] }));
+    const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, readRetries: 0, nowFn: () => 0 });
+
+    await expect(client.get('/chats/19%3Aabc%40thread.v2/messages/1787644105434')).rejects.toMatchObject({ status: 429 });
+    expect(await client.get('/chats/19%3Aabc%40thread.v2/messages?$top=50')).toEqual({ value: [{ id: '1' }] });
+    expect(client.throttledForMs('/chats/19%3Aabc%40thread.v2/messages/999')).toBe(60_000);
+    expect(client.throttledForMs('/chats/19%3Aabc%40thread.v2/messages')).toBe(0);
+  });
+
+  it('gateKeyFor blanks ids but keeps the resource shape', () => {
+    expect(GraphClient.gateKeyFor('/chats/19%3Aabc%40thread.v2/messages/1787644105434')).toBe('/chats/*/messages/*');
+    expect(GraphClient.gateKeyFor('/chats/19%3Aabc%40thread.v2/messages?$top=50')).toBe('/chats/*/messages');
+    expect(GraphClient.gateKeyFor('/me/chats')).toBe('/me/chats');
+    expect(GraphClient.gateKeyFor('https://graph.microsoft.com/v1.0/me/chats?$top=1')).toBe('/me/chats');
+  });
+});
+
+describe('teams chats — single-message fetch falls back to the list under throttle', () => {
+  const throttled = () => new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 't' } }), { status: 429, headers: { 'retry-after': '60', 'content-type': 'application/json' } });
+  const raw = (id: string, text: string) => ({ id, createdDateTime: '2026-08-25T07:48:25Z', from: { user: { displayName: 'Kleivdal, Celine', id: 'u1' } }, body: { contentType: 'text', content: text }, attachments: [] });
+
+  it('replyToMessage: the original is found in the recent list and the quoted reply is posted', async () => {
+    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
+      if (init.method === 'POST') return json({ ...raw('new-1', 'reply'), from: { user: { displayName: 'Assistant' } } }, 201);
+      if (url.endsWith('/messages/1787644105434')) return throttled();
+      return json({ value: [raw('other', 'x'), raw('1787644105434', 'Logo:')] });
+    });
+    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, readRetries: 0, nowFn: () => 0 }));
+
+    const sent = await chats.replyToMessage('19:a@thread.v2', '1787644105434', 'Takk!');
+
+    expect(sent.id).toBe('new-1');
+    const post = fetchFn.mock.calls.find(([, init]) => (init as RequestInit).method === 'POST')!;
+    expect(JSON.parse((post[1] as RequestInit).body as string).attachments[0].content).toMatch(/"messagePreview":"Logo:"/);
+  });
+
+  it('replyToMessage: not in the last 50 either → a named MessageFetchThrottled error, nothing posted', async () => {
+    const fetchFn = vi.fn(async (url: string) => (url.endsWith('/messages/old-id') ? throttled() : json({ value: [raw('other', 'x')] })));
+    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, readRetries: 0, nowFn: () => 0 }));
+
+    await expect(chats.replyToMessage('19:a@thread.v2', 'old-id', 'hi')).rejects.toMatchObject({ code: 'MessageFetchThrottled' });
+    expect(fetchFn.mock.calls.some(([, init]) => (init as RequestInit)?.method === 'POST')).toBe(false);
   });
 });
