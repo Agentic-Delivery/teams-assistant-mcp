@@ -48,8 +48,10 @@ const RETRYABLE_READ_STATUSES = new Set([429, 503, 504]);
 /** Graph collections whose next path segment is an id — the shape of a resource family. Only the
  *  collections this chats-only server actually touches; a speculative list only hides gaps. */
 const GATE_COLLECTIONS = new Set(['chats', 'messages', 'shares', 'hostedContents']);
-/** Error codes Graph uses for APPLICATION-wide throttling: these close every family at once. */
-const GLOBAL_THROTTLE_CODES = new Set(['ApplicationThrottled', 'ActivityLimitReached', 'ServiceUnavailable']);
+/** The error code Graph uses for APPLICATION-wide throttling: it closes every family at once.
+ *  Kept to the one code seen live (2026-08-25); speculative entries would either never match or
+ *  turn an ordinary per-resource 429 into a client-wide lockout. */
+const GLOBAL_THROTTLE_CODES = new Set(['ApplicationThrottled']);
 const GLOBAL_GATE_KEY = '*';
 
 /** One reading of Retry-After for the whole client: a positive finite number of seconds, else nothing. */
@@ -119,7 +121,9 @@ export class GraphClient {
     const remaining = this.throttledForMs(path);
     if (remaining > 0) {
       throw new GraphError(
-        `Locally throttled: a recent 429 closed this client for another ${Math.ceil(remaining / 1000)}s (${path} not sent)`,
+        `Locally throttled: a recent 429 closed the gate for ${GraphClient.gateKeyFor(path)} ` +
+          `(or the global gate) for another ${Math.ceil(remaining / 1000)}s — ${path} not sent; ` +
+          'other resource families may still be fine',
         429,
         'LocallyThrottled',
         Math.ceil(remaining / 1000),
