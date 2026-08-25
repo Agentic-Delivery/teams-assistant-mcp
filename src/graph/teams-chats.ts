@@ -317,10 +317,13 @@ export class GraphTeamsChats implements TeamsChatsPort {
       : parsed.attachments.find((candidate) => candidate.contentType !== 'messageReference');
 
     if (!attachment) {
+      const onlyQuote = parsed.attachments.length > 0;
       throw new Error(
         attachmentId
           ? `Message ${messageId} has no attachment ${attachmentId}.`
-          : `Message ${messageId} has no attachments.`,
+          : onlyQuote
+            ? `Message ${messageId} has no downloadable attachment — only a quoted-message card.`
+            : `Message ${messageId} has no attachments.`,
       );
     }
 
