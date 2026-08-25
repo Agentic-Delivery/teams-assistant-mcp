@@ -268,6 +268,16 @@ describe('inbox poller — behaviour under throttle (2026-08-25)', () => {
     expect(clean).toBe(false);
   });
 
+  it('a healthy chat followed by a throttled one: the cycle is NOT clean even though one of two succeeded', async () => {
+    const readMessages = async (chatId: string, since?: string) => {
+      if (chatId.includes('two')) throw Object.assign(new Error('Too many requests'), { status: 429 });
+      return applyWatermark([], since);
+    };
+    const p = pollerOver(readMessages, ['19:one@thread.v2', '19:two@thread.v2']);
+
+    expect(await p.pollOnce()).toBe(false);
+  });
+
   it('a chat answering 403 is parked: not asked again on the next cycle, while healthy chats still are', async () => {
     const asked: string[] = [];
     const readMessages = async (chatId: string, since?: string) => {
