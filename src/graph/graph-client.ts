@@ -45,8 +45,12 @@ const MAX_THROTTLE_WINDOW_MS = 60 * 60_000;
 export const MAX_RETRY_SLEEP_MS = 60_000;
 
 const RETRYABLE_READ_STATUSES = new Set([429, 503, 504]);
-/** Graph collections whose next path segment is an id — the shape of a resource family. */
-const GATE_COLLECTIONS = new Set(['chats', 'messages', 'users', 'drives', 'items', 'shares', 'hostedContents', 'members', 'replies']);
+/** Graph collections whose next path segment is an id — the shape of a resource family. Only the
+ *  collections this chats-only server actually touches; a speculative list only hides gaps. */
+const GATE_COLLECTIONS = new Set(['chats', 'messages', 'shares', 'hostedContents']);
+/** Error codes Graph uses for APPLICATION-wide throttling: these close every family at once. */
+const GLOBAL_THROTTLE_CODES = new Set(['ApplicationThrottled', 'ActivityLimitReached', 'ServiceUnavailable']);
+const GLOBAL_GATE_KEY = '*';
 
 /** One reading of Retry-After for the whole client: a positive finite number of seconds, else nothing. */
 function retryAfterSecondsOf(response: Response): number | undefined {
@@ -61,11 +65,16 @@ export class GraphClient {
   private readonly readRetries: number;
   private readonly nowFn: () => number;
   /**
-   * The throttle gate. Graph ESCALATES its penalty window when a caller keeps sending while
+   * The throttle gates. Graph ESCALATES its penalty window when a caller keeps sending while
    * throttled — and on 2026-08-25 this client's own retries, stacked under a poller and a
-   * readback loop, kept an account throttled for hours. One 429 now closes the gate for the
-   * whole client: every request until the window passes fails fast, locally, without touching
-   * the network. Silence is the only thing that ends a throttle.
+   * readback loop, kept an account throttled for hours. A 429 closes a gate: every request on
+   * that gate until the window passes fails fast, locally, without touching the network.
+   * Silence is the only thing that ends a throttle.
+   *
+   * Gates are keyed per resource FAMILY (see gateKeyFor) because Graph throttles per resource —
+   * the same day showed the single-message GET refused for hours while the message list and
+   * plain posts on the same chat were healthy. An APPLICATION-wide throttle (Graph says so by
+   * error code, e.g. ApplicationThrottled) closes the global gate, which every request checks.
    */
   private readonly throttledUntil = new Map<string, number>();
 
@@ -85,18 +94,25 @@ export class GraphClient {
    * path with its ids blanked — `/chats/{id}/messages/{id}` and `/chats/{id}/messages` are two gates.
    */
   static gateKeyFor(path: string): string {
-    const pathname = (path.replace(/^https?:\/\/[^/]+/, '').split('?')[0] ?? path).replace(/^\/v1\.0/, '');
-    const segments = pathname.split('/');
+    const withoutHost = path.replace(/^https?:\/\/[^/]+/, '').replace(/^\/v1\.0/, '');
+    const pathname = withoutHost.split('?')[0] as string;
+    // OneDrive path syntax (`/me/drive/root:/folder/file.pdf:/content`) carries the file name in
+    // the path itself; everything from `root:` on is one family, whatever the file or folder.
+    const driveCut = pathname.indexOf('/root:');
+    const shaped = driveCut >= 0 ? `${pathname.slice(0, driveCut)}/root:*` : pathname;
+    const segments = shaped.split('/');
     // Structural, not length-based: the segment AFTER a collection name is an id.
     return segments
       .map((segment, index) => (index > 0 && GATE_COLLECTIONS.has(segments[index - 1] ?? '') ? '*' : segment))
       .join('/');
   }
 
-  /** Milliseconds until the gate for this path's resource family reopens; 0 when open. */
-  throttledForMs(path = '/'): number {
-    const until = this.throttledUntil.get(GraphClient.gateKeyFor(path)) ?? 0;
-    return Math.max(0, until - this.nowFn());
+  /** Milliseconds until this path's gate (its family's or the global one) reopens; 0 when open. */
+  throttledForMs(path: string): number {
+    const now = this.nowFn();
+    const family = this.throttledUntil.get(GraphClient.gateKeyFor(path)) ?? 0;
+    const global = this.throttledUntil.get(GLOBAL_GATE_KEY) ?? 0;
+    return Math.max(0, Math.max(family, global) - now);
   }
 
   private assertGateOpen(path: string): void {
@@ -111,13 +127,19 @@ export class GraphClient {
     }
   }
 
-  private noteThrottle(path: string, response: Response): void {
+  private async noteThrottle(path: string, response: Response): Promise<void> {
     if (response.status !== 429) {
       return;
     }
     const named = retryAfterSecondsOf(response);
     const windowMs = named ? Math.min(named * 1000, MAX_THROTTLE_WINDOW_MS) : DEFAULT_THROTTLE_WINDOW_MS;
-    const key = GraphClient.gateKeyFor(path);
+    // Peek at the error code without consuming the body the caller still needs.
+    const code = await response
+      .clone()
+      .json()
+      .then((body) => (body as { error?: { code?: string } })?.error?.code)
+      .catch(() => undefined);
+    const key = code && GLOBAL_THROTTLE_CODES.has(code) ? GLOBAL_GATE_KEY : GraphClient.gateKeyFor(path);
     this.throttledUntil.set(key, Math.max(this.throttledUntil.get(key) ?? 0, this.nowFn() + windowMs));
   }
 
@@ -135,7 +157,7 @@ export class GraphClient {
         authorization: `Bearer ${token}`,
       },
     });
-    this.noteThrottle(path, response);
+    await this.noteThrottle(path, response);
     return response;
   }
 
@@ -151,10 +173,12 @@ export class GraphClient {
     );
   }
 
-  async get<T>(path: string): Promise<T> {
+  async get<T>(path: string, options: { readRetries?: number } = {}): Promise<T> {
     // Reads are idempotent, so a throttled or briefly unavailable GET may be retried after the
     // wait the server names (capped — an aggressive Retry-After must not park the caller for
-    // minutes), falling back to a short exponential pause.
+    // minutes), falling back to a short exponential pause. A caller holding a cheaper fallback
+    // (a list scan instead of a throttled single fetch) passes readRetries: 0 and takes it now.
+    const readRetries = options.readRetries ?? this.readRetries;
     for (let attempt = 0; ; attempt += 1) {
       const response = await this.authorized(path, { method: 'GET' });
       if (response.ok) {
@@ -163,7 +187,7 @@ export class GraphClient {
         }
         return (await response.json()) as T;
       }
-      if (attempt >= this.readRetries || !RETRYABLE_READ_STATUSES.has(response.status)) {
+      if (attempt >= readRetries || !RETRYABLE_READ_STATUSES.has(response.status)) {
         await this.fail(response);
       }
       // The wait honours a named Retry-After on ANY retryable status (a 503 that asks for

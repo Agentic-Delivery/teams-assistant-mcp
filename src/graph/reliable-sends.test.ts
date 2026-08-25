@@ -470,3 +470,28 @@ describe('the real assembly — round 2', () => {
     expect(error.message).toMatch(/socket hang up/);
   });
 });
+
+describe('the real assembly — MessageFetchThrottled through the decorator', () => {
+  const stubToken: TokenProvider = { kind: 'stub', getAccessToken: async () => 't' };
+  const jsonResponse = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+
+  it('a reply whose original cannot be fetched fails at once with MessageFetchThrottled — no send, no readback, no sleep', async () => {
+    const posts: number[] = [];
+    const sleeps: number[] = [];
+    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
+      if (init.method === 'POST') { posts.push(1); return jsonResponse({ id: 'never' }, 201); }
+      if (url.endsWith('/messages/old-id')) return new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 't' } }), { status: 429, headers: { 'retry-after': '60', 'content-type': 'application/json' } });
+      return jsonResponse({ value: [] });
+    });
+    let now = 0;
+    const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async (ms) => { sleeps.push(ms); now += ms; }, nowFn: () => now });
+    const chats = new ReliableTeamsChats(new GraphTeamsChats(client), { selfDisplayName: 'Assistant', sleepFn: async (ms) => { sleeps.push(ms); now += ms; }, nowFn: () => new Date(now) });
+
+    const error = (await chats.replyToMessage('19:a@thread.v2', 'old-id', 'hi').catch((c: unknown) => c)) as GraphError;
+
+    expect(error.code).toBe('MessageFetchThrottled');
+    expect(error.message).toMatch(/nothing was posted/);
+    expect(posts).toHaveLength(0);
+    expect(sleeps).toEqual([]);
+  });
+});

@@ -539,7 +539,7 @@ describe('graph client — the throttle gate (2026-08-25: retries under 429 ampl
   it('a GET retries at most ONCE after a 429, and never while the gate is closed', async () => {
     let now = 0;
     const waits: number[] = [];
-    const fetchFn = vi.fn().mockResolvedValue(throttled('5'));
+    const fetchFn = vi.fn(async () => throttled('5')); // a fresh Response per call — bodies are single-use
     const client = new GraphClient({
       tokenProvider: stubToken,
       fetchFn: fetchFn as never,
@@ -637,20 +637,74 @@ describe('teams chats — single-message fetch falls back to the list under thro
       if (url.endsWith('/messages/1787644105434')) return throttled();
       return json({ value: [raw('other', 'x'), raw('1787644105434', 'Logo:')] });
     });
-    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, readRetries: 0, nowFn: () => 0 }));
+    const sleeps: number[] = [];
+    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async (ms) => void sleeps.push(ms), nowFn: () => 0 }));
 
     const sent = await chats.replyToMessage('19:a@thread.v2', '1787644105434', 'Takk!');
 
     expect(sent.id).toBe('new-1');
+    // The throttled endpoint was hit exactly ONCE, and nobody slept: the fallback is cheaper than
+    // the client's own retry, so fetchMessage opts out of it.
+    expect(fetchFn.mock.calls.filter(([url]) => String(url).endsWith('/messages/1787644105434'))).toHaveLength(1);
+    expect(sleeps).toEqual([]);
     const post = fetchFn.mock.calls.find(([, init]) => (init as RequestInit).method === 'POST')!;
     expect(JSON.parse((post[1] as RequestInit).body as string).attachments[0].content).toMatch(/"messagePreview":"Logo:"/);
   });
 
   it('replyToMessage: not in the last 50 either → a named MessageFetchThrottled error, nothing posted', async () => {
     const fetchFn = vi.fn(async (url: string) => (url.endsWith('/messages/old-id') ? throttled() : json({ value: [raw('other', 'x')] })));
-    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, readRetries: 0, nowFn: () => 0 }));
+    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }));
 
-    await expect(chats.replyToMessage('19:a@thread.v2', 'old-id', 'hi')).rejects.toMatchObject({ code: 'MessageFetchThrottled' });
+    await expect(chats.replyToMessage('19:a@thread.v2', 'old-id', 'hi')).rejects.toMatchObject({ code: 'MessageFetchThrottled', status: 429, retryAfterSeconds: 60 });
     expect(fetchFn.mock.calls.some(([, init]) => (init as RequestInit)?.method === 'POST')).toBe(false);
+  });
+});
+
+describe('graph client — global vs family gates, drive paths (review round 1 of the per-family change)', () => {
+  const appThrottled = () => new Response(JSON.stringify({ error: { code: 'ApplicationThrottled', message: 'Rate limit is exceeded. Try again in 300 seconds.' } }), { status: 429, headers: { 'retry-after': '300', 'content-type': 'application/json' } });
+
+  it('an APPLICATION-wide 429 (by error code) closes every family, not just the one that answered', async () => {
+    const fetchFn = vi.fn().mockResolvedValueOnce(appThrottled());
+    const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, readRetries: 0, nowFn: () => 0 });
+
+    await expect(client.get('/me/chats')).rejects.toMatchObject({ status: 429, code: 'ApplicationThrottled' });
+    await expect(client.post('/chats/x/messages', {})).rejects.toMatchObject({ code: 'LocallyThrottled' });
+    await expect(client.get('/chats/x/messages/1')).rejects.toMatchObject({ code: 'LocallyThrottled' });
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('a plain per-resource 429 (TooManyRequests) closes only its own family — the non-triggering side', async () => {
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 't' } }), { status: 429, headers: { 'retry-after': '60', 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(json({ id: 'posted' }));
+    const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, readRetries: 0, nowFn: () => 0 });
+
+    await expect(client.get('/chats/x/messages/1')).rejects.toMatchObject({ status: 429 });
+    expect(await client.post('/chats/x/messages', {})).toEqual({ id: 'posted' });
+  });
+
+  it('OneDrive path syntax: every file under the drive root is ONE family', () => {
+    expect(GraphClient.gateKeyFor('/me/drive/root:/ai-test/report.pdf:/content')).toBe('/me/drive/root:*');
+    expect(GraphClient.gateKeyFor('/me/drive/root:/other-dir/x.png:/content')).toBe('/me/drive/root:*');
+    expect(GraphClient.gateKeyFor('/shares/u!abc/driveItem/content')).toBe('/shares/*/driveItem/content');
+  });
+});
+
+describe('teams chats — getAttachment under the single-message throttle', () => {
+  it('falls back to the list, finds the attachment there, and downloads it', async () => {
+    const throttled = () => new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 't' } }), { status: 429, headers: { 'retry-after': '60', 'content-type': 'application/json' } });
+    const listed = { id: 'm-1', createdDateTime: '2026-08-25T07:48:25Z', from: { user: { displayName: 'Celine', id: 'u1' } }, body: { contentType: 'html', content: 'Logo:' }, attachments: [{ id: 'att-1', contentType: 'image/png', name: 'logo.png', contentUrl: null }] };
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.endsWith('/messages/m-1')) return throttled();
+      if (url.includes('/hostedContents/')) return new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { 'content-type': 'image/png' } });
+      return json({ value: [listed] });
+    });
+    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }));
+
+    const payload = await chats.getAttachment('19:a@thread.v2', 'm-1', 'att-1');
+
+    expect(payload.contentType).toBe('image/png');
+    expect(payload.bytes.length).toBe(3);
   });
 });

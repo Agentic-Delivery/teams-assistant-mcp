@@ -25,12 +25,21 @@ Fix direction: a lock file next to the inbox (first server takes it, later ones 
 and say so on stderr), or a per-session `TEAMS_INBOX_PATH`. Until then, keep one session per
 account, or set `TEAMS_INBOX_DISABLED=1` in the extra ones.
 
-## The throttle gate is per process (0.2.0)
+## The throttle gates are per process (0.2.0; per resource family since 0.2.1)
 
-`GraphClient` closes a client-wide gate on the first 429 so nothing in that process keeps feeding
-Graph's penalty window. Separate processes do not share it: a cron loop running `teams-post` in
+`GraphClient` closes a gate on a 429 — per resource family, or the global gate for an
+application-wide throttle — so nothing in that process keeps feeding Graph's penalty window on
+that family. Separate processes do not share it: a cron loop running `teams-post` in
 a fresh process each time, a second server instance, or an orchestrator's own retry loop around
 the CLIs is entirely ungated and will keep the throttle alive while the server believes it is
 being quiet. Space such callers yourself (one attempt, then wait the window), or route them
 through one long-lived process. A cross-process gate (a lock file beside the token cache) is the
 fix direction if this bites again.
+
+## Quoted replies to old messages fail under the single-message throttle (0.2.1)
+
+`GET /chats/{id}/messages/{id}` is throttled on its own budget. When it is, a quoted reply (which
+fetches the original to build the quote card) and an attachment download fall back to the chat's
+last 50 messages. A message older than that cannot be fetched until the throttle clears; the
+reply fails with `MessageFetchThrottled` and nothing is posted. Post a plain message instead, or
+wait the named window.

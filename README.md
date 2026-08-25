@@ -118,11 +118,19 @@ out any `Retry-After` the throttle named. Reads (GETs) retry ONCE inside `GraphC
 429/503/504, after the named wait; writes never auto-retry at that layer. A 204 or empty body on
 a write is a success, not a parse error.
 
-**The throttle gate (since 0.2.0).** Graph escalates its penalty window when a caller keeps
-sending while throttled — and retries that look reasonable one call at a time add up to exactly
-that. So one 429 closes a client-wide gate for the full `Retry-After` (30 s when none is
-named): every request from that process until the window passes fails fast, locally, as
-`GraphError` code `LocallyThrottled`, without touching the network. A throttled send waits the
+**The throttle gates (since 0.2.0, per resource family since 0.2.1).** Graph escalates its
+penalty window when a caller keeps sending while throttled — and retries that look reasonable
+one call at a time add up to exactly that. So a 429 closes a gate for the full `Retry-After`
+(30 s when none is named): every request on that gate until the window passes fails fast,
+locally, as `GraphError` code `LocallyThrottled`, without touching the network. Gates are keyed
+per resource family (`/chats/{id}/messages/{id}` and `/chats/{id}/messages` are two gates —
+Graph throttles them separately, and 2026-08-25 proved it: the single-message fetch was
+refused for hours while the message list and plain posts on the same chat stayed healthy);
+an application-wide throttle (`ApplicationThrottled` and friends, by error code) closes the
+global gate every request checks. A quoted reply and an attachment download both start with
+that single-message fetch, so under its throttle they fall back to scanning the chat's last
+50 messages; a reply to something older than that fails with `MessageFetchThrottled` —
+nothing posted, the wait named. A throttled send waits the
 window out BEFORE reading the chat back, then retries once — unless the named window exceeds
 what one call may sleep (60 s), in which case it fails immediately with the 429 and its
 Retry-After, no theatre first. If a send's outcome is genuinely

@@ -209,6 +209,7 @@ export class GraphTeamsChats implements TeamsChatsPort {
       return toChatMessage(
         await this.graph.get<unknown>(
           `/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}`,
+          { readRetries: 0 }, // the list fallback below is cheaper than sleeping and re-hitting a throttled family
         ),
         chatId,
       );
@@ -224,8 +225,9 @@ export class GraphTeamsChats implements TeamsChatsPort {
         .find((message) => message.id === messageId);
       if (!found) {
         throw new GraphError(
-          `Message ${messageId} could not be fetched directly (throttled) and is not among the ` +
-            'chat\'s last 50 messages.',
+          `Message ${messageId} could not be fetched (that endpoint is throttled` +
+            `${caught.retryAfterSeconds ? `, retry in ${caught.retryAfterSeconds}s` : ''}) and is not ` +
+            'among the chat\'s last 50 messages — nothing was posted.',
           429,
           'MessageFetchThrottled',
           caught.retryAfterSeconds,
