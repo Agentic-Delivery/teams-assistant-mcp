@@ -123,7 +123,9 @@ sending while throttled — and retries that look reasonable one call at a time 
 that. So one 429 closes a client-wide gate for the full `Retry-After` (30 s when none is
 named): every request from that process until the window passes fails fast, locally, as
 `GraphError` code `LocallyThrottled`, without touching the network. A throttled send waits the
-window out BEFORE reading the chat back, then retries once. If a send's outcome is genuinely
+window out BEFORE reading the chat back, then retries once — unless the named window exceeds
+what one call may sleep (60 s), in which case it fails immediately with the 429 and its
+Retry-After, no theatre first. If a send's outcome is genuinely
 unknown (the response path died) and the gate then blocks the readback, the send reports
 `UnknownOutcome` naming the original failure — never "not sent". The gate is per process: see
 KNOWN-ISSUES.
