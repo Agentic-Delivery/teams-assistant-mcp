@@ -4,7 +4,7 @@ import { basename, extname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { z } from 'zod';
 import type { ChatAllowlist } from './allowlist.js';
-import type { TeamsChatsPort } from './graph/teams-chats.js';
+import type { ChatMessage, TeamsChatsPort } from './graph/teams-chats.js';
 
 export interface ServerDeps {
   chats: TeamsChatsPort;
@@ -150,7 +150,7 @@ export function buildServer(deps: ServerDeps): McpServer {
     ({ chatId, text, format }) =>
       guard(async () => {
         allowlist.assertPostable(chatId);
-        let sent;
+        let sent: ChatMessage;
         if (format === 'html') {
           sent = await chats.sendHtmlMessage(chatId, text);
         } else {
