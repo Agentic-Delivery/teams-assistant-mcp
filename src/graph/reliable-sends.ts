@@ -38,25 +38,58 @@ function normalized(text: string): string {
 }
 
 /**
+ * Tags whose stored body Teams is confirmed to re-serialize — and, in doing so, pretty-print
+ * with a raw newline between every bare-adjacent tag pair inside it. Table structure ONLY, per
+ * two live captures (2026-08-25, see reliable-sends.test.ts's captured-readback fixtures):
+ *
+ *  - A MINIFIED table (`<td>build</td><td>ok</td>`, zero whitespace between adjacent tags) came
+ *    back rewritten with an inserted `<tbody>` and a newline at every boundary inside it,
+ *    including `</td><td>` and `</th><th>` — htmlToText's BLOCK_END does not treat those as
+ *    word boundaries (only p/div/li/tr/h1-6/br are), so reducing the SENT html straight through
+ *    htmlToText under-counts word boundaries a landed copy WILL have ("buildok" locally vs.
+ *    "build ok" once Teams has rewritten it), and a mid-flight response failure would retry
+ *    into a real duplicate (2026-08-24's incident, through the html door).
+ *  - `<p><b>a</b><i>b</i></p>` (zero whitespace at three bare boundaries: p→b, b→i, i→p) came
+ *    back COMPLETELY UNCHANGED — not even the p→b boundary was touched, despite p being one of
+ *    BLOCK_END's own tags. So "block tag" is not what triggers rewriting; table normalization
+ *    (Teams inserting the implicit `<tbody>` HTML5 requires, which apparently forces the whole
+ *    subtree through a re-serializer) is the only mechanism observed. Treating every block tag
+ *    as a rewrite boundary — the first attempt at this fix — was therefore itself wrong: it
+ *    would insert a space at, say, a `</b><code>` boundary Teams never touches, producing a
+ *    match key with an extra word Teams' real readback text will never have.
+ *
+ * What remains UNVERIFIED: list tags (ul/ol/li) and other table-adjacent tags (thead) are
+ * assumed to behave like the confirmed table tags because they participate in the same
+ * HTML5-normalization family, but that assumption has not itself been captured. If a future
+ * duplicate incident traces back to one of them, capture it and extend this set with its own
+ * evidence rather than guessing further.
+ */
+const REWRITTEN_TAG_BOUNDARY = new Set(['table', 'thead', 'tbody', 'tr', 'td', 'th']);
+
+/** Matches one tag, capturing its name, when it is immediately followed by another tag with no
+ *  characters in between — i.e. a bare tag-to-tag boundary; the second capture is that next
+ *  tag's name, via a non-consuming lookahead so overlapping boundaries are still each matched. */
+const TAG_BOUNDARY = /<\/?([a-zA-Z][a-zA-Z0-9]*)\b[^>]*>(?=<\/?([a-zA-Z][a-zA-Z0-9]*)\b)/g;
+
+/**
  * The match key for an html send, reduced the same way a landed copy's own readback will be.
  *
- * Empirically checked 2026-08-25 (see reliable-sends.test.ts's captured-readback fixture): a
- * MINIFIED table (`<td>build</td><td>ok</td>`, no whitespace between adjacent tags) sent via
- * sendHtmlMessage came back from a real Graph GET rewritten with a raw newline between EVERY
- * pair of bare-adjacent tags — including `</td><td>` and `</th><th>`, which htmlToText's
- * BLOCK_END does not treat as word boundaries (only p/div/li/tr/h1-6/br are). Reducing our own
- * freshly-authored html straight through htmlToText therefore under-counts word boundaries a
- * landed copy WILL have: "buildok" locally vs. "build ok" once Teams has rewritten it — so a
- * genuinely landed html send would never match its own readback, and a mid-flight response
- * failure would retry into a real duplicate (2026-08-24's incident, through the html door).
- *
- * Inserting a space at every bare tag-to-tag boundary before reducing closes that gap. It is a
- * conservative over-approximation — normalized() below collapses any whitespace this adds that
- * Teams' own rewrite would not have — so it can only turn a false MISMATCH into a match, never
- * the reverse.
+ * Only boundaries in REWRITTEN_TAG_BOUNDARY get a space inserted before reducing through
+ * htmlToText — see that set's doc comment for the two captures this is built from. Getting this
+ * wrong in EITHER direction breaks the match equally: inserting a space Teams' own rewrite would
+ * not have produces a key with an extra word a genuinely landed copy's text will never contain;
+ * omitting one Teams DOES insert leaves the key missing a word the landed copy WILL contain. Both
+ * are a false mismatch, and a false mismatch here means a landed html send retries into a real
+ * duplicate — so this only inserts where the tag names on the boundary say Teams will.
  */
 function htmlMatchText(html: string): string {
-  return htmlToText(html.replace(/></g, '> <'));
+  const withKnownBoundarySpaces = html.replace(TAG_BOUNDARY, (match, leftName, rightName) =>
+    REWRITTEN_TAG_BOUNDARY.has(leftName.toLowerCase()) ||
+    REWRITTEN_TAG_BOUNDARY.has(rightName.toLowerCase())
+      ? `${match} `
+      : match,
+  );
+  return htmlToText(withKnownBoundarySpaces);
 }
 
 type MatchShape = 'whole-message' | 'reply-tail';
