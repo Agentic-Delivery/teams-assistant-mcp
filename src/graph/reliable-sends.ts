@@ -53,16 +53,20 @@ function normalized(text: string): string {
  *    back COMPLETELY UNCHANGED — not even the p→b boundary was touched, despite p being one of
  *    BLOCK_END's own tags. So "block tag" is not what triggers rewriting; table normalization
  *    (Teams inserting the implicit `<tbody>` HTML5 requires, which apparently forces the whole
- *    subtree through a re-serializer) is the only mechanism observed. Treating every block tag
- *    as a rewrite boundary — the first attempt at this fix — was therefore itself wrong: it
- *    would insert a space at, say, a `</b><code>` boundary Teams never touches, producing a
- *    match key with an extra word Teams' real readback text will never have.
+ *    subtree through a re-serializer) is the only mechanism observed. Inserting at EVERY bare
+ *    boundary — the first attempt at this fix — was therefore itself wrong: it would insert a
+ *    space at, say, a `</b><code>` boundary Teams never touches, producing a match key with an
+ *    extra word Teams' real readback text will never have.
  *
- * What remains UNVERIFIED: list tags (ul/ol/li) and other table-adjacent tags (thead) are
- * assumed to behave like the confirmed table tags because they participate in the same
- * HTML5-normalization family, but that assumption has not itself been captured. If a future
- * duplicate incident traces back to one of them, capture it and extend this set with its own
- * evidence rather than guessing further.
+ * What remains UNVERIFIED: thead/tbody/table themselves are in the set on capture 1's subtree
+ * evidence, not their own (low risk — they only occur inside a table whose rewriting IS
+ * proven). List tags (ul/ol/li) are deliberately NOT in the set, and cannot break either way:
+ * htmlToText's BLOCK_END already breaks on `</li>`, so the key gets its word boundary whether
+ * or not Teams rewrites a list. The one gap neither capture covers is a text→tag boundary
+ * inside a rewritten table cell (`<td><b>x</b>y</td>`) — capture 2 makes it very likely safe,
+ * since Teams demonstrably leaves inline content untouched. If a future duplicate incident
+ * traces back here, capture the payload and extend this set with its own evidence rather than
+ * guessing further.
  */
 const REWRITTEN_TAG_BOUNDARY = new Set(['table', 'thead', 'tbody', 'tr', 'td', 'th']);
 
