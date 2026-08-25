@@ -164,15 +164,15 @@ export class ReliableTeamsChats implements TeamsChatsPort {
         lastFailure = caught;
       }
 
-      // A 429 is not an unknown outcome — Graph refused the write outright, nothing landed,
-      // and reading the chat back now would only be another throttled request feeding the
-      // penalty window. Wait the named window out FIRST; the readback then doubles as the
-      // proof the gate has reopened.
       if (failure instanceof GraphError && failure.code === 'MessageFetchThrottled') {
         // The reply never got as far as a send — its original could not be fetched. Retrying
         // the whole reply (readback included) would only re-hit the family that is throttled.
         throw failure;
       }
+      // A 429 is not an unknown outcome — Graph refused the write outright, nothing landed,
+      // and reading the chat back now would only be another throttled request feeding the
+      // penalty window. Wait the named window out FIRST; the readback then doubles as the
+      // proof the gate has reopened.
       if (failure instanceof GraphError && failure.status === 429) {
         const waitMs = this.throttleWaitMs(failure);
         // Same rule as the client: a window that cannot clear inside one call's sleep cap

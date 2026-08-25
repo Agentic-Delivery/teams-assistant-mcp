@@ -708,3 +708,28 @@ describe('teams chats — getAttachment under the single-message throttle', () =
     expect(payload.bytes.length).toBe(3);
   });
 });
+
+describe('graph client — the peek must never break the gate (round 2 of the per-family change)', () => {
+  it('a 429 with an HTML (non-JSON) body still closes the family gate for the named window', async () => {
+    const fetchFn = vi.fn().mockResolvedValueOnce(new Response('<html>Too many requests</html>', { status: 429, headers: { 'retry-after': '45', 'content-type': 'text/html' } }));
+    const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, readRetries: 0, nowFn: () => 0 });
+
+    await expect(client.get('/chats/x/messages/1')).rejects.toMatchObject({ status: 429 });
+    expect(client.throttledForMs('/chats/x/messages/1')).toBe(45_000);
+    await expect(client.get('/chats/x/messages/2')).rejects.toMatchObject({ code: 'LocallyThrottled' });
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('teams chats — the fallback is for throttles only (the non-triggering side)', () => {
+  it('a 404 on the single-message GET propagates as-is; the list is never scanned', async () => {
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.endsWith('/messages/gone')) return new Response(JSON.stringify({ error: { code: 'NotFound', message: 'Message not found' } }), { status: 404, headers: { 'content-type': 'application/json' } });
+      return json({ value: [] });
+    });
+    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }));
+
+    await expect(chats.replyToMessage('19:a@thread.v2', 'gone', 'hi')).rejects.toMatchObject({ status: 404, code: 'NotFound' });
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+});
