@@ -71,6 +71,14 @@ signal, not every word; a message that is all bold has no bold. If in doubt, pla
    cells they force ugly wraps. Reserve them for a few short identifiers per message;
    never put a long file path in a code box inside a table cell (it gets clipped) — long
    paths go in plain text or on their own line.
+6. **One pin per chat.** Pinning a second message (Graph `POST /chats/{id}/pinnedMessages`)
+   silently REPLACES the first while the API reports success — verify with a GET of the
+   collection, never trust the POST. Consequence: a standing fixture must be ONE combined
+   message (see the dashboard pattern below), not one pin per concern.
+7. **`<p>` and list elements stack large margins** — fine for prose, but they wreck dense
+   dashboards (headers float away from their lists, tails glue together). For dashboard-like
+   messages use plain `<div>` per line with a `<div>&nbsp;</div>` spacer between sections;
+   numbered items as literal "1. " text in divs, not `<ol>`. Screenshot-verified both ways.
 
 ## The live status-board pattern (agent-progress transparency)
 
@@ -90,6 +98,17 @@ without scroll spam.
   is its own separate message, styled per the vocabulary above.
 - Boards carry progress, never decisions: anything needing a human decision is a normal
   message that names its owner.
+
+**Standing-dashboard variant** (recommended for a channel the team lives in): instead of a
+board per mission, keep ONE permanent pinned message — status section on top, a backlog/plan
+mirror below (see verified-delivery's ways-of-working for the ownership doctrine) — edited
+in place forever, div-layout per quirk 7, single pin per quirk 6. When nothing runs, the
+status section must SAY so with a timestamp ("🟢 idle — last mission <x> completed <when>");
+a board frozen on ⏳ reads as broken. Where a one-click full view of the master document
+helps, chats also accept a website tab via Graph:
+`POST /chats/{id}/tabs` with `"teamsApp@odata.bind": ".../appCatalogs/teamsApps/com.microsoft.teamspace.tab.web"`
+and `configuration.contentUrl`/`websiteUrl` pointing at the document's web view (verified
+working with an Azure DevOps file view; the target must tolerate iframe rendering).
 
 ## Wiring it into a project
 
