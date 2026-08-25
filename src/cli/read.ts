@@ -12,6 +12,7 @@ await run(async () => {
   const limit = limitIndex >= 0 ? Number(args[limitIndex + 1]) : 20;
   const since = sinceIndex >= 0 ? args[sinceIndex + 1] : undefined;
   if (!Number.isFinite(limit) || limit < 1) usage('--limit must be a positive number');
+  if (sinceIndex >= 0 && !since) usage('--since needs an ISO-8601 value');
 
   const { chats, allowlist } = buildContext();
   allowlist.assertReadable(chatId);

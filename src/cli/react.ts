@@ -11,5 +11,5 @@ await run(async () => {
   const { chats, allowlist } = buildContext();
   const entry = allowlist.assertPostable(chatId);
   await chats.setReaction(chatId, messageId, emoji);
-  succeed({ action: 'react', messageId, emoji, chat: entry.label ?? chatId });
+  succeed({ action: 'react', messageId, emoji, chat: entry.label });
 });

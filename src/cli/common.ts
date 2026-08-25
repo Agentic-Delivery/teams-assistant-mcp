@@ -1,10 +1,7 @@
-import { FileTokenCache } from '../auth/token-cache.js';
-import { RopcTokenProvider } from '../auth/ropc-token-provider.js';
-import { GraphClient } from '../graph/graph-client.js';
-import { GraphTeamsChats } from '../graph/teams-chats.js';
-import { ReliableTeamsChats } from '../graph/reliable-sends.js';
+import { buildChats } from '../build-chats.js';
 import { ChatNotAllowedError, type ChatAllowlist } from '../allowlist.js';
 import { loadConfig } from '../config.js';
+import type { ReliableTeamsChats } from '../graph/reliable-sends.js';
 
 /**
  * Shared plumbing for the standalone CLIs (teams-post, teams-reply, teams-react, teams-read).
@@ -22,31 +19,23 @@ export interface CliContext {
 
 export function buildContext(): CliContext {
   const config = loadConfig();
-  const tokenProvider = new RopcTokenProvider({
-    tenantId: config.tenantId,
-    clientId: config.clientId,
-    username: config.username,
-    password: config.password,
-    cache: new FileTokenCache(config.tokenCachePath),
-  });
-  const graph = new GraphClient({ tokenProvider });
-  return {
-    chats: new ReliableTeamsChats(new GraphTeamsChats(graph)),
-    allowlist: config.allowlist,
-  };
+  return { chats: buildChats(config).chats, allowlist: config.allowlist };
 }
 
 export function readStdin(): Promise<string> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let buffer = '';
+    process.stdin.setEncoding('utf8'); // Buffer concat would corrupt a multibyte char split across chunks.
     process.stdin.on('data', (chunk) => (buffer += chunk));
     process.stdin.on('end', () => resolve(buffer.trim()));
+    process.stdin.on('error', reject);
   });
 }
 
-export function succeed(payload: Record<string, unknown>): never {
-  process.stdout.write(`${JSON.stringify({ ok: true, ...payload })}\n`);
-  process.exit(0);
+/** Writes the single JSON success line, WAITS for the pipe to drain, then exits 0 — a payload
+ *  bigger than the 64 KiB pipe buffer would otherwise be truncated mid-JSON with exit 0. */
+export function succeed(payload: Record<string, unknown>): void {
+  process.stdout.write(`${JSON.stringify({ ok: true, ...payload })}\n`, () => process.exit(0));
 }
 
 export function usage(text: string): never {
@@ -54,7 +43,7 @@ export function usage(text: string): never {
   process.exit(2);
 }
 
-export async function run(main: () => Promise<never>): Promise<void> {
+export async function run(main: () => Promise<void>): Promise<void> {
   try {
     await main();
   } catch (caught) {

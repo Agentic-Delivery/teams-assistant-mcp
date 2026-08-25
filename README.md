@@ -27,7 +27,7 @@ Claude Code  --stdio-->  teams-assistant-mcp  --HTTPS-->  Microsoft Graph  -->  
                           TokenProvider  (ROPC today, swappable)
 ```
 
-The server speaks MCP over stdio and exposes ten tools:
+The server speaks MCP over stdio and exposes eleven tools:
 
 | Tool | What it does |
 |---|---|
@@ -38,6 +38,7 @@ The server speaks MCP over stdio and exposes ten tools:
 | `send_chat_file` | Uploads a local file to the account's OneDrive (`TEAMS_MCP_UPLOAD_DIR`, default `ai-test`) and shares it into the chat |
 | `reply_chat_message` | Posts a quoted reply to a specific message — chats have no reply threads, so this is the quote card the Teams UI produces |
 | `edit_chat_message` | Replaces the text of a message this account sent (Graph refuses anyone else's) |
+| `react_to_chat_message` | Puts an emoji reaction on a message — the receipt gesture for "seen, being handled" |
 | `delete_chat_message` | Soft-deletes a message this account sent — the reversible kind; no hard delete offered |
 | `get_chat_attachment` | Downloads one attachment to a local file and returns the path — shared files, and pasted images which appear as `inline-image-N` |
 | `poll_chats` | Reads every allowlisted chat in one call, carrying a watermark per chat |

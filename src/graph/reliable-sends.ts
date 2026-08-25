@@ -9,6 +9,12 @@ import type {
 import type { ChatMessage, ReadResult } from '../messages.js';
 
 export interface ReliableSendOptions {
+  /**
+   * The assistant's own display name, as Graph reports it on messages this account sends.
+   * Required: without it a readback could claim a colleague's message quoting our text as
+   * "our copy" — a genuinely failed send reported as success with a foreign message id.
+   */
+  selfDisplayName: string;
   /** Total attempts per send, first try included. */
   attempts?: number;
   sleepFn?: (ms: number) => Promise<void>;
@@ -16,16 +22,18 @@ export interface ReliableSendOptions {
 }
 
 /**
- * How far back a readback looks for "our" copy. Generous on purpose: clock skew between this
- * machine and Graph plus the time a slow request spends in flight — but short enough that a
- * genuinely identical broadcast from an earlier session is not mistaken for this attempt's.
+ * Clock-skew allowance between this machine and Graph's timestamps. Kept tight on purpose:
+ * the wider this window, the likelier an EARLIER identical message of our own (a repeated
+ * status line, say) gets mistaken for this attempt's copy.
  */
-const ATTEMPT_WINDOW_SKEW_MS = 3 * 60 * 1000;
+const ATTEMPT_WINDOW_SKEW_MS = 60 * 1000;
 const READBACK_LIMIT = 20;
 
 function normalized(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
 }
+
+type MatchShape = 'whole-message' | 'reply-tail';
 
 /**
  * Decorator over any TeamsChatsPort that makes sends safe to retry.
@@ -34,16 +42,22 @@ function normalized(text: string): string {
  * succeeded, every response was misread as a failure, and every "retry" was really a duplicate.
  * The rule this class encodes: a failure report describes the response path, not the chat.
  * Before ANY re-send, read the chat back — if our copy is standing, that copy IS the success.
+ *
+ * "Our copy" is deliberately strict: sent by this account's own display name, created within
+ * this attempt's window, not deleted, and matching the sent text exactly (whole message for a
+ * send; the tail after the quote card for a reply). Newest match wins.
  */
 export class ReliableTeamsChats implements TeamsChatsPort {
+  private readonly selfDisplayName: string;
   private readonly attempts: number;
   private readonly sleepFn: (ms: number) => Promise<void>;
   private readonly nowFn: () => Date;
 
   constructor(
     private readonly inner: TeamsChatsPort,
-    options: ReliableSendOptions = {},
+    options: ReliableSendOptions,
   ) {
+    this.selfDisplayName = options.selfDisplayName;
     this.attempts = options.attempts ?? 3;
     this.sleepFn = options.sleepFn ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.nowFn = options.nowFn ?? (() => new Date());
@@ -58,7 +72,9 @@ export class ReliableTeamsChats implements TeamsChatsPort {
   }
 
   sendMessage(chatId: string, text: string): Promise<ChatMessage> {
-    return this.sendGuarded(chatId, text, () => this.inner.sendMessage(chatId, text));
+    return this.sendGuarded(chatId, text, 'whole-message', () =>
+      this.inner.sendMessage(chatId, text),
+    );
   }
 
   sendImage(chatId: string, image: OutboundImage, text?: string): Promise<ChatMessage> {
@@ -72,7 +88,10 @@ export class ReliableTeamsChats implements TeamsChatsPort {
   }
 
   replyToMessage(chatId: string, replyToMessageId: string, text: string): Promise<ChatMessage> {
-    return this.sendGuarded(chatId, text, () =>
+    // A landed reply's text carries the quoted original BEFORE our own words, so the match is
+    // "ends with what we sent" — never containment, which the quoted original itself could
+    // satisfy when someone replies with words the original already contains.
+    return this.sendGuarded(chatId, text, 'reply-tail', () =>
       this.inner.replyToMessage(chatId, replyToMessageId, text),
     );
   }
@@ -102,11 +121,22 @@ export class ReliableTeamsChats implements TeamsChatsPort {
   private async sendGuarded(
     chatId: string,
     text: string,
+    shape: MatchShape,
     doSend: () => Promise<ChatMessage>,
   ): Promise<ChatMessage> {
-    const windowStart = new Date(this.nowFn().getTime() - ATTEMPT_WINDOW_SKEW_MS).toISOString();
+    const windowStart = this.nowFn().getTime() - ATTEMPT_WINDOW_SKEW_MS;
 
     for (let attempt = 1; ; attempt += 1) {
+      if (attempt > 1) {
+        // A retry only ever runs against a chat PROVEN not to hold our copy — including the
+        // case where the previous readback itself failed (say, on the same dead connection
+        // the send died on) and the backoff gave both a chance to recover.
+        const landedLate = await this.findLandedCopy(chatId, text, shape, windowStart);
+        if (landedLate) {
+          return landedLate;
+        }
+      }
+
       let failure: unknown;
       try {
         return await doSend();
@@ -114,9 +144,9 @@ export class ReliableTeamsChats implements TeamsChatsPort {
         failure = caught;
       }
 
-      // The send REPORTED failure — that is a claim about the response path, not the chat.
-      // Only the chat itself can say whether the write landed.
-      const landed = await this.findLandedCopy(chatId, text, windowStart);
+      // The send REPORTED failure — a claim about the response path, not the chat. Only the
+      // chat itself can say whether the write landed.
+      const landed = await this.findLandedCopy(chatId, text, shape, windowStart);
       if (landed) {
         return landed;
       }
@@ -130,19 +160,30 @@ export class ReliableTeamsChats implements TeamsChatsPort {
   private async findLandedCopy(
     chatId: string,
     text: string,
-    windowStart: string,
+    shape: MatchShape,
+    windowStartMs: number,
   ): Promise<ChatMessage | undefined> {
     const wanted = normalized(text);
     try {
       const { messages } = await this.inner.readMessages(chatId, undefined, READBACK_LIMIT);
-      return messages.find(
-        (candidate) =>
-          !candidate.isDeleted &&
-          candidate.createdDateTime >= windowStart &&
-          normalized(candidate.text).includes(wanted),
-      );
+      // Messages arrive oldest-first (applyWatermark sorts ascending); the newest match is
+      // the one this attempt could have produced.
+      return messages.findLast((candidate) => {
+        if (candidate.isDeleted || candidate.from !== this.selfDisplayName) {
+          return false;
+        }
+        const createdMs = Date.parse(candidate.createdDateTime);
+        if (!Number.isFinite(createdMs) || createdMs < windowStartMs) {
+          return false;
+        }
+        const candidateText = normalized(candidate.text);
+        return shape === 'whole-message'
+          ? candidateText === wanted
+          : candidateText.endsWith(wanted);
+      });
     } catch {
-      // A readback that cannot run proves nothing either way; the retry loop carries on.
+      // A readback that cannot run proves nothing either way; the retry loop re-checks before
+      // any re-send.
       return undefined;
     }
   }
@@ -152,6 +193,8 @@ export class ReliableTeamsChats implements TeamsChatsPort {
       failure instanceof GraphError && failure.retryAfterSeconds
         ? failure.retryAfterSeconds
         : undefined;
-    return retryAfter ? retryAfter * 1000 : 2 ** attempt * 2500;
+    // Capped: an aggressive Retry-After must not park the caller for minutes — better to give
+    // up honestly after a bounded wait than to hang a tool call nobody can see into.
+    return retryAfter ? Math.min(retryAfter, 60) * 1000 : 2 ** attempt * 2500;
   }
 }

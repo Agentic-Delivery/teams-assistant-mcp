@@ -12,5 +12,5 @@ await run(async () => {
   const { chats, allowlist } = buildContext();
   const entry = allowlist.assertPostable(chatId);
   const sent = await chats.sendMessage(chatId, text);
-  succeed({ action: 'post', id: sent.id, chat: entry.label ?? chatId });
+  succeed({ action: 'post', id: sent.id, chat: entry.label });
 });

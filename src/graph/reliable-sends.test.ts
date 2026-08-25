@@ -40,7 +40,7 @@ describe('reliable sends — readback before any retry', () => {
   it('passes a clean send straight through', async () => {
     const sent = message({ id: 'fresh' });
     const inner = portWith({ sendMessage: vi.fn(async () => sent) });
-    const chats = new ReliableTeamsChats(inner, { sleepFn: async () => {}, nowFn: fixedNow });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
 
     expect(await chats.sendMessage('19:a@thread.v2', 'hello channel')).toBe(sent);
     expect(inner.sendMessage).toHaveBeenCalledTimes(1);
@@ -56,7 +56,7 @@ describe('reliable sends — readback before any retry', () => {
       sendMessage,
       readMessages: vi.fn(async () => ({ messages: [landed] }) as unknown as ReadResult),
     });
-    const chats = new ReliableTeamsChats(inner, { sleepFn: async () => {}, nowFn: fixedNow });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
 
     const result = await chats.sendMessage('19:a@thread.v2', 'Nytt i stage nå 🚀');
 
@@ -74,7 +74,7 @@ describe('reliable sends — readback before any retry', () => {
       sendMessage,
       readMessages: async () => ({ messages: [stale] }) as unknown as ReadResult,
     });
-    const chats = new ReliableTeamsChats(inner, { sleepFn: async () => {}, nowFn: fixedNow });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
 
     const result = await chats.sendMessage('19:a@thread.v2', 'hello channel');
 
@@ -92,7 +92,7 @@ describe('reliable sends — readback before any retry', () => {
       sendMessage,
       readMessages: async () => ({ messages: [deleted] }) as unknown as ReadResult,
     });
-    const chats = new ReliableTeamsChats(inner, { sleepFn: async () => {}, nowFn: fixedNow });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
 
     expect((await chats.sendMessage('19:a@thread.v2', 'hello channel')).id).toBe('second-try');
   });
@@ -105,6 +105,7 @@ describe('reliable sends — readback before any retry', () => {
       .mockResolvedValueOnce(message({ id: 'second-try' }));
     const inner = portWith({ sendMessage });
     const chats = new ReliableTeamsChats(inner, {
+      selfDisplayName: 'Assistant',
       sleepFn: async (ms) => void waits.push(ms),
       nowFn: fixedNow,
     });
@@ -120,6 +121,7 @@ describe('reliable sends — readback before any retry', () => {
     });
     const inner = portWith({ sendMessage });
     const chats = new ReliableTeamsChats(inner, {
+      selfDisplayName: 'Assistant',
       attempts: 3,
       sleepFn: async () => {},
       nowFn: fixedNow,
@@ -142,7 +144,7 @@ describe('reliable sends — readback before any retry', () => {
         throw new GraphError('reads throttled too', 429);
       },
     });
-    const chats = new ReliableTeamsChats(inner, { sleepFn: async () => {}, nowFn: fixedNow });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
 
     expect((await chats.sendMessage('19:a@thread.v2', 'hello channel')).id).toBe('second-try');
   });
@@ -159,7 +161,7 @@ describe('reliable sends — readback before any retry', () => {
       replyToMessage,
       readMessages: async () => ({ messages: [landedReply] }) as unknown as ReadResult,
     });
-    const chats = new ReliableTeamsChats(inner, { sleepFn: async () => {}, nowFn: fixedNow });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
 
     const result = await chats.replyToMessage('19:a@thread.v2', 'orig-1', 'my actual answer here');
 
@@ -176,7 +178,7 @@ describe('reliable sends — readback before any retry', () => {
       sendMessage,
       readMessages: async () => ({ messages: [landed] }) as unknown as ReadResult,
     });
-    const chats = new ReliableTeamsChats(inner, { sleepFn: async () => {}, nowFn: fixedNow });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
 
     expect(await chats.sendMessage('19:a@thread.v2', 'two words spread out')).toBe(landed);
     expect(sendMessage).toHaveBeenCalledTimes(1);
@@ -187,12 +189,132 @@ describe('reliable sends — readback before any retry', () => {
       editMessage: vi.fn(async () => undefined),
       deleteMessage: vi.fn(async () => undefined),
     });
-    const chats = new ReliableTeamsChats(inner, { sleepFn: async () => {}, nowFn: fixedNow });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
 
     await chats.editMessage('19:a@thread.v2', 'm1', 'new');
     await chats.deleteMessage('19:a@thread.v2', 'm1');
 
     expect(inner.editMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1', 'new');
     expect(inner.deleteMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1');
+  });
+});
+
+describe('reliable sends — the match must be OUR copy, nothing else (review round 1 MAJORs)', () => {
+  it("a colleague's message quoting our text is never claimed as the landed copy", async () => {
+    const foreign = message({ id: 'johans', from: 'Johan', text: '"Deploy klar" — ja, jeg ser den' });
+    const sendMessage = vi
+      .fn()
+      .mockRejectedValueOnce(new GraphError('hang up', 0))
+      .mockResolvedValueOnce(message({ id: 'second-try', text: 'Deploy klar' }));
+    const inner = portWith({
+      sendMessage,
+      readMessages: async () => ({ messages: [foreign] }) as unknown as ReadResult,
+    });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    const result = await chats.sendMessage('19:a@thread.v2', 'Deploy klar');
+
+    expect(result.id).toBe('second-try');
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it('a short reply is not satisfied by the quoted ORIGINAL containing the same words', async () => {
+    // Replying "ja" to "Ska jag deploya nu? ja/nej" — the original contains "ja" but is not
+    // our reply. The tail match plus the sender pin both have to hold.
+    const original = message({ id: 'orig', from: 'Johan', text: 'Ska jag deploya nu? ja/nej' });
+    const replyToMessage = vi
+      .fn()
+      .mockRejectedValueOnce(new GraphError('hang up', 0))
+      .mockResolvedValueOnce(message({ id: 'real-reply', text: 'Ska jag deploya nu? ja/nej\nja' }));
+    const inner = portWith({
+      replyToMessage,
+      readMessages: async () => ({ messages: [original] }) as unknown as ReadResult,
+    });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    const result = await chats.replyToMessage('19:a@thread.v2', 'orig', 'ja');
+
+    expect(result.id).toBe('real-reply');
+    expect(replyToMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it('a whole-message send is matched by equality, not containment', async () => {
+    const superset = message({ id: 'older-superset', text: 'status ok — men les videre' });
+    const sendMessage = vi
+      .fn()
+      .mockRejectedValueOnce(new GraphError('hang up', 0))
+      .mockResolvedValueOnce(message({ id: 'second-try', text: 'status ok' }));
+    const inner = portWith({
+      sendMessage,
+      readMessages: async () => ({ messages: [superset] }) as unknown as ReadResult,
+    });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    expect((await chats.sendMessage('19:a@thread.v2', 'status ok')).id).toBe('second-try');
+  });
+
+  it('when two own copies stand in the window, the NEWEST one wins', async () => {
+    const older = message({ id: 'older', text: 'status ok', createdDateTime: '2026-08-25T05:59:30Z' });
+    const newer = message({ id: 'newer', text: 'status ok', createdDateTime: '2026-08-25T06:00:10Z' });
+    const sendMessage = vi.fn(async () => {
+      throw new GraphError('hang up', 0);
+    });
+    const inner = portWith({
+      sendMessage,
+      readMessages: async () => ({ messages: [older, newer] }) as unknown as ReadResult,
+    });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    expect((await chats.sendMessage('19:a@thread.v2', 'status ok')).id).toBe('newer');
+  });
+
+  it('an offset-form timestamp still matches (no string comparison of ISO forms)', async () => {
+    const landed = message({ text: 'hello channel', createdDateTime: '2026-08-25T06:00:05+00:00' });
+    const sendMessage = vi.fn(async () => {
+      throw new GraphError('hang up', 0);
+    });
+    const inner = portWith({
+      sendMessage,
+      readMessages: async () => ({ messages: [landed] }) as unknown as ReadResult,
+    });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    expect(await chats.sendMessage('19:a@thread.v2', 'hello channel')).toBe(landed);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('an absurd Retry-After is capped instead of parking the caller', async () => {
+    const waits: number[] = [];
+    const sendMessage = vi
+      .fn()
+      .mockRejectedValueOnce(new GraphError('throttled', 429, 'TooManyRequests', 300))
+      .mockResolvedValueOnce(message({ id: 'second-try' }));
+    const inner = portWith({ sendMessage });
+    const chats = new ReliableTeamsChats(inner, {
+      selfDisplayName: 'Assistant',
+      sleepFn: async (ms) => void waits.push(ms),
+      nowFn: fixedNow,
+    });
+
+    await chats.sendMessage('19:a@thread.v2', 'hello channel');
+
+    expect(waits).toEqual([60000]);
+  });
+
+  it('a retry re-checks the chat right before re-sending, catching a late-landing copy', async () => {
+    // First readback dies with the same connection the send died on; by the retry, both work.
+    const landed = message({ text: 'hello channel' });
+    const sendMessage = vi.fn(async () => {
+      throw new GraphError('hang up', 0);
+    });
+    const readMessages = vi
+      .fn()
+      .mockRejectedValueOnce(new GraphError('same dead link', 0))
+      .mockResolvedValueOnce({ messages: [landed] } as unknown as ReadResult);
+    const inner = portWith({ sendMessage, readMessages });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    expect(await chats.sendMessage('19:a@thread.v2', 'hello channel')).toBe(landed);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 });

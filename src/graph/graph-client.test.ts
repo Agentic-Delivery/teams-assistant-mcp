@@ -361,25 +361,52 @@ describe('teams chats over graph', () => {
 });
 
 describe('graph client — empty-success bodies (the 11-copy broadcast incident, 2026-08-24)', () => {
-  it('treats a 204 answer to post() as success, not a parse error', async () => {
+  it('treats a 204 answer to postNoContent() as success, not a parse error', async () => {
     // setReaction and friends answer 204 No Content; the old unconditional response.json()
     // threw SyntaxError on that success, which is how a landed write got reported as failed.
     const fetchFn = vi.fn(async () => new Response(null, { status: 204 }));
     const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never });
 
-    await expect(client.post('/chats/x/messages/1/setReaction', { reactionType: '👍' }))
+    await expect(client.postNoContent('/chats/x/messages/1/setReaction', { reactionType: '👍' }))
       .resolves.toBeUndefined();
   });
 
-  it('treats a 200 with an empty body as success too', async () => {
+  it('an empty success to a CREATE post() is an unknown outcome said plainly, never a phantom resource', async () => {
+    // A create must hand back the resource; defaulting an empty body would give callers a
+    // message with no id. The error text says the write may have landed — the readback layer
+    // is what turns that honesty into a safe retry.
     const fetchFn = vi.fn(async () => new Response('', { status: 200 }));
     const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never });
 
-    await expect(client.post('/whatever', {})).resolves.toBeUndefined();
+    const error = (await client.post('/chats/x/messages', {}).catch((c: unknown) => c)) as GraphError;
+    expect(error).toBeInstanceOf(GraphError);
+    expect(error.code).toBe('EmptyCreateResponse');
+    expect(error.message).toMatch(/unknown/);
   });
 });
 
 describe('graph client — throttle handling on reads', () => {
+  it('caps an absurd Retry-After on the read retry instead of parking the caller', async () => {
+    const waits: number[] = [];
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'throttled' } }), {
+          status: 429,
+          headers: { 'retry-after': '300', 'content-type': 'application/json' },
+        }),
+      )
+      .mockResolvedValueOnce(json({ id: 'fine' }));
+    const client = new GraphClient({
+      tokenProvider: stubToken,
+      fetchFn: fetchFn as never,
+      sleepFn: async (ms) => void waits.push(ms),
+    });
+
+    expect(await client.get('/me')).toEqual({ id: 'fine' });
+    expect(waits).toEqual([60000]);
+  });
+
   it('retries a 429 GET after the Retry-After the server names, then succeeds', async () => {
     const waits: number[] = [];
     const fetchFn = vi
