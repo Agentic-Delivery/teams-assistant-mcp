@@ -7,6 +7,7 @@ import { RopcTokenProvider } from './auth/ropc-token-provider.js';
 import type { TokenProvider } from './auth/token-provider.js';
 import { GraphClient } from './graph/graph-client.js';
 import { GraphTeamsChats } from './graph/teams-chats.js';
+import { ReliableTeamsChats } from './graph/reliable-sends.js';
 import { loadConfig } from './config.js';
 import { InboxPoller, type SignedInAccount } from './inbox.js';
 import { buildServer } from './server.js';
@@ -25,7 +26,9 @@ async function main(): Promise<void> {
 
   const uploadDir = process.env['TEAMS_MCP_UPLOAD_DIR'];
   const graph = new GraphClient({ tokenProvider });
-  const chats = new GraphTeamsChats(graph, uploadDir ? { uploadDir } : {});
+  // Readback-before-retry on every send: a failure report is a claim about the response path,
+  // not the chat, and re-sending without checking is how one broadcast became eleven.
+  const chats = new ReliableTeamsChats(new GraphTeamsChats(graph, uploadDir ? { uploadDir } : {}));
 
   const server = buildServer({
     chats,

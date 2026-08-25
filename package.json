@@ -11,7 +11,11 @@
     "url": "https://github.com/Agentic-Delivery/teams-assistant-mcp.git"
   },
   "bin": {
-    "teams-assistant-mcp": "dist/index.js"
+    "teams-assistant-mcp": "dist/index.js",
+    "teams-post": "dist/cli/post.js",
+    "teams-reply": "dist/cli/reply.js",
+    "teams-react": "dist/cli/react.js",
+    "teams-read": "dist/cli/read.js"
   },
   "files": [
     "dist",

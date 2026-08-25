@@ -7,6 +7,8 @@ export class GraphError extends Error {
     message: string,
     readonly status: number,
     readonly code?: string,
+    /** Seconds the server asked us to wait (Retry-After), when it named one. */
+    readonly retryAfterSeconds?: number,
   ) {
     super(message);
     this.name = 'GraphError';
@@ -25,15 +27,24 @@ export interface GraphClientOptions {
   tokenProvider: TokenProvider;
   fetchFn?: typeof fetch;
   baseUrl?: string;
+  sleepFn?: (ms: number) => Promise<void>;
+  /** Extra attempts after the first for throttled/unavailable READS. Writes never auto-retry. */
+  readRetries?: number;
 }
+
+const RETRYABLE_READ_STATUSES = new Set([429, 503, 504]);
 
 export class GraphClient {
   private readonly fetchFn: typeof fetch;
   private readonly baseUrl: string;
+  private readonly sleepFn: (ms: number) => Promise<void>;
+  private readonly readRetries: number;
 
   constructor(private readonly options: GraphClientOptions) {
     this.fetchFn = options.fetchFn ?? fetch;
     this.baseUrl = options.baseUrl ?? GRAPH_BASE_URL;
+    this.sleepFn = options.sleepFn ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.readRetries = options.readRetries ?? 2;
   }
 
   private url(path: string): string {
@@ -55,22 +66,56 @@ export class GraphClient {
     const body = (await response.json().catch(() => undefined)) as
       | { error?: { code?: string; message?: string } }
       | undefined;
+    const retryAfterHeader = response.headers.get('retry-after');
+    const retryAfterSeconds = retryAfterHeader ? Number(retryAfterHeader) : undefined;
     throw new GraphError(
       body?.error?.message ?? `Graph request failed with HTTP ${response.status}`,
       response.status,
       body?.error?.code,
+      Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : undefined,
     );
   }
 
-  async get<T>(path: string): Promise<T> {
-    const response = await this.authorized(path, { method: 'GET' });
-    if (!response.ok) {
-      await this.fail(response);
+  /**
+   * A 204 (or an empty 200) is a SUCCESS with nothing to say. Parsing it as JSON used to throw,
+   * and that lie — a landed write reported as failed — is what turned one broadcast into eleven
+   * on 2026-08-24. Success detection must never depend on the body being parseable.
+   */
+  private async parseBody<T>(response: Response): Promise<T> {
+    if (response.status === 204) {
+      return undefined as T;
     }
-    return (await response.json()) as T;
+    const raw = await response.text();
+    if (raw.trim() === '') {
+      return undefined as T;
+    }
+    return JSON.parse(raw) as T;
+  }
+
+  async get<T>(path: string): Promise<T> {
+    // Reads are idempotent, so a throttled or briefly unavailable GET may be retried after the
+    // wait the server names (falling back to a short exponential pause).
+    for (let attempt = 0; ; attempt += 1) {
+      const response = await this.authorized(path, { method: 'GET' });
+      if (response.ok) {
+        return await this.parseBody<T>(response);
+      }
+      if (attempt >= this.readRetries || !RETRYABLE_READ_STATUSES.has(response.status)) {
+        await this.fail(response);
+      }
+      const retryAfterHeader = Number(response.headers.get('retry-after'));
+      const waitMs = Number.isFinite(retryAfterHeader) && retryAfterHeader > 0
+        ? retryAfterHeader * 1000
+        : 2 ** attempt * 1000;
+      await response.body?.cancel().catch(() => undefined);
+      await this.sleepFn(waitMs);
+    }
   }
 
   async post<T>(path: string, body: unknown): Promise<T> {
+    // Deliberately NO automatic retry here: a POST is a write, and a failure report says nothing
+    // about whether the write landed. Retry policy for sends lives in ReliableTeamsChats, which
+    // reads the chat back before ever sending again.
     const response = await this.authorized(path, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -79,7 +124,7 @@ export class GraphClient {
     if (!response.ok) {
       await this.fail(response);
     }
-    return (await response.json()) as T;
+    return await this.parseBody<T>(response);
   }
 
   /** PATCH with a JSON body. Graph answers 204 No Content on success, so nothing is returned. */

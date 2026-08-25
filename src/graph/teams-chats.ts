@@ -41,6 +41,7 @@ export interface TeamsChatsPort {
   replyToMessage(chatId: string, replyToMessageId: string, text: string): Promise<ChatMessage>;
   editMessage(chatId: string, messageId: string, newText: string): Promise<void>;
   deleteMessage(chatId: string, messageId: string): Promise<void>;
+  setReaction(chatId: string, messageId: string, reactionType: string): Promise<void>;
   getAttachment(chatId: string, messageId: string, attachmentId?: string): Promise<AttachmentPayload>;
 }
 
@@ -254,6 +255,15 @@ export class GraphTeamsChats implements TeamsChatsPort {
     // can be restored. Hard delete is deliberately not offered here.
     await this.graph.postAction(
       `/me/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}/softDelete`,
+    );
+  }
+
+  async setReaction(chatId: string, messageId: string, reactionType: string): Promise<void> {
+    // The payload is {reactionType} at the top level — NOT wrapped in {body: …} like a message
+    // post. Graph answers 204, which post() now treats as the success it is.
+    await this.graph.post(
+      `/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}/setReaction`,
+      { reactionType },
     );
   }
 

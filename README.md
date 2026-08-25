@@ -93,6 +93,30 @@ messages any more.
 Two knobs: `TEAMS_INBOX_PATH` moves the inbox (the sidecar follows it), and
 `TEAMS_INBOX_DISABLED=1` switches the poller off entirely for consumers that only post.
 
+## The standalone CLIs
+
+Four small commands ship beside the server for scripts, cron jobs and background monitors that
+need Teams without a running MCP session: `teams-post <chatId>` (text on stdin), `teams-reply
+<chatId> <messageId>` (text on stdin), `teams-react <chatId> <messageId> <emoji>` and
+`teams-read <chatId> [--limit N] [--since ISO]`. Same allowlist, same auth, same code paths as
+the server tools — including the send reliability below.
+
+Their output contract exists because of a real incident (2026-08-24): an ad-hoc wrapper's
+caller grepped for a success token the wrapper never printed, read eleven successful posts as
+eleven throttles, and re-posted a broadcast ten times. So: success is exactly one JSON line on
+stdout and exit 0; failure is prose on stderr and a non-zero exit (2 usage, 3 allowlist,
+1 anything else). **Branch on the exit code, never on output text.**
+
+## Send reliability: readback before retry
+
+Every send (server tools and CLIs alike) goes through `ReliableTeamsChats`, which treats a
+failure report as a claim about the response path, not about the chat. On any send error it
+reads the chat back first — if this attempt's copy is standing, that copy is returned as the
+success and nothing is re-sent. Only a readback that finds nothing leads to a retry, waiting
+out any `Retry-After` the throttle named. Reads (GETs) retry transparently inside `GraphClient`
+on 429/503/504; writes never auto-retry at that layer. A 204 or empty body on a write is a
+success, not a parse error.
+
 ## Auth, and the fact that ROPC is temporary
 
 Sign-in uses the OAuth password grant (ROPC) against Entra ID, with one of Microsoft's own
