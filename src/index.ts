@@ -2,11 +2,7 @@
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { FileTokenCache } from './auth/token-cache.js';
-import { RopcTokenProvider } from './auth/ropc-token-provider.js';
-import type { TokenProvider } from './auth/token-provider.js';
-import { GraphClient } from './graph/graph-client.js';
-import { GraphTeamsChats } from './graph/teams-chats.js';
+import { buildChats } from './build-chats.js';
 import { loadConfig } from './config.js';
 import { InboxPoller, type SignedInAccount } from './inbox.js';
 import { buildServer } from './server.js';
@@ -14,18 +10,8 @@ import { buildServer } from './server.js';
 async function main(): Promise<void> {
   const config = loadConfig();
 
-  // The one line to change when ROPC dies. Everything downstream takes a TokenProvider.
-  const tokenProvider: TokenProvider = new RopcTokenProvider({
-    tenantId: config.tenantId,
-    clientId: config.clientId,
-    username: config.username,
-    password: config.password,
-    cache: new FileTokenCache(config.tokenCachePath),
-  });
-
   const uploadDir = process.env['TEAMS_MCP_UPLOAD_DIR'];
-  const graph = new GraphClient({ tokenProvider });
-  const chats = new GraphTeamsChats(graph, uploadDir ? { uploadDir } : {});
+  const { chats, graph } = buildChats(config, uploadDir ? { uploadDir } : {});
 
   const server = buildServer({
     chats,
@@ -39,7 +25,7 @@ async function main(): Promise<void> {
   await server.connect(new StdioServerTransport());
   // stdout is the MCP transport. Anything human-readable goes to stderr or it corrupts the protocol.
   process.stderr.write(
-    `teams-assistant-mcp ready: ${config.allowlist.entries().length} allowed chat(s), auth=${tokenProvider.kind}\n`,
+    `teams-assistant-mcp ready: ${config.allowlist.entries().length} allowed chat(s), auth=ropc\n`,
   );
 
   // The background inbox: every new message in the allowlisted chats lands as one JSON line in a

@@ -23,5 +23,11 @@ describe.skip('live Graph (awaiting a Teams-licensed account)', () => {
   it.todo('returns nothing on a second read with the previous watermark');
   it.todo('posts a message that appears in Teams under the assistant display name');
   it.todo('downloads a file attachment shared in the pilot chat');
+  // Partial live evidence already exists for this one: on 2026-08-24 an ad-hoc script sent raw
+  // unicode glyphs (👍) as reactionType against this exact endpoint shape and the reactions
+  // rendered in Teams. Still worth a proper live test: the documented vocabulary historically
+  // named reactions (like, heart, …), and the glyph acceptance should be pinned, not folklore.
+  it.todo('setReaction accepts a raw emoji glyph as reactionType and it renders in Teams');
+  it.todo('a send whose response is dropped mid-flight is recovered by the readback, not duplicated');
   it.todo('is refused by Graph, not just by us, if the account is removed from the chat');
 });

@@ -211,6 +211,29 @@ export function buildServer(deps: ServerDeps): McpServer {
   );
 
   server.registerTool(
+    'react_to_chat_message',
+    {
+      title: 'React to a message with an emoji',
+      description:
+        'Puts an emoji reaction (👍, ❤️, …) on a message in an allowlisted chat, as the ' +
+        'signed-in account. The receipt gesture for "seen and being handled" — cheaper than a ' +
+        'reply and idempotent: reacting twice with the same emoji is one reaction.',
+      inputSchema: {
+        chatId: z.string().describe('Graph chat id, must be allowlisted with canPost: true'),
+        messageId: z.string().describe('Id of the message to react to'),
+        emoji: z.string().min(1).describe('The reaction emoji, e.g. 👍'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    ({ chatId, messageId, emoji }) =>
+      guard(async () => {
+        allowlist.assertPostable(chatId);
+        await chats.setReaction(chatId, messageId, emoji);
+        return ok({ reacted: true, chatId, messageId, emoji });
+      }),
+  );
+
+  server.registerTool(
     'delete_chat_message',
     {
       title: 'Delete a message this account sent',

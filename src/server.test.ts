@@ -108,6 +108,12 @@ class FakeTeamsChats implements TeamsChatsPort {
     );
   }
 
+  reactions: Array<{ chatId: string; messageId: string; emoji: string }> = [];
+
+  async setReaction(chatId: string, messageId: string, reactionType: string) {
+    this.reactions.push({ chatId, messageId, emoji: reactionType });
+  }
+
   async getAttachment(): Promise<AttachmentPayload> {
     return {
       bytes: new Uint8Array([1, 2, 3]),
@@ -153,7 +159,7 @@ beforeEach(async () => {
 });
 
 describe('tool surface', () => {
-  it('offers the nine chat tools plus the poll helper', async () => {
+  it('offers the ten chat tools plus the poll helper', async () => {
     const { tools } = await client.listTools();
 
     expect(tools.map((tool) => tool.name).sort()).toEqual([
@@ -162,12 +168,37 @@ describe('tool surface', () => {
       'get_chat_attachment',
       'list_chats',
       'poll_chats',
+      'react_to_chat_message',
       'read_chat_messages',
       'reply_chat_message',
       'send_chat_file',
       'send_chat_image',
       'send_chat_message',
     ]);
+  });
+});
+
+describe('react_to_chat_message', () => {
+  it('puts the emoji on the message in an allowlisted chat', async () => {
+    const result = await call(client, 'react_to_chat_message', {
+      chatId: PILOT,
+      messageId: 'msg-9',
+      emoji: '👍',
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(chats.reactions).toEqual([{ chatId: PILOT, messageId: 'msg-9', emoji: '👍' }]);
+  });
+
+  it('refuses a chat outside the allowlist', async () => {
+    const result = await call(client, 'react_to_chat_message', {
+      chatId: '19:not-ours@thread.v2',
+      messageId: 'msg-9',
+      emoji: '👍',
+    });
+
+    expect(result.isError).toBe(true);
+    expect(chats.reactions).toEqual([]);
   });
 });
 

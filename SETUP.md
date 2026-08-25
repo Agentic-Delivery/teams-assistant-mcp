@@ -257,7 +257,7 @@ read-only because their entry says `canPost: false`, not because anyone remember
 
 ## 8. Tool reference
 
-The ten tools, as registered in `src/server.ts`. All results are JSON text; errors (including
+The eleven tools, as registered in `src/server.ts`. All results are JSON text; errors (including
 allowlist refusals) come back as readable text, not transport failures.
 
 | Tool | What it does | Input |
@@ -267,6 +267,7 @@ allowlist refusals) come back as readable text, not transport failures.
 | `send_chat_message` | Posts plain text to a chat with `canPost: true` | `chatId`, `text` |
 | `reply_chat_message` | Posts a quote-card reply to a specific message | `chatId`, `replyToMessageId`, `text` |
 | `edit_chat_message` | Replaces the text of a message this account sent; Teams shows "Edited" | `chatId`, `messageId`, `newText` |
+| `react_to_chat_message` | Puts an emoji reaction on a message in an allowlisted chat | `chatId`, `messageId`, `emoji` |
 | `delete_chat_message` | Soft-deletes a message this account sent (restorable in Teams) | `chatId`, `messageId` |
 | `send_chat_image` | Posts a PNG/JPEG that renders inline | `chatId`, `path?` or `base64?` (exactly one), `mime?` (required with base64), `text?` |
 | `send_chat_file` | Uploads to the account's OneDrive and shares into the chat as a file card | `chatId`, `path`, `text?` |
@@ -275,3 +276,12 @@ allowlist refusals) come back as readable text, not transport failures.
 
 Editing and deleting only work on the account's own messages; that is Graph's rule for delegated
 calls, and the server passes Graph's refusal through verbatim rather than pre-checking it.
+
+## The standalone CLIs
+
+Beside the server, `npm run build` produces four commands under `dist/cli/` (also exposed as
+package bins): `teams-post`, `teams-reply`, `teams-react`, `teams-read`. Same env vars, same
+allowlist, same send-reliability code paths as the server tools. Success is exactly one JSON
+line on stdout and exit 0; failure is stderr plus a non-zero exit (2 usage, 3 allowlist,
+1 anything else). Branch on the exit code, never on output text — see README's "The standalone
+CLIs" for the incident that made this a rule.

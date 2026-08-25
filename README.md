@@ -27,7 +27,7 @@ Claude Code  --stdio-->  teams-assistant-mcp  --HTTPS-->  Microsoft Graph  -->  
                           TokenProvider  (ROPC today, swappable)
 ```
 
-The server speaks MCP over stdio and exposes ten tools:
+The server speaks MCP over stdio and exposes eleven tools:
 
 | Tool | What it does |
 |---|---|
@@ -38,6 +38,7 @@ The server speaks MCP over stdio and exposes ten tools:
 | `send_chat_file` | Uploads a local file to the account's OneDrive (`TEAMS_MCP_UPLOAD_DIR`, default `ai-test`) and shares it into the chat |
 | `reply_chat_message` | Posts a quoted reply to a specific message — chats have no reply threads, so this is the quote card the Teams UI produces |
 | `edit_chat_message` | Replaces the text of a message this account sent (Graph refuses anyone else's) |
+| `react_to_chat_message` | Puts an emoji reaction on a message — the receipt gesture for "seen, being handled" |
 | `delete_chat_message` | Soft-deletes a message this account sent — the reversible kind; no hard delete offered |
 | `get_chat_attachment` | Downloads one attachment to a local file and returns the path — shared files, and pasted images which appear as `inline-image-N` |
 | `poll_chats` | Reads every allowlisted chat in one call, carrying a watermark per chat |
@@ -92,6 +93,30 @@ messages any more.
 
 Two knobs: `TEAMS_INBOX_PATH` moves the inbox (the sidecar follows it), and
 `TEAMS_INBOX_DISABLED=1` switches the poller off entirely for consumers that only post.
+
+## The standalone CLIs
+
+Four small commands ship beside the server for scripts, cron jobs and background monitors that
+need Teams without a running MCP session: `teams-post <chatId>` (text on stdin), `teams-reply
+<chatId> <messageId>` (text on stdin), `teams-react <chatId> <messageId> <emoji>` and
+`teams-read <chatId> [--limit N] [--since ISO]`. Same allowlist, same auth, same code paths as
+the server tools — including the send reliability below.
+
+Their output contract exists because of a real incident (2026-08-24): an ad-hoc wrapper's
+caller grepped for a success token the wrapper never printed, read eleven successful posts as
+eleven throttles, and re-posted a broadcast ten times. So: success is exactly one JSON line on
+stdout and exit 0; failure is prose on stderr and a non-zero exit (2 usage, 3 allowlist,
+1 anything else). **Branch on the exit code, never on output text.**
+
+## Send reliability: readback before retry
+
+Every send (server tools and CLIs alike) goes through `ReliableTeamsChats`, which treats a
+failure report as a claim about the response path, not about the chat. On any send error it
+reads the chat back first — if this attempt's copy is standing, that copy is returned as the
+success and nothing is re-sent. Only a readback that finds nothing leads to a retry, waiting
+out any `Retry-After` the throttle named. Reads (GETs) retry transparently inside `GraphClient`
+on 429/503/504; writes never auto-retry at that layer. A 204 or empty body on a write is a
+success, not a parse error.
 
 ## Auth, and the fact that ROPC is temporary
 
