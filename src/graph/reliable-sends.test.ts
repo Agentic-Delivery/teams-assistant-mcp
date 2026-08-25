@@ -318,3 +318,36 @@ describe('reliable sends — the match must be OUR copy, nothing else (review ro
     expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('reliable sends — under a 429 the chat is NOT read back before the wait (2026-08-25)', () => {
+  it('a throttled send waits the named window first, reads back once, then retries once — bounded', async () => {
+    const calls: string[] = [];
+    const sendMessage = vi
+      .fn()
+      .mockImplementationOnce(async () => { calls.push('send'); throw new GraphError('throttled', 429, 'TooManyRequests', 20); })
+      .mockImplementationOnce(async () => { calls.push('send'); return message({ id: 'second-try' }); });
+    const readMessages = vi.fn(async () => { calls.push('read'); return { messages: [] } as unknown as ReadResult; });
+    const inner = portWith({ sendMessage, readMessages });
+    const waits: number[] = [];
+    const chats = new ReliableTeamsChats(inner, {
+      selfDisplayName: 'Assistant',
+      sleepFn: async (ms) => void waits.push(ms),
+      nowFn: fixedNow,
+    });
+
+    expect((await chats.sendMessage('19:a@thread.v2', 'hello channel')).id).toBe('second-try');
+    expect(calls).toEqual(['send', 'read', 'send']); // no readback BEFORE the wait
+    expect(waits).toEqual([20000]);
+  });
+
+  it('two 429s in a row: give up after the second, three requests total, never a storm', async () => {
+    const sendMessage = vi.fn(async () => { throw new GraphError('throttled', 429, 'TooManyRequests', 5); });
+    const readMessages = vi.fn(async () => ({ messages: [] }) as unknown as ReadResult);
+    const inner = portWith({ sendMessage, readMessages });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    await expect(chats.sendMessage('19:a@thread.v2', 'hello channel')).rejects.toMatchObject({ status: 429 });
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    expect(readMessages).toHaveBeenCalledTimes(1);
+  });
+});

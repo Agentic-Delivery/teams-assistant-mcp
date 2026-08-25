@@ -227,3 +227,59 @@ describe('inbox poller', () => {
     expect((await inboxLines()).map((line) => line['id'])).toEqual(['a', 'a']);
   });
 });
+
+describe('inbox poller — behaviour under throttle (2026-08-25)', () => {
+  let dir: string;
+  let inboxPath: string;
+  let statePath: string;
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'inbox-throttle-'));
+    inboxPath = join(dir, 'inbox.jsonl');
+    statePath = join(dir, 'inbox-state.json');
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function pollerOver(readMessages: (chatId: string, since?: string) => Promise<ReturnType<typeof applyWatermark>>, chatIds: string[]) {
+    return new InboxPoller({
+      chats: { readMessages },
+      allowlist: new ChatAllowlist(chatIds.map((id) => ({ id, label: id, canPost: true }))),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+    });
+  }
+
+  it('the first 429 ends the cycle — later chats are not asked — and the cycle counts as unclean so start() backs off', async () => {
+    const asked: string[] = [];
+    const readMessages = async (chatId: string) => {
+      asked.push(chatId);
+      const err = Object.assign(new Error('Too many requests'), { status: 429 });
+      throw err;
+    };
+    const p = pollerOver(readMessages, ['19:one@thread.v2', '19:two@thread.v2', '19:three@thread.v2']);
+
+    const clean = await p.pollOnce();
+
+    expect(asked).toEqual(['19:one@thread.v2']);
+    expect(clean).toBe(false);
+  });
+
+  it('a chat answering 403 is parked: not asked again on the next cycle, while healthy chats still are', async () => {
+    const asked: string[] = [];
+    const readMessages = async (chatId: string, since?: string) => {
+      asked.push(chatId);
+      if (chatId === '19:forbidden@thread.v2') {
+        throw Object.assign(new Error('InsufficientPrivileges'), { status: 403 });
+      }
+      return applyWatermark([], since);
+    };
+    const p = pollerOver(readMessages, ['19:forbidden@thread.v2', '19:ok@thread.v2']);
+
+    await p.pollOnce();
+    await p.pollOnce();
+
+    expect(asked).toEqual(['19:forbidden@thread.v2', '19:ok@thread.v2', '19:ok@thread.v2']);
+  });
+});

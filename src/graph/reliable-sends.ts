@@ -58,7 +58,7 @@ export class ReliableTeamsChats implements TeamsChatsPort {
     options: ReliableSendOptions,
   ) {
     this.selfDisplayName = options.selfDisplayName;
-    this.attempts = options.attempts ?? 3;
+    this.attempts = options.attempts ?? 2;
     this.sleepFn = options.sleepFn ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.nowFn = options.nowFn ?? (() => new Date());
   }
@@ -144,8 +144,20 @@ export class ReliableTeamsChats implements TeamsChatsPort {
         failure = caught;
       }
 
-      // The send REPORTED failure — a claim about the response path, not the chat. Only the
-      // chat itself can say whether the write landed.
+      // A 429 is not an unknown outcome — Graph refused the write outright, nothing landed,
+      // and reading the chat back now would only be another throttled request feeding the
+      // penalty window. Wait the named window out FIRST; the readback then doubles as the
+      // proof the gate has reopened.
+      if (failure instanceof GraphError && failure.status === 429) {
+        if (attempt >= this.attempts) {
+          throw failure;
+        }
+        await this.sleepFn(this.backoffMs(attempt, failure));
+        continue; // the loop's pre-send readback runs next, then the single retry
+      }
+
+      // Any other failure IS an unknown outcome — a claim about the response path, not the
+      // chat. Only the chat itself can say whether the write landed.
       const landed = await this.findLandedCopy(chatId, text, shape, windowStart);
       if (landed) {
         return landed;
