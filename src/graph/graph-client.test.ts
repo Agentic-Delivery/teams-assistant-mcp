@@ -386,18 +386,35 @@ describe('graph client — empty-success bodies (the 11-copy broadcast incident,
 });
 
 describe('graph client — throttle handling on reads', () => {
-  it('caps an absurd Retry-After on the read retry instead of parking the caller', async () => {
+  it('a Retry-After longer than one call may sleep: no retry, honest 429 now, gate closed for the FULL window', async () => {
+    let now = 0;
+    const waits: number[] = [];
+    const fetchFn = vi.fn().mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'throttled' } }), {
+        status: 429,
+        headers: { 'retry-after': '300', 'content-type': 'application/json' },
+      }),
+    );
+    const client = new GraphClient({
+      tokenProvider: stubToken,
+      fetchFn: fetchFn as never,
+      sleepFn: async (ms) => { waits.push(ms); now += ms; },
+      nowFn: () => now,
+    });
+
+    await expect(client.get('/me')).rejects.toMatchObject({ status: 429, retryAfterSeconds: 300 });
+    expect(fetchFn).toHaveBeenCalledTimes(1); // sleeping a minute to fail locally would be theatre
+    expect(waits).toEqual([]);
+    expect(client.throttledForMs()).toBe(300_000); // the window Graph named, not a 60 s stand-in
+  });
+
+  it('a 429 with NO Retry-After still waits the gate out before the single retry (not a 1 s exponential)', async () => {
+    let now = 0;
     const waits: number[] = [];
     const fetchFn = vi
       .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'throttled' } }), {
-          status: 429,
-          headers: { 'retry-after': '300', 'content-type': 'application/json' },
-        }),
-      )
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'throttled' } }), { status: 429 }))
       .mockResolvedValueOnce(json({ id: 'fine' }));
-    let now = 0;
     const client = new GraphClient({
       tokenProvider: stubToken,
       fetchFn: fetchFn as never,
@@ -406,7 +423,7 @@ describe('graph client — throttle handling on reads', () => {
     });
 
     expect(await client.get('/me')).toEqual({ id: 'fine' });
-    expect(waits).toEqual([60000]);
+    expect(waits).toEqual([30_000]); // DEFAULT_THROTTLE_WINDOW_MS — a shorter sleep retries into a closed gate
   });
 
   it('retries a 429 GET after the Retry-After the server names, then succeeds', async () => {

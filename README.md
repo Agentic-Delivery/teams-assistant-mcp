@@ -114,9 +114,19 @@ Every send (server tools and CLIs alike) goes through `ReliableTeamsChats`, whic
 failure report as a claim about the response path, not about the chat. On any send error it
 reads the chat back first — if this attempt's copy is standing, that copy is returned as the
 success and nothing is re-sent. Only a readback that finds nothing leads to a retry, waiting
-out any `Retry-After` the throttle named. Reads (GETs) retry transparently inside `GraphClient`
-on 429/503/504; writes never auto-retry at that layer. A 204 or empty body on a write is a
-success, not a parse error.
+out any `Retry-After` the throttle named. Reads (GETs) retry ONCE inside `GraphClient` on
+429/503/504, after the named wait; writes never auto-retry at that layer. A 204 or empty body on
+a write is a success, not a parse error.
+
+**The throttle gate (since 0.2.0).** Graph escalates its penalty window when a caller keeps
+sending while throttled — and retries that look reasonable one call at a time add up to exactly
+that. So one 429 closes a client-wide gate for the full `Retry-After` (30 s when none is
+named): every request from that process until the window passes fails fast, locally, as
+`GraphError` code `LocallyThrottled`, without touching the network. A throttled send waits the
+window out BEFORE reading the chat back, then retries once. If a send's outcome is genuinely
+unknown (the response path died) and the gate then blocks the readback, the send reports
+`UnknownOutcome` naming the original failure — never "not sent". The gate is per process: see
+KNOWN-ISSUES.
 
 ## Auth, and the fact that ROPC is temporary
 

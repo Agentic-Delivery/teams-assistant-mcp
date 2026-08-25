@@ -29,6 +29,8 @@ export interface InboxPollerDeps {
   inboxPath: string;
   statePath: string;
   pollMs?: number;
+  /** Injectable clock for the 403 park; defaults to Date.now. */
+  nowFn?: () => number;
   maxBackoffMs?: number;
   log?: (line: string) => void;
 }
@@ -55,12 +57,14 @@ export class InboxPoller {
   private backoffMs: number;
   private lastErrorSignature: string | undefined;
   private readonly parked = new Map<string, number>();
+  private readonly now: () => number;
 
   constructor(private readonly deps: InboxPollerDeps) {
     this.pollMs = deps.pollMs ?? DEFAULT_POLL_MS;
     this.maxBackoffMs = deps.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
     this.log = deps.log ?? (() => {});
     this.backoffMs = this.pollMs;
+    this.now = deps.nowFn ?? (() => Date.now());
   }
 
   /**
@@ -112,18 +116,19 @@ export class InboxPoller {
       const lines: string[] = [];
 
       let throttled = false;
+      let attempted = 0;
       for (const entry of this.deps.allowlist.entries()) {
         if (throttled) {
           break; // one 429 ends the cycle — every further request would feed the penalty window
         }
         const parkedUntil = this.parked.get(entry.id) ?? 0;
-        if (parkedUntil > Date.now()) {
+        if (parkedUntil > this.now()) {
           continue; // a chat this account can't read (403) is re-tried on a slow cadence, not every cycle
         }
+        attempted += 1;
         const known = this.state[entry.id];
         try {
           const result = await this.deps.chats.readMessages(entry.id, known?.watermark);
-          this.parked.delete(entry.id);
           for (const message of result.messages) {
             if (message.id === known?.lastId) {
               continue;
@@ -161,7 +166,7 @@ export class InboxPoller {
           if (status === 429) {
             throttled = true; // 2026-08-25: polling on through a throttle kept an account throttled for hours
           } else if (status === 403) {
-            this.parked.set(entry.id, Date.now() + PARK_FORBIDDEN_CHAT_MS);
+            this.parked.set(entry.id, this.now() + PARK_FORBIDDEN_CHAT_MS);
           }
         }
       }
@@ -174,8 +179,10 @@ export class InboxPoller {
       if (failures.length > 0) {
         await this.reportFailure(failures.join(' | '));
         // A throttled cycle is never "clean": start() doubles the wait, which is the only
-        // thing that ends a throttle. A single dead chat still doesn't slow the healthy ones.
-        return !throttled && failures.length < this.deps.allowlist.entries().length;
+        // thing that ends a throttle. A single dead chat still doesn't slow the healthy ones —
+        // but the denominator is the chats this cycle actually ASKED: with the 403 chats
+        // parked, "one of three failed" must not hide "the only chat asked failed" (auth death).
+        return !throttled && failures.length < attempted;
       }
       this.lastErrorSignature = undefined;
       return true;
