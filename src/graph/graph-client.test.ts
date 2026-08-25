@@ -592,3 +592,15 @@ describe('graph client — Retry-After is honoured on 503/504 as well (round 2)'
     expect(error.message).toMatch(/300 seconds/);
   });
 });
+
+describe('graph client — 503 WITHOUT Retry-After (the non-triggering side)', () => {
+  it('waits the short exponential pause, not the throttle default', async () => {
+    let now = 0;
+    const waits: number[] = [];
+    const fetchFn = vi.fn().mockResolvedValueOnce(new Response('', { status: 503 })).mockResolvedValueOnce(json({ id: 'fine' }));
+    const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async (ms) => { waits.push(ms); now += ms; }, nowFn: () => now });
+
+    expect(await client.get('/me')).toEqual({ id: 'fine' });
+    expect(waits).toEqual([1000]);
+  });
+});

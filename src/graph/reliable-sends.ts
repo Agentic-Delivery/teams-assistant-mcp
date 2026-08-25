@@ -201,7 +201,7 @@ export class ReliableTeamsChats implements TeamsChatsPort {
       if (attempt >= this.attempts) {
         throw failure;
       }
-      await this.sleepFn(this.backoffMs(attempt, failure));
+      await this.sleepFn(this.backoffMs(attempt));
     }
   }
 
@@ -240,10 +240,8 @@ export class ReliableTeamsChats implements TeamsChatsPort {
     }
   }
 
-  private backoffMs(attempt: number, failure: unknown): number {
-    if (failure instanceof GraphError && failure.status === 429) {
-      return this.throttleWaitMs(failure);
-    }
+  /** Backoff for a non-throttle failure (a 429 never reaches here — its branch uses throttleWaitMs). */
+  private backoffMs(attempt: number): number {
     return 2 ** attempt * 2500;
   }
 

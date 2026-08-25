@@ -446,7 +446,19 @@ describe('the real assembly — round 2', () => {
     const error = (await chats.sendMessage('19:a@thread.v2', 'hello').catch((c: unknown) => c)) as GraphError;
 
     expect(error.status).toBe(429);
-    expect(error.code).not.toBe('UnknownOutcome');
+    expect(error.code).toBe('ApplicationThrottled'); // Graph's refusal, not our gate's
+    expect(error.retryAfterSeconds).toBe(20);
+  });
+
+  it('first attempt: response path dies and the readback is blocked at once → UnknownOutcome immediately, no sleep, no second send', async () => {
+    let posts = 0;
+    const { chats, sleeps } = stack(async (_u, init) => { if (init.method === 'POST') { posts += 1; throw new TypeError('socket hang up'); } return throttled('1'); }, { advance: false });
+
+    const error = (await chats.sendMessage('19:a@thread.v2', 'hello').catch((c: unknown) => c)) as GraphError;
+
+    expect(error.code).toBe('UnknownOutcome');
+    expect(posts).toBe(1);
+    expect(sleeps).toEqual([]);
   });
 
   it('response path dies, then the readback meets a REAL Graph 429 (not our gate): UnknownOutcome naming the hang-up', async () => {
