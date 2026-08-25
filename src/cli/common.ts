@@ -4,7 +4,8 @@ import { loadConfig } from '../config.js';
 import type { ReliableTeamsChats } from '../graph/reliable-sends.js';
 
 /**
- * Shared plumbing for the standalone CLIs (teams-post, teams-reply, teams-react, teams-read).
+ * Shared plumbing for the standalone CLIs (teams-post, teams-reply, teams-edit, teams-react,
+ * teams-read).
  *
  * The output contract is the whole point, learned the hard way on 2026-08-24 when a caller
  * grepped for a success token the old ad-hoc script never printed and re-posted a broadcast
@@ -20,6 +21,41 @@ export interface CliContext {
 export function buildContext(): CliContext {
   const config = loadConfig();
   return { chats: buildChats(config).chats, allowlist: config.allowlist };
+}
+
+/**
+ * teams-post's --html routing, pulled out of post.ts so it is unit-testable without a live
+ * send: a subprocess test cannot distinguish "the --html branch runs" from "the flag was
+ * ignored", because assertPostable always throws (or not) before either send path is ever
+ * reached — the allowlist gate looks identical either way. Calling this directly with a fake
+ * TeamsChatsPort proves which method actually gets called.
+ */
+export async function doPost(
+  { chats, allowlist }: CliContext,
+  chatId: string,
+  text: string,
+  html: boolean,
+): Promise<{ action: 'post'; id: string; chat: string }> {
+  const entry = allowlist.assertPostable(chatId);
+  const sent = html ? await chats.sendHtmlMessage(chatId, text) : await chats.sendMessage(chatId, text);
+  return { action: 'post', id: sent.id, chat: entry.label };
+}
+
+/** teams-edit's --html routing — same rationale as doPost above. */
+export async function doEdit(
+  { chats, allowlist }: CliContext,
+  chatId: string,
+  messageId: string,
+  newText: string,
+  html: boolean,
+): Promise<{ action: 'edit'; id: string; chat: string }> {
+  const entry = allowlist.assertPostable(chatId);
+  if (html) {
+    await chats.editHtmlMessage(chatId, messageId, newText);
+  } else {
+    await chats.editMessage(chatId, messageId, newText);
+  }
+  return { action: 'edit', id: messageId, chat: entry.label };
 }
 
 export function readStdin(): Promise<string> {

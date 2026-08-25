@@ -37,6 +37,28 @@ function normalized(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
 }
 
+/**
+ * The match key for an html send, reduced the same way a landed copy's own readback will be.
+ *
+ * Empirically checked 2026-08-25 (see reliable-sends.test.ts's captured-readback fixture): a
+ * MINIFIED table (`<td>build</td><td>ok</td>`, no whitespace between adjacent tags) sent via
+ * sendHtmlMessage came back from a real Graph GET rewritten with a raw newline between EVERY
+ * pair of bare-adjacent tags — including `</td><td>` and `</th><th>`, which htmlToText's
+ * BLOCK_END does not treat as word boundaries (only p/div/li/tr/h1-6/br are). Reducing our own
+ * freshly-authored html straight through htmlToText therefore under-counts word boundaries a
+ * landed copy WILL have: "buildok" locally vs. "build ok" once Teams has rewritten it — so a
+ * genuinely landed html send would never match its own readback, and a mid-flight response
+ * failure would retry into a real duplicate (2026-08-24's incident, through the html door).
+ *
+ * Inserting a space at every bare tag-to-tag boundary before reducing closes that gap. It is a
+ * conservative over-approximation — normalized() below collapses any whitespace this adds that
+ * Teams' own rewrite would not have — so it can only turn a false MISMATCH into a match, never
+ * the reverse.
+ */
+function htmlMatchText(html: string): string {
+  return htmlToText(html.replace(/></g, '> <'));
+}
+
 type MatchShape = 'whole-message' | 'reply-tail';
 
 /**
@@ -82,12 +104,22 @@ export class ReliableTeamsChats implements TeamsChatsPort {
   }
 
   sendHtmlMessage(chatId: string, html: string): Promise<ChatMessage> {
+    const matchText = htmlMatchText(html);
+    if (normalized(matchText) === '') {
+      // html like '<img src="...">' or '<hr>' reduces to no text at all — there is no readback
+      // key to guard with. Worse than merely "no retry": an EMPTY wanted string is a match
+      // against EVERY candidate whose own text also reduces to empty (findLandedCopy compares
+      // by equality), so a genuinely failed send could claim an EARLIER own message — an
+      // unrelated image, say — sent minutes ago as "this attempt's landed copy". Same shape as
+      // sendImage's own comment below: one attempt, honest error, no blind retry.
+      return this.inner.sendHtmlMessage(chatId, html);
+    }
     // sendGuarded's second argument is the MATCH text, not necessarily what gets posted: a
     // landed copy's readback always comes back as htmlToText(body) (toChatMessage runs every
     // html body through it — see messages.ts), so comparing raw markup against that readback
-    // would never match and every retry would re-post a duplicate. Reducing the caller's html
-    // through the SAME converter the reader uses is what makes the comparison meaningful.
-    return this.sendGuarded(chatId, htmlToText(html), 'whole-message', () =>
+    // would never match and every retry would re-post a duplicate. htmlMatchText reduces the
+    // caller's html the same way (see its own doc comment for the empirically-found subtlety).
+    return this.sendGuarded(chatId, matchText, 'whole-message', () =>
       this.inner.sendHtmlMessage(chatId, html),
     );
   }

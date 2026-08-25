@@ -264,9 +264,9 @@ allowlist refusals) come back as readable text, not transport failures.
 |---|---|---|
 | `list_chats` | The allowlist intersected with what the account can see; `visibleToAccount: false` flags missing membership | none |
 | `read_chat_messages` | Messages from one chat, oldest first, with a watermark for the next call | `chatId`, `since?` (ISO watermark, exclusive), `limit?` (1–200, default 50) |
-| `send_chat_message` | Posts plain text to a chat with `canPost: true` | `chatId`, `text` |
+| `send_chat_message` | Posts to a chat with `canPost: true` | `chatId`, `text`, `format?` (`'text'` default, escapes and renders; `'html'` posts raw Teams-subset HTML verbatim — caller escapes their own `<`, `>`, `&`) |
 | `reply_chat_message` | Posts a quote-card reply to a specific message | `chatId`, `replyToMessageId`, `text` |
-| `edit_chat_message` | Replaces the text of a message this account sent; Teams shows "Edited" | `chatId`, `messageId`, `newText` |
+| `edit_chat_message` | Replaces the text of a message this account sent; Teams shows "Edited" | `chatId`, `messageId`, `newText`, `format?` (same as `send_chat_message`) |
 | `react_to_chat_message` | Puts an emoji reaction on a message in an allowlisted chat | `chatId`, `messageId`, `emoji` |
 | `delete_chat_message` | Soft-deletes a message this account sent (restorable in Teams) | `chatId`, `messageId` |
 | `send_chat_image` | Posts a PNG/JPEG that renders inline | `chatId`, `path?` or `base64?` (exactly one), `mime?` (required with base64), `text?` |
@@ -279,9 +279,11 @@ calls, and the server passes Graph's refusal through verbatim rather than pre-ch
 
 ## The standalone CLIs
 
-Beside the server, `npm run build` produces four commands under `dist/cli/` (also exposed as
-package bins): `teams-post`, `teams-reply`, `teams-react`, `teams-read`. Same env vars, same
-allowlist, same send-reliability code paths as the server tools. Success is exactly one JSON
-line on stdout and exit 0; failure is stderr plus a non-zero exit (2 usage, 3 allowlist,
-1 anything else). Branch on the exit code, never on output text — see README's "The standalone
-CLIs" for the incident that made this a rule.
+Beside the server, `npm run build` produces five commands under `dist/cli/` (also exposed as
+package bins): `teams-post [--html]`, `teams-reply`, `teams-edit [--html]`, `teams-react`,
+`teams-read`. Same env vars, same allowlist, same send-reliability code paths as the server
+tools. `--html` on `teams-post`/`teams-edit` posts stdin as raw HTML verbatim, same contract as
+`format: 'html'` above. Success is exactly one JSON line on stdout and exit 0; failure is
+stderr plus a non-zero exit (2 usage, 3 allowlist, 1 anything else). Branch on the exit code,
+never on output text — see README's "The standalone CLIs" for the incident that made this a
+rule.
