@@ -150,10 +150,12 @@ export function buildServer(deps: ServerDeps): McpServer {
     ({ chatId, text, format }) =>
       guard(async () => {
         allowlist.assertPostable(chatId);
-        const sent =
-          format === 'html'
-            ? await chats.sendHtmlMessage(chatId, text)
-            : await chats.sendMessage(chatId, text);
+        let sent;
+        if (format === 'html') {
+          sent = await chats.sendHtmlMessage(chatId, text);
+        } else {
+          sent = await chats.sendMessage(chatId, text);
+        }
         return ok({ posted: true, chatId, messageId: sent.id, createdDateTime: sent.createdDateTime });
       }),
   );

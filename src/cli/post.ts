@@ -2,7 +2,7 @@
 // Usage: teams-post <chatId> [--html] < message.txt
 // --html: stdin is raw Teams-subset HTML, posted verbatim — the caller escapes their own <,>,&.
 // Success: one JSON line {ok, id, chat} on stdout, exit 0. See common.ts for the contract.
-import { buildContext, readStdin, run, succeed, usage } from './common.js';
+import { buildContext, doPost, readStdin, run, succeed, usage } from './common.js';
 
 await run(async () => {
   const chatId = process.argv[2];
@@ -11,8 +11,5 @@ await run(async () => {
   const text = await readStdin();
   if (!text) usage('empty message on stdin');
 
-  const { chats, allowlist } = buildContext();
-  const entry = allowlist.assertPostable(chatId);
-  const sent = html ? await chats.sendHtmlMessage(chatId, text) : await chats.sendMessage(chatId, text);
-  succeed({ action: 'post', id: sent.id, chat: entry.label });
+  succeed(await doPost(buildContext(), chatId, text, html));
 });

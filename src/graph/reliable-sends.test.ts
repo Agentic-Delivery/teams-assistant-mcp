@@ -3,7 +3,7 @@ import { GraphClient, GraphError } from './graph-client.js';
 import { ReliableTeamsChats } from './reliable-sends.js';
 import { GraphTeamsChats, type TeamsChatsPort } from './teams-chats.js';
 import type { TokenProvider } from '../auth/token-provider.js';
-import type { ChatMessage, ReadResult } from '../messages.js';
+import { toChatMessage, type ChatMessage, type ReadResult } from '../messages.js';
 
 function message(overrides: Partial<ChatMessage>): ChatMessage {
   return {
@@ -259,6 +259,93 @@ describe('reliable sends — html format: readback dedup compares TEXT, not raw 
     await chats.editHtmlMessage('19:a@thread.v2', 'm1', '<b>corrected</b>');
 
     expect(inner.editHtmlMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1', '<b>corrected</b>');
+  });
+
+  it('an html body that reduces to no text at all (image/hr-only) gets no guard: one attempt, honest error, no readback', async () => {
+    // The hazard this closes: an EMPTY match key equality-matches ANY earlier own message whose
+    // text also reduces to empty (an unrelated image sent minutes ago, say) — findLandedCopy
+    // would report THAT as "this attempt's landed copy" and swallow a genuine failure as success.
+    const earlierEmpty = message({
+      id: 'earlier-empty',
+      text: '',
+      createdDateTime: '2026-08-25T05:59:50Z', // inside the attempt window
+    });
+    const sendHtmlMessage = vi.fn(async () => {
+      throw new GraphError('hang up', 0);
+    });
+    const readMessages = vi.fn(async () => ({ messages: [earlierEmpty] }) as unknown as ReadResult);
+    const inner = portWith({ sendHtmlMessage, readMessages });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    await expect(
+      chats.sendHtmlMessage('19:a@thread.v2', '<img src="https://example.test/x.png">'),
+    ).rejects.toThrow(/hang up/);
+
+    expect(readMessages).not.toHaveBeenCalled(); // no blind readback against an empty match key
+    expect(sendHtmlMessage).toHaveBeenCalledTimes(1); // one attempt, never a retry
+  });
+
+  it('a clean send of empty-reducing html still succeeds — one attempt is enough when nothing fails', async () => {
+    const sent = message({ id: 'hr-1', text: '' });
+    const sendHtmlMessage = vi.fn(async () => sent);
+    const inner = portWith({ sendHtmlMessage });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    expect(await chats.sendHtmlMessage('19:a@thread.v2', '<hr>')).toBe(sent);
+    expect(sendHtmlMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('reliable sends — html match key vs a REAL captured Teams readback (fixture, 2026-08-25)', () => {
+  // Captured empirically against the allowlisted dev/test chat: sent this MINIFIED table (no
+  // whitespace between adjacent tags) via a real sendHtmlMessage call, then GET the message back
+  // off Graph and read RAW body.content — bypassing toChatMessage/htmlToText entirely, so this is
+  // exactly what Teams stored, not what our own code thinks it stored.
+  const SENT_HTML =
+    '<table border="1"><tr><th>Item</th><th>State</th></tr><tr><td>build</td><td>ok</td></tr></table>';
+  const CAPTURED_RAW_READBACK =
+    '<table border="1">\n<tbody>\n<tr>\n<th>Item</th>\n<th>State</th>\n</tr>\n<tr>\n' +
+    '<td>build</td>\n<td>ok</td>\n</tr>\n</tbody>\n</table>';
+
+  it('toChatMessage reduces the captured readback to "Item State\\nbuild ok" (pins the capture itself)', () => {
+    const landed = toChatMessage(
+      {
+        id: 'captured-1',
+        createdDateTime: '2026-08-25T06:00:05Z',
+        from: { user: { id: 'me', displayName: 'Assistant' } },
+        body: { contentType: 'html', content: CAPTURED_RAW_READBACK },
+      },
+      '19:a@thread.v2',
+    );
+
+    expect(landed.text).toBe('Item State\nbuild ok');
+  });
+
+  it('the sent (minified) html matches its own REAL captured readback — table cell boundaries included', async () => {
+    // Without htmlMatchText's tag-boundary fix this reduces to "ItemState\nbuildok" locally,
+    // which never equals "Item State\nbuild ok" — this is the exact case that used to duplicate.
+    const landed = toChatMessage(
+      {
+        id: 'captured-1',
+        createdDateTime: '2026-08-25T06:00:05Z',
+        from: { user: { id: 'me', displayName: 'Assistant' } },
+        body: { contentType: 'html', content: CAPTURED_RAW_READBACK },
+      },
+      '19:a@thread.v2',
+    );
+    const sendHtmlMessage = vi.fn(async () => {
+      throw new GraphError('socket hang up mid-response', 0);
+    });
+    const inner = portWith({
+      sendHtmlMessage,
+      readMessages: vi.fn(async () => ({ messages: [landed] }) as unknown as ReadResult),
+    });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    const result = await chats.sendHtmlMessage('19:a@thread.v2', SENT_HTML);
+
+    expect(result).toBe(landed);
+    expect(sendHtmlMessage).toHaveBeenCalledTimes(1); // found the REAL captured landed copy — no duplicate
   });
 });
 
