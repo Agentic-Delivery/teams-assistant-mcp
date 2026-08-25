@@ -359,3 +359,126 @@ describe('teams chats over graph', () => {
     expect((await chats.listChats())[0]?.topic).toBe('Alice, Bob');
   });
 });
+
+describe('graph client — empty-success bodies (the 11-copy broadcast incident, 2026-08-24)', () => {
+  it('treats a 204 answer to postNoContent() as success, not a parse error', async () => {
+    // setReaction and friends answer 204 No Content; the old unconditional response.json()
+    // threw SyntaxError on that success, which is how a landed write got reported as failed.
+    const fetchFn = vi.fn(async () => new Response(null, { status: 204 }));
+    const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never });
+
+    await expect(client.postNoContent('/chats/x/messages/1/setReaction', { reactionType: '👍' }))
+      .resolves.toBeUndefined();
+  });
+
+  it('an empty success to a CREATE post() is an unknown outcome said plainly, never a phantom resource', async () => {
+    // A create must hand back the resource; defaulting an empty body would give callers a
+    // message with no id. The error text says the write may have landed — the readback layer
+    // is what turns that honesty into a safe retry.
+    const fetchFn = vi.fn(async () => new Response('', { status: 200 }));
+    const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never });
+
+    const error = (await client.post('/chats/x/messages', {}).catch((c: unknown) => c)) as GraphError;
+    expect(error).toBeInstanceOf(GraphError);
+    expect(error.code).toBe('EmptyCreateResponse');
+    expect(error.message).toMatch(/unknown/);
+  });
+});
+
+describe('graph client — throttle handling on reads', () => {
+  it('caps an absurd Retry-After on the read retry instead of parking the caller', async () => {
+    const waits: number[] = [];
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'throttled' } }), {
+          status: 429,
+          headers: { 'retry-after': '300', 'content-type': 'application/json' },
+        }),
+      )
+      .mockResolvedValueOnce(json({ id: 'fine' }));
+    const client = new GraphClient({
+      tokenProvider: stubToken,
+      fetchFn: fetchFn as never,
+      sleepFn: async (ms) => void waits.push(ms),
+    });
+
+    expect(await client.get('/me')).toEqual({ id: 'fine' });
+    expect(waits).toEqual([60000]);
+  });
+
+  it('retries a 429 GET after the Retry-After the server names, then succeeds', async () => {
+    const waits: number[] = [];
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'throttled' } }), {
+          status: 429,
+          headers: { 'retry-after': '7', 'content-type': 'application/json' },
+        }),
+      )
+      .mockResolvedValueOnce(json({ id: 'fine' }));
+    const client = new GraphClient({
+      tokenProvider: stubToken,
+      fetchFn: fetchFn as never,
+      sleepFn: async (ms) => void waits.push(ms),
+    });
+
+    expect(await client.get('/me')).toEqual({ id: 'fine' });
+    expect(waits).toEqual([7000]);
+  });
+
+  it('gives up after the retry budget and surfaces the throttle with its Retry-After', async () => {
+    const fetchFn = vi.fn(async () =>
+      new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'throttled' } }), {
+        status: 429,
+        headers: { 'retry-after': '3', 'content-type': 'application/json' },
+      }),
+    );
+    const client = new GraphClient({
+      tokenProvider: stubToken,
+      fetchFn: fetchFn as never,
+      sleepFn: async () => {},
+    });
+
+    const error = (await client.get('/me').catch((c: unknown) => c)) as GraphError;
+    expect(error).toBeInstanceOf(GraphError);
+    expect(error.status).toBe(429);
+    expect(error.retryAfterSeconds).toBe(3);
+    expect(fetchFn.mock.calls.length).toBe(3); // 1 try + 2 retries, then honesty
+  });
+
+  it('never auto-retries a POST — a write is not idempotent', async () => {
+    const fetchFn = vi.fn(async () =>
+      new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'throttled' } }), {
+        status: 429,
+        headers: { 'retry-after': '1', 'content-type': 'application/json' },
+      }),
+    );
+    const client = new GraphClient({
+      tokenProvider: stubToken,
+      fetchFn: fetchFn as never,
+      sleepFn: async () => {},
+    });
+
+    await expect(client.post('/chats/x/messages', {})).rejects.toThrow();
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('reactions', () => {
+  it('setReaction posts the bare payload and accepts the 204 answer', async () => {
+    const fetchFn = vi.fn(async () => new Response(null, { status: 204 }));
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
+    );
+
+    await expect(chats.setReaction('19:a@thread.v2', 'msg-1', '👍')).resolves.toBeUndefined();
+
+    const [url, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toContain('/messages/msg-1/setReaction');
+    // The payload is {reactionType} directly — wrapping it in {body: …} answers
+    // "ReactionType cannot be null", the 2026-08-24 react.mjs bug.
+    expect(JSON.parse(init.body as string)).toEqual({ reactionType: '👍' });
+  });
+});
