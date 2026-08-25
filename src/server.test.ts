@@ -69,8 +69,26 @@ class FakeTeamsChats implements TeamsChatsPort {
     );
   }
 
+  readonly sentHtml: Array<{ chatId: string; html: string }> = [];
+
+  async sendHtmlMessage(chatId: string, html: string) {
+    this.sentHtml.push({ chatId, html });
+    // contentType 'html' here so toChatMessage's htmlToText round-trip mirrors the real Graph
+    // readback — the same shape a genuine sendHtmlMessage readback would return.
+    return toChatMessage(
+      {
+        id: 'sent-html-1',
+        chatId,
+        createdDateTime: '2026-08-19T10:00:00Z',
+        body: { contentType: 'html', content: html },
+      },
+      chatId,
+    );
+  }
+
   readonly replies: Array<{ chatId: string; replyToMessageId: string; text: string }> = [];
   readonly edits: Array<{ chatId: string; messageId: string; newText: string }> = [];
+  readonly htmlEdits: Array<{ chatId: string; messageId: string; html: string }> = [];
   readonly deletes: Array<{ chatId: string; messageId: string }> = [];
 
   async replyToMessage(chatId: string, replyToMessageId: string, text: string) {
@@ -83,6 +101,10 @@ class FakeTeamsChats implements TeamsChatsPort {
 
   async editMessage(chatId: string, messageId: string, newText: string) {
     this.edits.push({ chatId, messageId, newText });
+  }
+
+  async editHtmlMessage(chatId: string, messageId: string, html: string) {
+    this.htmlEdits.push({ chatId, messageId, html });
   }
 
   async deleteMessage(chatId: string, messageId: string) {
@@ -272,6 +294,20 @@ describe('edit_chat_message', () => {
     expect(result.isError).toBe(true);
     expect(chats.edits).toEqual([]);
   });
+
+  it('format "html" patches the content verbatim through editHtmlMessage', async () => {
+    const html = '<table border="1"><tr><td>ok</td></tr></table>';
+    const result = await call(client, 'edit_chat_message', {
+      chatId: PILOT,
+      messageId: 'm1',
+      newText: html,
+      format: 'html',
+    });
+
+    expect(result.isError).toBe(false);
+    expect(chats.htmlEdits).toEqual([{ chatId: PILOT, messageId: 'm1', html }]);
+    expect(chats.edits).toEqual([]);
+  });
 });
 
 describe('delete_chat_message', () => {
@@ -372,6 +408,23 @@ describe('send_chat_message', () => {
     expect(result.isError).toBe(true);
     expect(result.text).toContain('for post');
     expect(chats.sent).toEqual([]);
+  });
+
+  it('format "html" posts the content verbatim through sendHtmlMessage, untouched by textToHtml', async () => {
+    const html = '<b>bold</b> &amp; <span style="color:#c00">red</span>';
+    const result = await call(client, 'send_chat_message', { chatId: PILOT, text: html, format: 'html' });
+
+    expect(result.isError).toBe(false);
+    expect(chats.sentHtml).toEqual([{ chatId: PILOT, html }]);
+    expect(chats.sent).toEqual([]); // the plain-text path was never touched
+  });
+
+  it('format omitted still goes through the escaping sendMessage path', async () => {
+    const result = await call(client, 'send_chat_message', { chatId: PILOT, text: '<b>not bold</b>' });
+
+    expect(result.isError).toBe(false);
+    expect(chats.sent).toEqual([{ chatId: PILOT, text: '<b>not bold</b>' }]);
+    expect(chats.sentHtml).toEqual([]);
   });
 });
 
