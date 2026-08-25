@@ -19,9 +19,10 @@ messages people actually want to read: when to style and when to stay plain, the
 vocabulary Teams verifiably renders (verified by screenshot against the real client, not
 inferred from docs), known rendering quirks, and a live status-board pattern for making
 agent progress visible in the chat. Install it by adding this repo as a Claude Code plugin
-marketplace; the skill is useful alongside any install of the server. Note the skill's
-capability note: styled output needs a raw-HTML send path — the server's standard send
-deliberately escapes to plain text.
+marketplace. Styled output needs the raw-HTML path the skill assumes: pass `format: 'html'`
+to `send_chat_message`/`edit_chat_message` (default `'text'` still escapes everything), or
+`--html` to `teams-post`/`teams-edit`. The caller owns entity-escaping `<`, `>`, `&` inside
+their own content on that path — the server posts it verbatim.
 
 ## Getting started
 
@@ -45,11 +46,11 @@ The server speaks MCP over stdio and exposes eleven tools:
 |---|---|
 | `list_chats` | The allowlisted chats, annotated with whether the account can actually see each one |
 | `read_chat_messages` | Messages from one chat, oldest first, with a watermark for the next call |
-| `send_chat_message` | Posts plain text to a chat whose allowlist entry has `canPost: true` |
+| `send_chat_message` | Posts to a chat whose allowlist entry has `canPost: true`; `format: 'text'` (default) escapes and renders, `format: 'html'` posts raw HTML verbatim |
 | `send_chat_image` | Posts a PNG/JPEG that renders inline, from a local path or base64 bytes |
 | `send_chat_file` | Uploads a local file to the account's OneDrive (`TEAMS_MCP_UPLOAD_DIR`, default `ai-test`) and shares it into the chat |
 | `reply_chat_message` | Posts a quoted reply to a specific message — chats have no reply threads, so this is the quote card the Teams UI produces |
-| `edit_chat_message` | Replaces the text of a message this account sent (Graph refuses anyone else's) |
+| `edit_chat_message` | Replaces the text of a message this account sent (Graph refuses anyone else's); same `format` option as `send_chat_message` |
 | `react_to_chat_message` | Puts an emoji reaction on a message — the receipt gesture for "seen, being handled" |
 | `delete_chat_message` | Soft-deletes a message this account sent — the reversible kind; no hard delete offered |
 | `get_chat_attachment` | Downloads one attachment to a local file and returns the path — shared files, and pasted images which appear as `inline-image-N` |
@@ -108,11 +109,14 @@ Two knobs: `TEAMS_INBOX_PATH` moves the inbox (the sidecar follows it), and
 
 ## The standalone CLIs
 
-Four small commands ship beside the server for scripts, cron jobs and background monitors that
-need Teams without a running MCP session: `teams-post <chatId>` (text on stdin), `teams-reply
-<chatId> <messageId>` (text on stdin), `teams-react <chatId> <messageId> <emoji>` and
-`teams-read <chatId> [--limit N] [--since ISO]`. Same allowlist, same auth, same code paths as
-the server tools — including the send reliability below.
+Five small commands ship beside the server for scripts, cron jobs and background monitors that
+need Teams without a running MCP session: `teams-post <chatId> [--html]` (text on stdin),
+`teams-reply <chatId> <messageId>` (text on stdin), `teams-edit <chatId> <messageId> [--html]`
+(new text on stdin), `teams-react <chatId> <messageId> <emoji>` and `teams-read <chatId>
+[--limit N] [--since ISO]`. Same allowlist, same auth, same code paths as the server tools —
+including the send reliability below. `--html` on `teams-post`/`teams-edit` posts stdin as raw
+Teams-subset HTML, verbatim — the caller is responsible for entity-escaping their own `<`, `>`,
+`&`; see the `teams-styling` plugin for the verified vocabulary.
 
 Their output contract exists because of a real incident (2026-08-24): an ad-hoc wrapper's
 caller grepped for a success token the wrapper never printed, read eleven successful posts as

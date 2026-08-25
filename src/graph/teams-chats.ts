@@ -36,10 +36,20 @@ export interface TeamsChatsPort {
   listChats(): Promise<ChatSummary[]>;
   readMessages(chatId: string, since?: string, limit?: number): Promise<ReadResult>;
   sendMessage(chatId: string, text: string): Promise<ChatMessage>;
+  /**
+   * Opt-in raw path: html is posted as the Graph body content VERBATIM — no textToHtml, no
+   * escaping. The caller owns entity-escaping `<`, `>`, `&` inside their own content; this is
+   * what lets Teams' HTML subset (tables, headings, colour — see the teams-styling skill's
+   * verified vocabulary) actually render, since textToHtml only ever produces plain
+   * paragraphs/breaks/links.
+   */
+  sendHtmlMessage(chatId: string, html: string): Promise<ChatMessage>;
   sendImage(chatId: string, image: OutboundImage, text?: string): Promise<ChatMessage>;
   sendFile(chatId: string, file: OutboundFile, text?: string): Promise<ChatMessage>;
   replyToMessage(chatId: string, replyToMessageId: string, text: string): Promise<ChatMessage>;
   editMessage(chatId: string, messageId: string, newText: string): Promise<void>;
+  /** Same verbatim contract as sendHtmlMessage, applied to an edit. */
+  editHtmlMessage(chatId: string, messageId: string, html: string): Promise<void>;
   deleteMessage(chatId: string, messageId: string): Promise<void>;
   setReaction(chatId: string, messageId: string, reactionType: string): Promise<void>;
   getAttachment(chatId: string, messageId: string, attachmentId?: string): Promise<AttachmentPayload>;
@@ -127,6 +137,16 @@ export class GraphTeamsChats implements TeamsChatsPort {
     const created = await this.graph.post<unknown>(
       `/chats/${encodeURIComponent(chatId)}/messages`,
       { body: { contentType: 'html', content: textToHtml(text) } },
+    );
+    return toChatMessage(created, chatId);
+  }
+
+  async sendHtmlMessage(chatId: string, html: string): Promise<ChatMessage> {
+    // No textToHtml here — html IS the body content, posted exactly as given. See
+    // TeamsChatsPort.sendHtmlMessage's doc comment for why this exists alongside sendMessage.
+    const created = await this.graph.post<unknown>(
+      `/chats/${encodeURIComponent(chatId)}/messages`,
+      { body: { contentType: 'html', content: html } },
     );
     return toChatMessage(created, chatId);
   }
@@ -282,6 +302,14 @@ export class GraphTeamsChats implements TeamsChatsPort {
     await this.graph.patch(
       `/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}`,
       { body: { contentType: 'html', content: textToHtml(newText) } },
+    );
+  }
+
+  async editHtmlMessage(chatId: string, messageId: string, html: string): Promise<void> {
+    // Same verbatim contract as sendHtmlMessage — no textToHtml, no escaping.
+    await this.graph.patch(
+      `/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}`,
+      { body: { contentType: 'html', content: html } },
     );
   }
 
