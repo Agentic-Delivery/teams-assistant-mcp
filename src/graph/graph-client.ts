@@ -146,14 +146,17 @@ export class GraphClient {
       if (attempt >= this.readRetries || !RETRYABLE_READ_STATUSES.has(response.status)) {
         await this.fail(response);
       }
-      await response.body?.cancel().catch(() => undefined);
-      // The wait must outlast the gate the 429 just closed, or the retry fails fast locally —
-      // and if that wait would exceed what one call may hang for, there is no honest retry:
-      // fail now with the 429 rather than sleep a minute and then fail locally anyway.
-      const waitMs = Math.max(this.throttledForMs(), 2 ** attempt * 1000);
+      // The wait honours a named Retry-After on ANY retryable status (a 503 that asks for
+      // room gets it), must outlast the gate a 429 just closed (or the retry fails fast
+      // locally), and never shrinks below a short exponential pause. If that wait would exceed
+      // what one call may hang for, there is no honest retry: fail now — with Graph's own
+      // message and code intact — rather than sleep a minute and then fail locally anyway.
+      const named = retryAfterSecondsOf(response);
+      const waitMs = Math.max(named ? named * 1000 : 0, this.throttledForMs(), 2 ** attempt * 1000);
       if (waitMs > MAX_RETRY_SLEEP_MS) {
         await this.fail(response);
       }
+      await response.body?.cancel().catch(() => undefined);
       await this.sleepFn(waitMs);
     }
   }

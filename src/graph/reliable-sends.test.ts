@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { GraphError } from './graph-client.js';
+import { GraphClient, GraphError } from './graph-client.js';
 import { ReliableTeamsChats } from './reliable-sends.js';
-import type { TeamsChatsPort } from './teams-chats.js';
+import { GraphTeamsChats, type TeamsChatsPort } from './teams-chats.js';
+import type { TokenProvider } from '../auth/token-provider.js';
 import type { ChatMessage, ReadResult } from '../messages.js';
 
 function message(overrides: Partial<ChatMessage>): ChatMessage {
@@ -285,22 +286,15 @@ describe('reliable sends — the match must be OUR copy, nothing else (review ro
     expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
-  it('an absurd Retry-After is capped instead of parking the caller', async () => {
+  it('an absurd Retry-After on a refused send: fail NOW with the 429, no sleep, no retry', async () => {
     const waits: number[] = [];
-    const sendMessage = vi
-      .fn()
-      .mockRejectedValueOnce(new GraphError('throttled', 429, 'TooManyRequests', 300))
-      .mockResolvedValueOnce(message({ id: 'second-try' }));
+    const sendMessage = vi.fn(async () => { throw new GraphError('throttled', 429, 'TooManyRequests', 300); });
     const inner = portWith({ sendMessage });
-    const chats = new ReliableTeamsChats(inner, {
-      selfDisplayName: 'Assistant',
-      sleepFn: async (ms) => void waits.push(ms),
-      nowFn: fixedNow,
-    });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async (ms) => void waits.push(ms), nowFn: fixedNow });
 
-    await chats.sendMessage('19:a@thread.v2', 'hello channel');
-
-    expect(waits).toEqual([60000]);
+    await expect(chats.sendMessage('19:a@thread.v2', 'hello channel')).rejects.toMatchObject({ status: 429, retryAfterSeconds: 300 });
+    expect(waits).toEqual([]);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
   it('a retry re-checks the chat right before re-sending, catching a late-landing copy', async () => {
@@ -354,10 +348,6 @@ describe('reliable sends — under a 429 the chat is NOT read back before the wa
   });
 });
 
-
-import { GraphClient } from './graph-client.js';
-import { GraphTeamsChats } from './teams-chats.js';
-import type { TokenProvider } from '../auth/token-provider.js';
 
 describe('the real assembly — GraphClient + GraphTeamsChats + ReliableTeamsChats over a fake fetch (review round 1)', () => {
   const stubToken: TokenProvider = { kind: 'stub', getAccessToken: async () => 't' };
@@ -415,5 +405,56 @@ describe('the real assembly — GraphClient + GraphTeamsChats + ReliableTeamsCha
     expect(error.code).toBe('UnknownOutcome');
     expect(error.message).toMatch(/socket hang up/);
     expect(error.message).not.toMatch(/not sent/);
+  });
+});
+
+describe('the real assembly — round 2', () => {
+  const stubToken: TokenProvider = { kind: 'stub', getAccessToken: async () => 't' };
+  const throttled = (retryAfter?: string) =>
+    new Response(JSON.stringify({ error: { code: 'ApplicationThrottled', message: 'Rate limit is exceeded.' } }), {
+      status: 429, headers: { 'content-type': 'application/json', ...(retryAfter ? { 'retry-after': retryAfter } : {}) },
+    });
+  const jsonResponse = (body: unknown, status = 200) =>
+    new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+
+  function stack(fetchFn: (url: string, init: RequestInit) => Promise<Response>, opts: { advance: boolean } = { advance: true }) {
+    let now = Date.parse('2026-08-25T06:00:00Z');
+    const sleeps: number[] = [];
+    const sleepFn = async (ms: number) => { sleeps.push(ms); if (opts.advance) now += ms; };
+    const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn, nowFn: () => now, readRetries: 0 });
+    const chats = new ReliableTeamsChats(new GraphTeamsChats(client), { selfDisplayName: 'Assistant', sleepFn, nowFn: () => new Date(now) });
+    return { chats, sleeps };
+  }
+
+  it('a send Graph REFUSED with a long Retry-After: reported as the 429 with that Retry-After, nothing slept, never "unknown"', async () => {
+    const posts: number[] = [];
+    const { chats, sleeps } = stack(async (_u, init) => { if (init.method === 'POST') { posts.push(1); return throttled('300'); } return jsonResponse({ value: [] }); });
+
+    const error = (await chats.sendMessage('19:a@thread.v2', 'hello').catch((c: unknown) => c)) as GraphError;
+
+    expect(error.status).toBe(429);
+    expect(error.code).toBe('ApplicationThrottled');
+    expect(error.retryAfterSeconds).toBe(300);
+    expect(error.message).not.toMatch(/UNKNOWN/);
+    expect(posts).toHaveLength(1);
+    expect(sleeps).toEqual([]); // no minute of theatre before the honest answer
+  });
+
+  it('a send refused with a SHORT Retry-After, then the gate still closed at retry time: still the 429, still not "unknown"', async () => {
+    const { chats } = stack(async (_u, init) => (init.method === 'POST' ? throttled('20') : throttled('20')), { advance: false });
+
+    const error = (await chats.sendMessage('19:a@thread.v2', 'hello').catch((c: unknown) => c)) as GraphError;
+
+    expect(error.status).toBe(429);
+    expect(error.code).not.toBe('UnknownOutcome');
+  });
+
+  it('response path dies, then the readback meets a REAL Graph 429 (not our gate): UnknownOutcome naming the hang-up', async () => {
+    const { chats } = stack(async (_u, init) => { if (init.method === 'POST') { throw new TypeError('socket hang up'); } return throttled('1'); });
+
+    const error = (await chats.sendMessage('19:a@thread.v2', 'hello').catch((c: unknown) => c)) as GraphError;
+
+    expect(error.code).toBe('UnknownOutcome');
+    expect(error.message).toMatch(/socket hang up/);
   });
 });

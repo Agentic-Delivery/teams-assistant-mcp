@@ -565,3 +565,30 @@ describe('graph client — the throttle gate (2026-08-25: retries under 429 ampl
     expect(client.throttledForMs()).toBeGreaterThan(0);
   });
 });
+
+describe('graph client — Retry-After is honoured on 503/504 as well (round 2)', () => {
+  it('a 503 naming Retry-After 30 waits those 30 s, not a 1 s exponential', async () => {
+    let now = 0;
+    const waits: number[] = [];
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(new Response('', { status: 503, headers: { 'retry-after': '30' } }))
+      .mockResolvedValueOnce(json({ id: 'fine' }));
+    const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async (ms) => { waits.push(ms); now += ms; }, nowFn: () => now });
+
+    expect(await client.get('/me')).toEqual({ id: 'fine' });
+    expect(waits).toEqual([30_000]);
+  });
+
+  it('the fail-now path keeps Graph\'s own message and code', async () => {
+    const fetchFn = vi.fn(async () =>
+      new Response(JSON.stringify({ error: { code: 'ApplicationThrottled', message: 'Rate limit is exceeded. Try again in 300 seconds.' } }), {
+        status: 429, headers: { 'retry-after': '300', 'content-type': 'application/json' },
+      }));
+    const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 });
+
+    const error = (await client.get('/me').catch((c: unknown) => c)) as GraphError;
+    expect(error.code).toBe('ApplicationThrottled');
+    expect(error.message).toMatch(/300 seconds/);
+  });
+});
