@@ -23,7 +23,8 @@ text; reach for styling when the content has structure a reader must scan:
 | Content | Format |
 |---|---|
 | Short conversational reply, answer to a question | Plain text — no styling |
-| Findings / triage / comparison across items | `<table>` — never plain-text pipe walls |
+| Comparison across items with SHORT cells (ids, labels, verdicts, numbers) | `<table>` — never plain-text pipe walls |
+| Findings with prose explanations | Headed sections, NOT a table: one `<b>` heading line per item, `<ul>` bullets under it, a bold `→ Fix:`/`→ Action:` closing bullet |
 | Long report | Summary message with a table + link to the full document; not the whole report inline |
 | Progress on multi-agent or long-running work | Live status board (pattern below) |
 | Warning / blocker / decision needed | One `<b>` lead line + ⚠️/🔴 emoji; mention the human owner by name |
@@ -58,6 +59,16 @@ signal, not every word; a message that is all bold has no bold. If in doubt, pla
 3. **Manual escaping is on you** on the raw-HTML path: `<`, `>`, `&` inside content (code
    snippets, generics, XML) must be entity-escaped (`&lt;` `&gt;` `&amp;`) or they are
    swallowed as markup.
+4. **Tables reflow with the reader's pane width** — there is no fixed layout. A table that
+   looks fine full-screen collapses into one-word-per-line columns in the default narrow
+   chat pane (screenshot-verified both ways). You cannot control the reader's window, so
+   design for the narrow case: cells hold at most one short sentence; multi-sentence prose
+   means you wanted headed sections, not a table.
+5. **Inline `<code>` boxes carry heavy padding** and visibly break line rhythm when
+   frequent — several per sentence turns prose into confetti, and inside narrow table
+   cells they force ugly wraps. Reserve them for a few short identifiers per message;
+   never put a long file path in a code box inside a table cell (it gets clipped) — long
+   paths go in plain text or on their own line.
 
 ## The live status-board pattern (agent-progress transparency)
 
