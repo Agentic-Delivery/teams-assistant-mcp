@@ -734,3 +734,22 @@ describe('teams chats — the fallback is for throttles only (the non-triggering
     expect(fetchFn).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('teams chats — getAttachment without an id skips the quote card', () => {
+  it('on a quoted reply carrying a file, "the attachment" is the file, never the messageReference', async () => {
+    const msg = { id: 'm-2', createdDateTime: '2026-08-25T07:48:25Z', from: { user: { displayName: 'Celine', id: 'u1' } }, body: { contentType: 'html', content: 'Logo:' },
+      attachments: [{ id: 'quote-1', contentType: 'messageReference', name: null, contentUrl: null }, { id: 'file-1', contentType: 'reference', name: 'logo.png', contentUrl: 'https://tenant-my.sharepoint.com/personal/x/Documents/logo.png' }] };
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.endsWith('/messages/m-2')) return json(msg);
+      if (url.includes('/shares/')) return new Response(new Uint8Array([7, 7]), { status: 200, headers: { 'content-type': 'image/png' } });
+      return json({ value: [msg] });
+    });
+    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }));
+
+    const payload = await chats.getAttachment('19:a@thread.v2', 'm-2');
+
+    expect(payload.name).toBe('logo.png');
+    expect(payload.bytes.length).toBe(2);
+    expect(fetchFn.mock.calls.some(([url]) => String(url).includes('/hostedContents/'))).toBe(false);
+  });
+});

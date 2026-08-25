@@ -309,9 +309,12 @@ export class GraphTeamsChats implements TeamsChatsPort {
     attachmentId?: string,
   ): Promise<AttachmentPayload> {
     const parsed = await this.fetchMessage(chatId, messageId);
+    // Without an explicit id, "the attachment" means the first one that IS a file — a quoted
+    // reply carries a messageReference card first, and a caller asking for "the attachment" on
+    // "Logo: <file>" never means the quote (2026-08-25: that pick answered 404 from hostedContents).
     const attachment = attachmentId
       ? parsed.attachments.find((candidate) => candidate.id === attachmentId)
-      : parsed.attachments[0];
+      : parsed.attachments.find((candidate) => candidate.contentType !== 'messageReference');
 
     if (!attachment) {
       throw new Error(
