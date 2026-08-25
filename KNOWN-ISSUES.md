@@ -24,3 +24,13 @@ Graph.
 Fix direction: a lock file next to the inbox (first server takes it, later ones skip the poller
 and say so on stderr), or a per-session `TEAMS_INBOX_PATH`. Until then, keep one session per
 account, or set `TEAMS_INBOX_DISABLED=1` in the extra ones.
+
+## The throttle gate is per process (0.2.0)
+
+`GraphClient` closes a client-wide gate on the first 429 so nothing in that process keeps feeding
+Graph's penalty window. Separate processes do not share it: a cron loop running `teams-post` in
+a fresh process each time, a second server instance, or an orchestrator's own retry loop around
+the CLIs is entirely ungated and will keep the throttle alive while the server believes it is
+being quiet. Space such callers yourself (one attempt, then wait the window), or route them
+through one long-lived process. A cross-process gate (a lock file beside the token cache) is the
+fix direction if this bites again.

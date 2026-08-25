@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ChatAllowlist } from './allowlist.js';
-import { InboxPoller } from './inbox.js';
+import { InboxPoller, PARK_FORBIDDEN_CHAT_MS } from './inbox.js';
 import { type ChatMessage, applyWatermark } from './messages.js';
 
 const CHAT = '19:pilot@thread.v2';
@@ -241,6 +241,7 @@ describe('inbox poller — behaviour under throttle (2026-08-25)', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  let clock = 1_000_000;
   function pollerOver(readMessages: (chatId: string, since?: string) => Promise<ReturnType<typeof applyWatermark>>, chatIds: string[]) {
     return new InboxPoller({
       chats: { readMessages },
@@ -248,6 +249,7 @@ describe('inbox poller — behaviour under throttle (2026-08-25)', () => {
       self: () => Promise.resolve(me),
       inboxPath,
       statePath,
+      nowFn: () => clock,
     });
   }
 
@@ -281,5 +283,49 @@ describe('inbox poller — behaviour under throttle (2026-08-25)', () => {
     await p.pollOnce();
 
     expect(asked).toEqual(['19:forbidden@thread.v2', '19:ok@thread.v2', '19:ok@thread.v2']);
+  });
+});
+
+describe('inbox poller — the clean verdict counts only the chats actually asked (review round 1)', () => {
+  let dir: string; let inboxPath: string; let statePath: string; let clock = 5_000_000;
+  beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'inbox-denom-')); inboxPath = join(dir, 'inbox.jsonl'); statePath = join(dir, 'inbox-state.json'); });
+  afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  it('two parked 403 chats plus the only live chat dying with 401: NOT clean (auth death must back off)', async () => {
+    const readMessages = async (chatId: string, since?: string) => {
+      if (chatId.includes('forbidden')) throw Object.assign(new Error('InsufficientPrivileges'), { status: 403 });
+      if (clock > 5_000_000) throw Object.assign(new Error('token expired'), { status: 401 });
+      return applyWatermark([], since);
+    };
+    const p = new InboxPoller({
+      chats: { readMessages },
+      allowlist: new ChatAllowlist(['19:forbidden-1@thread.v2', '19:forbidden-2@thread.v2', '19:live@thread.v2'].map((id) => ({ id, label: id, canPost: true }))),
+      self: () => Promise.resolve(me), inboxPath, statePath, nowFn: () => clock,
+    });
+
+    await p.pollOnce();          // parks both 403 chats; live chat fine
+    clock += 1_000;
+    const clean = await p.pollOnce(); // only the live chat is asked, and it fails
+
+    expect(clean).toBe(false);
+  });
+
+  it('a parked chat is asked again once the park expires', async () => {
+    const asked: string[] = [];
+    const readMessages = async (chatId: string, _since?: string) => {
+      asked.push(chatId);
+      throw Object.assign(new Error('InsufficientPrivileges'), { status: 403 });
+    };
+    const p = new InboxPoller({
+      chats: { readMessages },
+      allowlist: new ChatAllowlist([{ id: '19:forbidden@thread.v2', label: 'f', canPost: true }]),
+      self: () => Promise.resolve(me), inboxPath, statePath, nowFn: () => clock,
+    });
+
+    await p.pollOnce();
+    clock += 60_000;  await p.pollOnce();             // inside the park: skipped
+    clock += PARK_FORBIDDEN_CHAT_MS; await p.pollOnce(); // park expired: asked again
+
+    expect(asked).toHaveLength(2);
   });
 });

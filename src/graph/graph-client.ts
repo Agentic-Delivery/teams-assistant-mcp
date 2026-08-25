@@ -34,8 +34,15 @@ export interface GraphClientOptions {
 }
 
 /** When a 429 names no Retry-After, close the gate for this long rather than for nothing. */
-const DEFAULT_THROTTLE_WINDOW_MS = 30_000;
-const MAX_THROTTLE_WINDOW_MS = 60_000;
+export const DEFAULT_THROTTLE_WINDOW_MS = 30_000;
+/**
+ * The gate honours the FULL Retry-After (sanity-capped at an hour): resuming inside the window
+ * Graph named is what escalates a throttle. What IS capped is how long one call will sleep
+ * waiting for a retry — a tool call must not hang for minutes; beyond this the call fails fast
+ * with the 429 and the gate keeps everyone else honest until the window really passes.
+ */
+const MAX_THROTTLE_WINDOW_MS = 60 * 60_000;
+export const MAX_RETRY_SLEEP_MS = 60_000;
 
 const RETRYABLE_READ_STATUSES = new Set([429, 503, 504]);
 
@@ -139,11 +146,15 @@ export class GraphClient {
       if (attempt >= this.readRetries || !RETRYABLE_READ_STATUSES.has(response.status)) {
         await this.fail(response);
       }
-      const retryAfter = retryAfterSecondsOf(response);
-      const waitMs = retryAfter ? Math.min(retryAfter, 60) * 1000 : 2 ** attempt * 1000;
       await response.body?.cancel().catch(() => undefined);
-      // The wait must outlast the gate the 429 just closed, or the retry fails fast locally.
-      await this.sleepFn(Math.max(waitMs, this.throttledForMs()));
+      // The wait must outlast the gate the 429 just closed, or the retry fails fast locally —
+      // and if that wait would exceed what one call may hang for, there is no honest retry:
+      // fail now with the 429 rather than sleep a minute and then fail locally anyway.
+      const waitMs = Math.max(this.throttledForMs(), 2 ** attempt * 1000);
+      if (waitMs > MAX_RETRY_SLEEP_MS) {
+        await this.fail(response);
+      }
+      await this.sleepFn(waitMs);
     }
   }
 
