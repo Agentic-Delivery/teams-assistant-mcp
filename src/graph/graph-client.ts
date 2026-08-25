@@ -45,6 +45,14 @@ const MAX_THROTTLE_WINDOW_MS = 60 * 60_000;
 export const MAX_RETRY_SLEEP_MS = 60_000;
 
 const RETRYABLE_READ_STATUSES = new Set([429, 503, 504]);
+/** Graph collections whose next path segment is an id — the shape of a resource family. Only the
+ *  collections this chats-only server actually touches; a speculative list only hides gaps. */
+const GATE_COLLECTIONS = new Set(['chats', 'messages', 'shares', 'hostedContents']);
+/** The error code Graph uses for APPLICATION-wide throttling: it closes every family at once.
+ *  Kept to the one code seen live (2026-08-25); speculative entries would either never match or
+ *  turn an ordinary per-resource 429 into a client-wide lockout. */
+const GLOBAL_THROTTLE_CODES = new Set(['ApplicationThrottled']);
+const GLOBAL_GATE_KEY = '*';
 
 /** One reading of Retry-After for the whole client: a positive finite number of seconds, else nothing. */
 function retryAfterSecondsOf(response: Response): number | undefined {
@@ -59,13 +67,18 @@ export class GraphClient {
   private readonly readRetries: number;
   private readonly nowFn: () => number;
   /**
-   * The throttle gate. Graph ESCALATES its penalty window when a caller keeps sending while
+   * The throttle gates. Graph ESCALATES its penalty window when a caller keeps sending while
    * throttled — and on 2026-08-25 this client's own retries, stacked under a poller and a
-   * readback loop, kept an account throttled for hours. One 429 now closes the gate for the
-   * whole client: every request until the window passes fails fast, locally, without touching
-   * the network. Silence is the only thing that ends a throttle.
+   * readback loop, kept an account throttled for hours. A 429 closes a gate: every request on
+   * that gate until the window passes fails fast, locally, without touching the network.
+   * Silence is the only thing that ends a throttle.
+   *
+   * Gates are keyed per resource FAMILY (see gateKeyFor) because Graph throttles per resource —
+   * the same day showed the single-message GET refused for hours while the message list and
+   * plain posts on the same chat were healthy. An APPLICATION-wide throttle (Graph says so by
+   * error code, e.g. ApplicationThrottled) closes the global gate, which every request checks.
    */
-  private throttledUntil = 0;
+  private readonly throttledUntil = new Map<string, number>();
 
   constructor(private readonly options: GraphClientOptions) {
     this.fetchFn = options.fetchFn ?? fetch;
@@ -75,16 +88,45 @@ export class GraphClient {
     this.nowFn = options.nowFn ?? (() => Date.now());
   }
 
-  /** Milliseconds until the gate reopens; 0 when open. Callers pacing themselves read this. */
-  throttledForMs(): number {
-    return Math.max(0, this.throttledUntil - this.nowFn());
+  /**
+   * Graph throttles per resource family, and 2026-08-25 showed the families really are
+   * separate: the single-message GET (`/chats/{id}/messages/{id}`) stayed 429 for hours while
+   * the message LIST and plain posts on the very same chat answered 200/201. One gate for the
+   * whole client would have kept the healthy families locked out, so the gate is keyed by the
+   * path with its ids blanked — `/chats/{id}/messages/{id}` and `/chats/{id}/messages` are two gates.
+   */
+  static gateKeyFor(path: string): string {
+    const withoutHost = path.replace(/^https?:\/\/[^/]+/, '').replace(/^\/v1\.0/, '');
+    const pathname = withoutHost.split('?')[0] as string;
+    // OneDrive path syntax (`/me/drive/root:/folder/file.pdf:/content`) carries the file name in
+    // the path itself; everything from `root:` on is one family, whatever the file or folder.
+    const driveCut = pathname.indexOf('/root:');
+    const shaped = driveCut >= 0 ? `${pathname.slice(0, driveCut)}/root:*` : pathname;
+    const segments = shaped.split('/');
+    // Structural, not length-based: the segment AFTER a collection name is an id.
+    return segments
+      .map((segment, index) => (index > 0 && GATE_COLLECTIONS.has(segments[index - 1] ?? '') ? '*' : segment))
+      .join('/');
+  }
+
+  /** Milliseconds until this path's gate (its family's or the global one) reopens; 0 when open. */
+  throttledForMs(path: string): number {
+    const now = this.nowFn();
+    const family = this.throttledUntil.get(GraphClient.gateKeyFor(path)) ?? 0;
+    const global = this.throttledUntil.get(GLOBAL_GATE_KEY) ?? 0;
+    return Math.max(0, Math.max(family, global) - now);
   }
 
   private assertGateOpen(path: string): void {
-    const remaining = this.throttledForMs();
+    const remaining = this.throttledForMs(path);
     if (remaining > 0) {
+      const now = this.nowFn();
+      const globalClosed = (this.throttledUntil.get(GLOBAL_GATE_KEY) ?? 0) > now;
+      const which = globalClosed
+        ? 'the GLOBAL gate (an application-wide throttle) — every resource family is closed'
+        : `the gate for ${GraphClient.gateKeyFor(path)} — other resource families may still be fine`;
       throw new GraphError(
-        `Locally throttled: a recent 429 closed this client for another ${Math.ceil(remaining / 1000)}s (${path} not sent)`,
+        `Locally throttled: a recent 429 closed ${which}; ${Math.ceil(remaining / 1000)}s remain — ${path} not sent`,
         429,
         'LocallyThrottled',
         Math.ceil(remaining / 1000),
@@ -92,13 +134,20 @@ export class GraphClient {
     }
   }
 
-  private noteThrottle(response: Response): void {
+  private async noteThrottle(path: string, response: Response): Promise<void> {
     if (response.status !== 429) {
       return;
     }
     const named = retryAfterSecondsOf(response);
     const windowMs = named ? Math.min(named * 1000, MAX_THROTTLE_WINDOW_MS) : DEFAULT_THROTTLE_WINDOW_MS;
-    this.throttledUntil = Math.max(this.throttledUntil, this.nowFn() + windowMs);
+    // Peek at the error code without consuming the body the caller still needs.
+    const code = await response
+      .clone()
+      .json()
+      .then((body) => (body as { error?: { code?: string } })?.error?.code)
+      .catch(() => undefined);
+    const key = code && GLOBAL_THROTTLE_CODES.has(code) ? GLOBAL_GATE_KEY : GraphClient.gateKeyFor(path);
+    this.throttledUntil.set(key, Math.max(this.throttledUntil.get(key) ?? 0, this.nowFn() + windowMs));
   }
 
   private url(path: string): string {
@@ -115,7 +164,7 @@ export class GraphClient {
         authorization: `Bearer ${token}`,
       },
     });
-    this.noteThrottle(response);
+    await this.noteThrottle(path, response);
     return response;
   }
 
@@ -131,10 +180,12 @@ export class GraphClient {
     );
   }
 
-  async get<T>(path: string): Promise<T> {
+  async get<T>(path: string, options: { readRetries?: number } = {}): Promise<T> {
     // Reads are idempotent, so a throttled or briefly unavailable GET may be retried after the
     // wait the server names (capped — an aggressive Retry-After must not park the caller for
-    // minutes), falling back to a short exponential pause.
+    // minutes), falling back to a short exponential pause. A caller holding a cheaper fallback
+    // (a list scan instead of a throttled single fetch) passes readRetries: 0 and takes it now.
+    const readRetries = options.readRetries ?? this.readRetries;
     for (let attempt = 0; ; attempt += 1) {
       const response = await this.authorized(path, { method: 'GET' });
       if (response.ok) {
@@ -143,7 +194,7 @@ export class GraphClient {
         }
         return (await response.json()) as T;
       }
-      if (attempt >= this.readRetries || !RETRYABLE_READ_STATUSES.has(response.status)) {
+      if (attempt >= readRetries || !RETRYABLE_READ_STATUSES.has(response.status)) {
         await this.fail(response);
       }
       // The wait honours a named Retry-After on ANY retryable status (a 503 that asks for
@@ -152,7 +203,7 @@ export class GraphClient {
       // what one call may hang for, there is no honest retry: fail now — with Graph's own
       // message and code intact — rather than sleep a minute and then fail locally anyway.
       const named = retryAfterSecondsOf(response);
-      const waitMs = Math.max(named ? named * 1000 : 0, this.throttledForMs(), 2 ** attempt * 1000);
+      const waitMs = Math.max(named ? named * 1000 : 0, this.throttledForMs(path), 2 ** attempt * 1000);
       if (waitMs > MAX_RETRY_SLEEP_MS) {
         await this.fail(response);
       }
