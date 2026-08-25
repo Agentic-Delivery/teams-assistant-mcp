@@ -29,5 +29,6 @@ describe.skip('live Graph (awaiting a Teams-licensed account)', () => {
   // named reactions (like, heart, …), and the glyph acceptance should be pinned, not folklore.
   it.todo('setReaction accepts a raw emoji glyph as reactionType and it renders in Teams');
   it.todo('a send whose response is dropped mid-flight is recovered by the readback, not duplicated');
+  it.todo('the message LIST returns the same body and attachments as the single-message GET (the fetchMessage fallback rests on it)');
   it.todo('is refused by Graph, not just by us, if the account is removed from the chat');
 });
