@@ -1,0 +1,30 @@
+{
+  "name": "agentic-delivery-teams",
+  "description": "Agentic Delivery — companion skills for the teams-assistant-mcp server",
+  "owner": {
+    "name": "Johan Spännare",
+    "email": "johan@agenticdelivery.se",
+    "url": "https://github.com/Agentic-Delivery"
+  },
+  "plugins": [
+    {
+      "name": "teams-styling",
+      "source": "./plugins/teams-styling",
+      "description": "Styling doctrine for agent-posted Teams messages: when to style and when not to, the empirically verified HTML vocabulary Teams renders, known quirks, and the live status-board pattern for agent-progress transparency.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Johan Spännare",
+        "url": "https://github.com/Agentic-Delivery"
+      },
+      "category": "communication",
+      "keywords": [
+        "teams",
+        "microsoft-teams",
+        "formatting",
+        "styling",
+        "status-board",
+        "mcp"
+      ]
+    }
+  ]
+}

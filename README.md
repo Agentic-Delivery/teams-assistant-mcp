@@ -11,6 +11,18 @@ waiting on an app registration, admin consent, or a Teams app manifest.
 This repo ships the server on its own. Consuming projects install the compiled output; none of
 them carry this source tree.
 
+## Companion skill: teams-styling
+
+The repo also ships a Claude Code plugin, `teams-styling`
+([plugins/teams-styling](plugins/teams-styling)), that teaches an agent how to compose
+messages people actually want to read: when to style and when to stay plain, the HTML
+vocabulary Teams verifiably renders (verified by screenshot against the real client, not
+inferred from docs), known rendering quirks, and a live status-board pattern for making
+agent progress visible in the chat. Install it by adding this repo as a Claude Code plugin
+marketplace; the skill is useful alongside any install of the server. Note the skill's
+capability note: styled output needs a raw-HTML send path — the server's standard send
+deliberately escapes to plain text.
+
 ## Getting started
 
 **[SETUP.md](SETUP.md)** is the zero-to-working manual: requesting the account, `.env`, finding
