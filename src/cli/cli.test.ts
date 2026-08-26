@@ -197,6 +197,33 @@ describe('the CLI contract — exit codes, and nothing but the JSON line on stdo
     expect(result.code).toBe(3);
     expect(result.stdout).toBe('');
   });
+
+  // Review round 2 follow-up NIT (2026-08-26): parseSendFlags also understands --html, but
+  // reply.ts only ever destructured { mentions } — a stray --html (or any other leftover
+  // argument) used to be silently accepted and ignored, and the reply still went out as plain
+  // text with no error at all. teams-reply does not support raw HTML; it must say so.
+  it('teams-reply rejects --html instead of silently posting plain text: exit 2', async () => {
+    const result = await runCli(
+      'reply.ts',
+      ['19:readonly@thread.v2', 'msg-1', '--html'],
+      fixtureEnv(),
+    );
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/--html/);
+  });
+
+  it('teams-reply rejects an unrecognised leftover argument instead of silently ignoring it: exit 2', async () => {
+    const result = await runCli(
+      'reply.ts',
+      ['19:readonly@thread.v2', 'msg-1', '--bogus', 'junk'],
+      fixtureEnv(),
+    );
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+  });
 });
 
 describe('teams-post / teams-edit — the --html routing decision (in-process, no subprocess, no network)', () => {
