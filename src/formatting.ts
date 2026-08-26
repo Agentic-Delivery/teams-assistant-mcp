@@ -46,17 +46,38 @@ function splitTrailingPunctuation(candidate: string): [url: string, rest: string
   }
 }
 
+export interface UrlSpan {
+  /** Index of the URL's first character in the input string. */
+  start: number;
+  /** Index one past the URL's last character — trailing sentence punctuation is NOT included. */
+  end: number;
+  url: string;
+}
+
+/**
+ * Every URL span in `text`, trimmed of trailing sentence punctuation exactly the way renderLine
+ * trims it before wrapping in an anchor. Exported so a caller that needs to know WHERE a URL
+ * will land in the rendered HTML (mentions.ts excludes URL spans from name substitution, so a
+ * mention name that is really just part of a link's path never gets tokenized) uses the same
+ * boundary renderLine itself uses, rather than a second, driftable definition of "URL". The regex
+ * itself only ever matches within one whitespace-delimited run, so scanning the full (possibly
+ * multi-line) text at once is equivalent to scanning line by line.
+ */
+export function findUrlSpans(text: string): UrlSpan[] {
+  return [...text.matchAll(URL)].map((match) => {
+    const [url] = splitTrailingPunctuation(match[0]);
+    const start = match.index;
+    return { start, end: start + url.length, url };
+  });
+}
+
 /** One line of text: everything escaped, URLs additionally wrapped in an anchor. */
 function renderLine(line: string): string {
   let html = '';
   let consumed = 0;
-  for (const match of line.matchAll(URL)) {
-    const [url, rest] = splitTrailingPunctuation(match[0]);
-    html +=
-      escapeHtml(line.slice(consumed, match.index)) +
-      `<a href="${escapeHtml(url)}">${escapeHtml(url)}</a>` +
-      escapeHtml(rest);
-    consumed = match.index + match[0].length;
+  for (const { start, end, url } of findUrlSpans(line)) {
+    html += escapeHtml(line.slice(consumed, start)) + `<a href="${escapeHtml(url)}">${escapeHtml(url)}</a>`;
+    consumed = end;
   }
   return html + escapeHtml(line.slice(consumed));
 }

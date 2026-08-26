@@ -2,7 +2,7 @@ import { buildChats } from '../build-chats.js';
 import { ChatNotAllowedError, type ChatAllowlist } from '../allowlist.js';
 import { loadConfig } from '../config.js';
 import type { ReliableTeamsChats } from '../graph/reliable-sends.js';
-import type { MentionTarget } from '../graph/teams-chats.js';
+import type { MentionTarget, PinnedMessage } from '../graph/teams-chats.js';
 
 /**
  * Shared plumbing for the standalone CLIs (teams-post, teams-reply, teams-edit, teams-react,
@@ -40,7 +40,17 @@ export function parseSendFlags(args: readonly string[]): { html: boolean; mentio
       html = true;
     } else if (arg === '--mention') {
       const value = args[i + 1];
-      if (value === undefined) usage('--mention needs a name');
+      // A missing value AND a flag-like value ("--mention --html", the next flag swallowed as
+      // the name) both fail loudly here — the alternative, silently taking "--html" as a mention
+      // name, only surfaces later as a confusing "No chat member matches "--html"" from
+      // resolveMentions, which gives no hint the real problem was a missing --mention argument.
+      if (value === undefined || value.startsWith('--')) {
+        usage(
+          value === undefined
+            ? '--mention needs a name'
+            : `--mention needs a name, got "${value}" which looks like a flag`,
+        );
+      }
       mentions.push(value);
       i += 1;
     } else {
@@ -99,6 +109,46 @@ export async function doEdit(
     await chats.editMessage(chatId, messageId, newText, resolved);
   }
   return { action: 'edit', id: messageId, chat: entry.label };
+}
+
+/** teams-reply's --mention plumbing — same rationale as doPost/doEdit above (testable without a
+ *  live send; a subprocess test can't distinguish "mentions were resolved and forwarded" from
+ *  "the flag was silently ignored"). */
+export async function doReply(
+  { chats, allowlist }: CliContext,
+  chatId: string,
+  replyToMessageId: string,
+  text: string,
+  mentions: readonly string[] = [],
+): Promise<{ action: 'reply'; id: string; inReplyTo: string; chat: string }> {
+  const entry = allowlist.assertPostable(chatId);
+  const resolved = await resolveMentions(chats, chatId, mentions);
+  const sent = await chats.replyToMessage(chatId, replyToMessageId, text, resolved);
+  return { action: 'reply', id: sent.id, inReplyTo: replyToMessageId, chat: entry.label };
+}
+
+/**
+ * teams-pin's confirm-before-claiming-success check — same reasoning as pin_chat_message in
+ * server.ts: Graph reporting the pinMessage POST as a success is not proof the pin landed, only
+ * the re-list pinMessage itself returns is. Duplicated here (not shared with server.ts) because
+ * the two live in separate module graphs with no existing shared "tool logic" layer — same
+ * wording, kept in sync by hand, same as the rest of the CLI/MCP-tool boundary.
+ */
+export async function doPin(
+  { chats, allowlist }: CliContext,
+  chatId: string,
+  messageId: string,
+): Promise<{ action: 'pin'; messageId: string; chat: string; pinnedMessages: readonly PinnedMessage[] }> {
+  const entry = allowlist.assertPostable(chatId);
+  const pinned = await chats.pinMessage(chatId, messageId);
+  if (!pinned.some((entry2) => entry2.messageId === messageId)) {
+    throw new Error(
+      `Pin request for message ${messageId} was accepted, but the post-pin list does not show it ` +
+        `pinned (currently pinned: ${pinned.map((entry2) => entry2.messageId).join(', ') || '(nothing)'}) ` +
+        '— the outcome is not confirmed; do not assume the pin landed.',
+    );
+  }
+  return { action: 'pin', messageId, chat: entry.label, pinnedMessages: pinned };
 }
 
 export function readStdin(): Promise<string> {

@@ -343,6 +343,17 @@ export function buildServer(deps: ServerDeps): McpServer {
       guard(async () => {
         allowlist.assertPostable(chatId);
         const pinned = await chats.pinMessage(chatId, messageId);
+        // Graph reporting the POST as a success is not proof the pin landed — only the re-list
+        // pinMessage returns is. Claiming pinned:true without checking it actually shows up would
+        // repeat the exact "response path lied" hazard ReliableTeamsChats exists to guard sends
+        // against, just on the pin path instead.
+        if (!pinned.some((entry) => entry.messageId === messageId)) {
+          throw new Error(
+            `Pin request for message ${messageId} was accepted, but the post-pin list does not ` +
+              `show it pinned (currently pinned: ${pinned.map((entry) => entry.messageId).join(', ') || '(nothing)'}) ` +
+              '— the outcome is not confirmed; do not assume the pin landed.',
+          );
+        }
         return ok({ pinned: true, chatId, messageId, pinnedMessages: pinPayload(pinned) });
       }),
   );

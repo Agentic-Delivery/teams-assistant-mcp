@@ -292,8 +292,9 @@ when to tag someone versus just naming them.
 ## The standalone CLIs
 
 Beside the server, `npm run build` produces seven commands under `dist/cli/` (also exposed as
-package bins): `teams-post [--html] [--mention "Name"]...`, `teams-reply`, `teams-edit [--html]
-[--mention "Name"]...`, `teams-react`, `teams-read`, `teams-pin`, `teams-unpin`. Same env vars,
+package bins): `teams-post [--html] [--mention "Name"]...`, `teams-reply [--mention "Name"]...`,
+`teams-edit [--html] [--mention "Name"]...`, `teams-react`, `teams-read`, `teams-pin`,
+`teams-unpin`. Same env vars,
 same allowlist, same send-reliability code paths as the server tools. `--html` on
 `teams-post`/`teams-edit` posts stdin as raw HTML verbatim, same contract as `format: 'html'`
 above; `--mention "Name"` (repeatable) works the same as the `mentions` tool parameter. Success

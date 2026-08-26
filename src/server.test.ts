@@ -176,9 +176,14 @@ class FakeTeamsChats implements TeamsChatsPort {
 
   // One pin per chat, replaced on every pin — mirrors the real single-pin-slot Graph behaviour.
   pinned: Record<string, PinnedMessage | undefined> = {};
+  // Toggle to simulate Graph accepting the POST but the re-list NOT showing it pinned — the
+  // pathological case the server must catch rather than reporting pinned:true regardless.
+  pinConfirms = true;
 
   async pinMessage(chatId: string, messageId: string): Promise<PinnedMessage[]> {
-    this.pinned[chatId] = { id: `pin-${messageId}`, messageId, preview: `preview of ${messageId}` };
+    if (this.pinConfirms) {
+      this.pinned[chatId] = { id: `pin-${messageId}`, messageId, preview: `preview of ${messageId}` };
+    }
     return this.listPinnedMessages(chatId);
   }
 
@@ -439,6 +444,18 @@ describe('pin_chat_message / unpin_chat_message / list_pinned_messages', () => {
     const result = await call(client, 'pin_chat_message', { chatId: OUTSIDE, messageId: 'm1' });
 
     expect(result.isError).toBe(true);
+  });
+
+  it('refuses to claim pinned:true when the post-pin re-list does not actually show the message pinned (review round 2, MINOR 4)', async () => {
+    // Graph reporting POST success is not proof the pin landed — only the re-list is. If the
+    // target messageId is missing from that list, the outcome must be reported as a loud
+    // failure, never as pinned:true on faith in the write's own response.
+    chats.pinConfirms = false;
+
+    const result = await call(client, 'pin_chat_message', { chatId: PILOT, messageId: 'm1' });
+
+    expect(result.isError).toBe(true);
+    expect(result.text).toMatch(/not (confirmed|show|pinned)/i);
   });
 
   it('lists what is currently pinned', async () => {

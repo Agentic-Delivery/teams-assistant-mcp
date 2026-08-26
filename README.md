@@ -147,13 +147,14 @@ Two knobs: `TEAMS_INBOX_PATH` moves the inbox (the sidecar follows it), and
 
 Seven small commands ship beside the server for scripts, cron jobs and background monitors that
 need Teams without a running MCP session: `teams-post <chatId> [--html] [--mention "Name"]...`
-(text on stdin), `teams-reply <chatId> <messageId>` (text on stdin), `teams-edit <chatId>
-<messageId> [--html] [--mention "Name"]...` (new text on stdin), `teams-react <chatId>
-<messageId> <emoji>`, `teams-read <chatId> [--limit N] [--since ISO]`, `teams-pin <chatId>
-<messageId>` and `teams-unpin <chatId> <messageId>`. Same allowlist, same auth, same code paths
-as the server tools — including the send reliability below. `--html` on `teams-post`/`teams-edit`
-posts stdin as raw Teams-subset HTML, verbatim — the caller is responsible for entity-escaping
-their own `<`, `>`, `&`; see the `teams-styling` plugin for the verified vocabulary. `--mention
+(text on stdin), `teams-reply <chatId> <messageId> [--mention "Name"]...` (text on stdin),
+`teams-edit <chatId> <messageId> [--html] [--mention "Name"]...` (new text on stdin), `teams-react
+<chatId> <messageId> <emoji>`, `teams-read <chatId> [--limit N] [--since ISO]`, `teams-pin
+<chatId> <messageId>` and `teams-unpin <chatId> <messageId>`. Same allowlist, same auth, same
+code paths as the server tools — including the send reliability below. `--html` on
+`teams-post`/`teams-edit` posts stdin as raw Teams-subset HTML, verbatim — the caller is
+responsible for entity-escaping their own `<`, `>`, `&`; see the `teams-styling` plugin for the
+verified vocabulary. `--mention
 "Name"` (repeatable) @mentions that person, same resolution and placement rules as the
 `mentions` tool parameter — see "@mentions" above.
 

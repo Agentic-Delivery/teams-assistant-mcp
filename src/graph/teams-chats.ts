@@ -201,13 +201,14 @@ export class GraphTeamsChats implements TeamsChatsPort {
   /**
    * The chat's current members, id included — used only to resolve @mentions. A dedicated fetch
    * (not listChats, which lists and expands members for EVERY allowlisted chat) because a send
-   * with mentions only ever needs one chat's roster.
+   * with mentions only ever needs one chat's roster. getAll, not a single get: a large chat's
+   * roster pages, and a single-page fetch used to silently truncate it — a member past page 1
+   * would come back "No chat member matches", indistinguishable from them genuinely not being in
+   * the chat (review round 2, 2026-08-26).
    */
   private async membersOf(chatId: string): Promise<ChatMember[]> {
-    const raw = await this.graph.get<{ value?: GraphMember[] }>(
-      `/chats/${encodeURIComponent(chatId)}/members`,
-    );
-    return (raw.value ?? []).flatMap((member) => {
+    const raw = await this.graph.getAll<GraphMember>(`/chats/${encodeURIComponent(chatId)}/members`);
+    return raw.flatMap((member) => {
       const mapped = toChatMember(member);
       return mapped ? [mapped] : [];
     });
