@@ -4,7 +4,7 @@ import { basename, extname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { z } from 'zod';
 import type { ChatAllowlist } from './allowlist.js';
-import type { ChatMessage, TeamsChatsPort } from './graph/teams-chats.js';
+import type { ChatMessage, MentionTarget, PinnedMessage, TeamsChatsPort } from './graph/teams-chats.js';
 
 export interface ServerDeps {
   chats: TeamsChatsPort;
@@ -40,12 +40,43 @@ function guard(handler: () => Promise<ToolResult>): Promise<ToolResult> {
   }));
 }
 
+/**
+ * Shared input schema for the `mentions` parameter on send/reply/edit. The wording here IS the
+ * mentions contract — read carefully before changing it, since a caller only ever sees this
+ * description, never the implementation.
+ */
+const mentionsSchema = z
+  .array(z.string().min(1))
+  .optional()
+  .describe(
+    'Display names to @mention so those people are actually NOTIFIED, not just referenced. ' +
+      'Each name is matched case-insensitively as an unambiguous substring against the chat\'s ' +
+      'member list (e.g. "Shiv" matches "Garg, Shivankit"); a name matching zero or more than ' +
+      'one member is refused, never silently dropped. format "text" (default): each mention\'s ' +
+      'name must literally occur somewhere in the message text — that occurrence becomes the ' +
+      'notifying tag, so just write the person\'s name where you mean to mention them. format ' +
+      '"html": place a literal `@{Name}` token (e.g. `@{Shiv}`) at each spot to mention; every ' +
+      'name in `mentions` needs a matching `@{Name}` token in the html and every token needs a ' +
+      'matching name in `mentions`, or the call is refused. Only mention people who need to ACT ' +
+      '— an owner, a question addressed to them — never everyone named in passing.',
+  );
+
+/** Resolves `mentions` against the chat's member list, or [] when none were given — the empty
+ *  case skips the Graph round-trip resolveMentions would otherwise cost. */
+async function resolveMentions(
+  chats: TeamsChatsPort,
+  chatId: string,
+  mentions: readonly string[] | undefined,
+): Promise<MentionTarget[]> {
+  return mentions && mentions.length > 0 ? chats.resolveMentions(chatId, mentions) : [];
+}
+
 export function buildServer(deps: ServerDeps): McpServer {
   const { chats, allowlist } = deps;
   const downloadDir = deps.downloadDir ?? join(tmpdir(), 'teams-assistant-mcp');
 
   const server = new McpServer(
-    { name: 'teams-assistant-mcp', version: '0.3.0' },
+    { name: 'teams-assistant-mcp', version: '0.4.0' },
     {
       instructions:
         `Reads and posts in a fixed set of Microsoft Teams group chats as the account ` +
@@ -81,7 +112,10 @@ export function buildServer(deps: ServerDeps): McpServer {
               ? {
                   topic: chat.topic,
                   chatType: chat.chatType,
-                  members: chat.members,
+                  // Names only here — list_chats' output shape predates @mentions; the AAD ids
+                  // ChatSummary.members now also carries are an implementation detail of
+                  // resolveMentions, not part of this tool's contract.
+                  members: chat.members.map((member) => member.displayName),
                   ...(chat.lastUpdatedDateTime
                     ? { lastUpdatedDateTime: chat.lastUpdatedDateTime }
                     : {}),
@@ -144,17 +178,19 @@ export function buildServer(deps: ServerDeps): McpServer {
           .enum(['text', 'html'])
           .optional()
           .describe('"text" (default) escapes and renders text; "html" posts text as raw HTML, verbatim'),
+        mentions: mentionsSchema,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
-    ({ chatId, text, format }) =>
+    ({ chatId, text, format, mentions }) =>
       guard(async () => {
         allowlist.assertPostable(chatId);
+        const resolved = await resolveMentions(chats, chatId, mentions);
         let sent: ChatMessage;
         if (format === 'html') {
-          sent = await chats.sendHtmlMessage(chatId, text);
+          sent = await chats.sendHtmlMessage(chatId, text, resolved);
         } else {
-          sent = await chats.sendMessage(chatId, text);
+          sent = await chats.sendMessage(chatId, text, resolved);
         }
         return ok({ posted: true, chatId, messageId: sent.id, createdDateTime: sent.createdDateTime });
       }),
@@ -178,13 +214,15 @@ export function buildServer(deps: ServerDeps): McpServer {
           .string()
           .min(1)
           .describe('Plain text of the reply; newlines and URLs render properly, markdown does not'),
+        mentions: mentionsSchema,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
-    ({ chatId, replyToMessageId, text }) =>
+    ({ chatId, replyToMessageId, text, mentions }) =>
       guard(async () => {
         allowlist.assertPostable(chatId);
-        const sent = await chats.replyToMessage(chatId, replyToMessageId, text);
+        const resolved = await resolveMentions(chats, chatId, mentions);
+        const sent = await chats.replyToMessage(chatId, replyToMessageId, text, resolved);
         return ok({
           posted: true,
           chatId,
@@ -219,16 +257,18 @@ export function buildServer(deps: ServerDeps): McpServer {
           .enum(['text', 'html'])
           .optional()
           .describe('"text" (default) escapes and renders newText; "html" posts newText as raw HTML, verbatim'),
+        mentions: mentionsSchema,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
     },
-    ({ chatId, messageId, newText, format }) =>
+    ({ chatId, messageId, newText, format, mentions }) =>
       guard(async () => {
         allowlist.assertPostable(chatId);
+        const resolved = await resolveMentions(chats, chatId, mentions);
         if (format === 'html') {
-          await chats.editHtmlMessage(chatId, messageId, newText);
+          await chats.editHtmlMessage(chatId, messageId, newText, resolved);
         } else {
-          await chats.editMessage(chatId, messageId, newText);
+          await chats.editMessage(chatId, messageId, newText, resolved);
         }
         return ok({ edited: true, chatId, messageId });
       }),
@@ -276,6 +316,86 @@ export function buildServer(deps: ServerDeps): McpServer {
         allowlist.assertPostable(chatId);
         await chats.deleteMessage(chatId, messageId);
         return ok({ deleted: true, chatId, messageId });
+      }),
+  );
+
+  function pinPayload(pinned: PinnedMessage[]) {
+    return pinned.map((entry) => ({ id: entry.id, messageId: entry.messageId, preview: entry.preview }));
+  }
+
+  server.registerTool(
+    'pin_chat_message',
+    {
+      title: 'Pin a message in a Teams chat',
+      description:
+        'Pins a message in an allowlisted chat. IMPORTANT: a Teams chat effectively holds only ' +
+        'ONE pin — pinning a second message silently REPLACES the first while Graph still ' +
+        'reports success (verified live 2026-08-25). There is no "add another pin"; treat this ' +
+        'as "set the pinned message", not "pin one more". The response carries the resulting ' +
+        'pinnedMessages list so the replacement is visible, not just assumed.',
+      inputSchema: {
+        chatId: z.string().describe('Graph chat id, must be allowlisted with canPost: true'),
+        messageId: z.string().describe('Id of the message to pin'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    },
+    ({ chatId, messageId }) =>
+      guard(async () => {
+        allowlist.assertPostable(chatId);
+        const pinned = await chats.pinMessage(chatId, messageId);
+        // Graph reporting the POST as a success is not proof the pin landed — only the re-list
+        // pinMessage returns is. Claiming pinned:true without checking it actually shows up would
+        // repeat the exact "response path lied" hazard ReliableTeamsChats exists to guard sends
+        // against, just on the pin path instead.
+        if (!pinned.some((entry) => entry.messageId === messageId)) {
+          throw new Error(
+            `Pin request for message ${messageId} was accepted, but the post-pin list does not ` +
+              `show it pinned (currently pinned: ${pinned.map((entry) => entry.messageId).join(', ') || '(nothing)'}) ` +
+              '— the outcome is not confirmed; do not assume the pin landed.',
+          );
+        }
+        return ok({ pinned: true, chatId, messageId, pinnedMessages: pinPayload(pinned) });
+      }),
+  );
+
+  server.registerTool(
+    'unpin_chat_message',
+    {
+      title: 'Unpin a message in a Teams chat',
+      description:
+        'Unpins a message in an allowlisted chat. Refuses with a clear error if that message is ' +
+        'not the one currently pinned (or nothing is pinned) rather than silently doing nothing.',
+      inputSchema: {
+        chatId: z.string().describe('Graph chat id, must be allowlisted with canPost: true'),
+        messageId: z.string().describe('Id of the currently-pinned message to unpin'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    ({ chatId, messageId }) =>
+      guard(async () => {
+        allowlist.assertPostable(chatId);
+        await chats.unpinMessage(chatId, messageId);
+        return ok({ unpinned: true, chatId, messageId });
+      }),
+  );
+
+  server.registerTool(
+    'list_pinned_messages',
+    {
+      title: 'List pinned messages in a Teams chat',
+      description:
+        'Lists the messages currently pinned in an allowlisted chat, each with a plain-text ' +
+        'preview. In practice this is at most one entry — see pin_chat_message\'s single-pin note.',
+      inputSchema: {
+        chatId: z.string().describe('Graph chat id, must be on the allowlist'),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    ({ chatId }) =>
+      guard(async () => {
+        allowlist.assertReadable(chatId);
+        const pinned = await chats.listPinnedMessages(chatId);
+        return ok({ chatId, pinnedMessages: pinPayload(pinned) });
       }),
   );
 

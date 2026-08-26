@@ -2,11 +2,15 @@ import { describe, expect, it } from 'vitest';
 import { formatChat, formatChatList } from './discover.js';
 import type { ChatSummary } from './graph/teams-chats.js';
 
+function member(displayName: string, id?: string) {
+  return { displayName, ...(id ? { id } : {}) };
+}
+
 const group: ChatSummary = {
   id: '19:0123456789abcdef0123456789abcdef@thread.v2',
   topic: 'Pilot chat',
   chatType: 'group',
-  members: ['Alice Anderson', 'Bob Brown', 'Assistant (AI)'],
+  members: [member('Alice Anderson'), member('Bob Brown'), member('Assistant (AI)')],
 };
 
 describe('formatChat', () => {
@@ -29,7 +33,7 @@ describe('formatChat', () => {
   it('caps the member list and counts the rest', () => {
     const crowded = {
       ...group,
-      members: ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'],
+      members: ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'].map((name) => member(name)),
     };
     expect(formatChat(crowded)).toContain('members  A, B, C, D, E, F, +2 more');
   });
@@ -45,7 +49,7 @@ describe('formatChatList', () => {
       id: '19:aaaa-1111_bbbb-2222@unq.gbl.spaces',
       topic: 'Alice Anderson',
       chatType: 'oneOnOne',
-      members: ['Alice Anderson', 'Assistant (AI)'],
+      members: [member('Alice Anderson'), member('Assistant (AI)')],
     };
     const text = formatChatList([group, second]);
     expect(text).toContain('@thread.v2\n');

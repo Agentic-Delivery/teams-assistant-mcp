@@ -1,19 +1,37 @@
-import { GraphClient, GraphError } from './graph-client.js';
+import { GRAPH_BASE_URL, GraphClient, GraphError } from './graph-client.js';
+import {
+  buildGraphMentionsPayload,
+  renderHtmlWithMentions,
+  renderTextWithMentions,
+  resolveMentionTargets,
+  type ChatMember,
+  type MentionTarget,
+} from './mentions.js';
 import { textToHtml } from '../formatting.js';
-import { type ChatMessage, type ReadResult, applyWatermark, toChatMessage } from '../messages.js';
+import { type ChatMessage, type ReadResult, applyWatermark, htmlToText, toChatMessage } from '../messages.js';
 
 export interface ChatSummary {
   id: string;
   topic: string;
   chatType: string;
   lastUpdatedDateTime?: string;
-  members: string[];
+  members: ChatMember[];
 }
 
 export interface AttachmentPayload {
   bytes: Uint8Array;
   contentType: string;
   name: string;
+}
+
+/** One pinned-message entry, as returned by listPinnedMessages/pinMessage. */
+export interface PinnedMessage {
+  /** The PIN resource's own id — what unpinMessage needs internally, never the chat message id. */
+  id: string;
+  /** The underlying chat message's id, when Graph reported one. */
+  messageId?: string;
+  /** Plain-text preview of the pinned message, via the same html-to-text conversion as reads. */
+  preview: string;
 }
 
 export interface OutboundImage {
@@ -35,25 +53,51 @@ export interface OutboundFile {
 export interface TeamsChatsPort {
   listChats(): Promise<ChatSummary[]>;
   readMessages(chatId: string, since?: string, limit?: number): Promise<ReadResult>;
-  sendMessage(chatId: string, text: string): Promise<ChatMessage>;
+  /**
+   * Resolves each of `names` against the chat's CURRENT member list — case-insensitive,
+   * unambiguous-substring ("Shiv" matches "Garg, Shivankit"; a name matching zero or more than
+   * one member throws) — into the id/displayName pairs the send/reply/edit methods below need to
+   * build a mention that actually notifies. Call this before any of them when the caller supplied
+   * mention names; pass the result straight through as `mentions`.
+   */
+  resolveMentions(chatId: string, names: readonly string[]): Promise<MentionTarget[]>;
+  sendMessage(chatId: string, text: string, mentions?: readonly MentionTarget[]): Promise<ChatMessage>;
   /**
    * Opt-in raw path: html is posted as the Graph body content VERBATIM — no textToHtml, no
    * escaping. The caller owns entity-escaping `<`, `>`, `&` inside their own content; this is
    * what lets Teams' HTML subset (tables, headings, colour — see the teams-styling skill's
    * verified vocabulary) actually render, since textToHtml only ever produces plain
-   * paragraphs/breaks/links.
+   * paragraphs/breaks/links. `mentions` (from resolveMentions) are placed wherever the html
+   * carries a matching `@{Name}` token — see renderHtmlWithMentions's doc comment for the
+   * contract.
    */
-  sendHtmlMessage(chatId: string, html: string): Promise<ChatMessage>;
+  sendHtmlMessage(chatId: string, html: string, mentions?: readonly MentionTarget[]): Promise<ChatMessage>;
   sendImage(chatId: string, image: OutboundImage, text?: string): Promise<ChatMessage>;
   sendFile(chatId: string, file: OutboundFile, text?: string): Promise<ChatMessage>;
-  replyToMessage(chatId: string, replyToMessageId: string, text: string): Promise<ChatMessage>;
-  editMessage(chatId: string, messageId: string, newText: string): Promise<void>;
+  replyToMessage(
+    chatId: string,
+    replyToMessageId: string,
+    text: string,
+    mentions?: readonly MentionTarget[],
+  ): Promise<ChatMessage>;
+  editMessage(chatId: string, messageId: string, newText: string, mentions?: readonly MentionTarget[]): Promise<void>;
   /** Same verbatim contract as sendHtmlMessage, applied to an edit. */
-  editHtmlMessage(chatId: string, messageId: string, html: string): Promise<void>;
+  editHtmlMessage(chatId: string, messageId: string, html: string, mentions?: readonly MentionTarget[]): Promise<void>;
   deleteMessage(chatId: string, messageId: string): Promise<void>;
   setReaction(chatId: string, messageId: string, reactionType: string): Promise<void>;
   getAttachment(chatId: string, messageId: string, attachmentId?: string): Promise<AttachmentPayload>;
+  /**
+   * Pins a message, replacing whatever was pinned before it: Graph reports success on a SECOND
+   * pin while silently dropping the first — a chat effectively holds exactly one pin (verified
+   * live 2026-08-25). Returns the pinned-list state AFTER the call so callers can see what
+   * actually happened rather than trusting the POST.
+   */
+  pinMessage(chatId: string, messageId: string): Promise<PinnedMessage[]>;
+  unpinMessage(chatId: string, messageId: string): Promise<void>;
+  listPinnedMessages(chatId: string): Promise<PinnedMessage[]>;
 }
+
+export type { ChatMember, MentionTarget };
 
 /**
  * Graph's sharing-URL encoding: base64 of the absolute URL, made URL-safe, prefixed "u!".
@@ -80,12 +124,44 @@ export interface GraphTeamsChatsOptions {
 
 export const DEFAULT_UPLOAD_DIR = 'ai-test';
 
+interface GraphMember {
+  displayName?: string | null;
+  email?: string | null;
+  /** The AAD user id — the field a mention actually needs; distinct from the member's own `id`
+   *  (a composite membership identifier Graph rejects if used as a mention target). */
+  userId?: string | null;
+}
+
 interface GraphChat {
   id?: string;
   topic?: string | null;
   chatType?: string;
   lastUpdatedDateTime?: string;
-  members?: Array<{ displayName?: string | null; email?: string | null }> | null;
+  members?: GraphMember[] | null;
+}
+
+function toChatMember(member: GraphMember): ChatMember | undefined {
+  return member.displayName
+    ? { displayName: member.displayName, ...(member.userId ? { id: member.userId } : {}) }
+    : undefined;
+}
+
+interface GraphPinnedMessage {
+  id?: string;
+  message?: {
+    id?: string;
+    body?: { contentType?: string; content?: string } | null;
+  } | null;
+}
+
+function toPinnedMessage(entry: GraphPinnedMessage): PinnedMessage | undefined {
+  if (!entry.id) {
+    return undefined;
+  }
+  const body = entry.message?.body;
+  const content = body?.content ?? '';
+  const preview = body?.contentType === 'html' ? htmlToText(content) : content.trim();
+  return { id: entry.id, ...(entry.message?.id ? { messageId: entry.message.id } : {}), preview };
 }
 
 export class GraphTeamsChats implements TeamsChatsPort {
@@ -104,20 +180,42 @@ export class GraphTeamsChats implements TeamsChatsPort {
       if (!chat.id) {
         return [];
       }
-      const members = (chat.members ?? []).flatMap((member) =>
-        member?.displayName ? [member.displayName] : [],
-      );
+      const members = (chat.members ?? []).flatMap((member) => {
+        const mapped = toChatMember(member);
+        return mapped ? [mapped] : [];
+      });
+      const names = members.map((member) => member.displayName);
       return [
         {
           id: chat.id,
           // Group chats often have no topic; the member list is the only way to recognise them.
-          topic: chat.topic ?? members.join(', ') ?? '',
+          topic: chat.topic ?? names.join(', ') ?? '',
           chatType: chat.chatType ?? 'unknown',
           ...(chat.lastUpdatedDateTime ? { lastUpdatedDateTime: chat.lastUpdatedDateTime } : {}),
           members,
         },
       ];
     });
+  }
+
+  /**
+   * The chat's current members, id included — used only to resolve @mentions. A dedicated fetch
+   * (not listChats, which lists and expands members for EVERY allowlisted chat) because a send
+   * with mentions only ever needs one chat's roster. getAll, not a single get: a large chat's
+   * roster pages, and a single-page fetch used to silently truncate it — a member past page 1
+   * would come back "No chat member matches", indistinguishable from them genuinely not being in
+   * the chat (review round 2, 2026-08-26).
+   */
+  private async membersOf(chatId: string): Promise<ChatMember[]> {
+    const raw = await this.graph.getAll<GraphMember>(`/chats/${encodeURIComponent(chatId)}/members`);
+    return raw.flatMap((member) => {
+      const mapped = toChatMember(member);
+      return mapped ? [mapped] : [];
+    });
+  }
+
+  async resolveMentions(chatId: string, names: readonly string[]): Promise<MentionTarget[]> {
+    return resolveMentionTargets(names, await this.membersOf(chatId));
   }
 
   async readMessages(chatId: string, since?: string, limit = 50): Promise<ReadResult> {
@@ -131,22 +229,39 @@ export class GraphTeamsChats implements TeamsChatsPort {
     );
   }
 
-  async sendMessage(chatId: string, text: string): Promise<ChatMessage> {
+  async sendMessage(
+    chatId: string,
+    text: string,
+    mentions: readonly MentionTarget[] = [],
+  ): Promise<ChatMessage> {
     // Always HTML: a 'text' body renders in Teams as one unbroken blob — no line breaks, no
-    // clickable links. textToHtml escapes everything, so plain text stays plain.
+    // clickable links. textToHtml escapes everything, so plain text stays plain. With mentions,
+    // renderTextWithMentions does the same escaping plus <at> tags at every occurrence of each
+    // mention's name — see its doc comment in mentions.ts.
     const created = await this.graph.post<unknown>(
       `/chats/${encodeURIComponent(chatId)}/messages`,
-      { body: { contentType: 'html', content: textToHtml(text) } },
+      {
+        body: { contentType: 'html', content: renderTextWithMentions(text, mentions) },
+        ...(mentions.length > 0 ? { mentions: buildGraphMentionsPayload(mentions) } : {}),
+      },
     );
     return toChatMessage(created, chatId);
   }
 
-  async sendHtmlMessage(chatId: string, html: string): Promise<ChatMessage> {
-    // No textToHtml here — html IS the body content, posted exactly as given. See
+  async sendHtmlMessage(
+    chatId: string,
+    html: string,
+    mentions: readonly MentionTarget[] = [],
+  ): Promise<ChatMessage> {
+    // No textToHtml here — html IS the body content, posted exactly as given, except that any
+    // `@{Name}` placeholder the caller wrote gets swapped for the matching <at> tag — see
     // TeamsChatsPort.sendHtmlMessage's doc comment for why this exists alongside sendMessage.
     const created = await this.graph.post<unknown>(
       `/chats/${encodeURIComponent(chatId)}/messages`,
-      { body: { contentType: 'html', content: html } },
+      {
+        body: { contentType: 'html', content: renderHtmlWithMentions(html, mentions) },
+        ...(mentions.length > 0 ? { mentions: buildGraphMentionsPayload(mentions) } : {}),
+      },
     );
     return toChatMessage(created, chatId);
   }
@@ -261,6 +376,7 @@ export class GraphTeamsChats implements TeamsChatsPort {
     chatId: string,
     replyToMessageId: string,
     text: string,
+    mentions: readonly MentionTarget[] = [],
   ): Promise<ChatMessage> {
     // Chats have no reply threads (that is channels-only). What the Teams UI calls a reply in a
     // chat is a new message carrying a messageReference attachment - a quote card built from the
@@ -286,30 +402,47 @@ export class GraphTeamsChats implements TeamsChatsPort {
       {
         body: {
           contentType: 'html',
-          content: `<attachment id="${original.id}"></attachment>${textToHtml(text)}`,
+          content: `<attachment id="${original.id}"></attachment>${renderTextWithMentions(text, mentions)}`,
         },
         attachments: [
           { id: original.id, contentType: 'messageReference', content: reference },
         ],
+        ...(mentions.length > 0 ? { mentions: buildGraphMentionsPayload(mentions) } : {}),
       },
     );
     return toChatMessage(created, chatId);
   }
 
-  async editMessage(chatId: string, messageId: string, newText: string): Promise<void> {
+  async editMessage(
+    chatId: string,
+    messageId: string,
+    newText: string,
+    mentions: readonly MentionTarget[] = [],
+  ): Promise<void> {
     // Graph only lets the delegated user edit messages they sent themselves; anything else
     // comes back as a Graph error, which the caller sees verbatim.
     await this.graph.patch(
       `/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}`,
-      { body: { contentType: 'html', content: textToHtml(newText) } },
+      {
+        body: { contentType: 'html', content: renderTextWithMentions(newText, mentions) },
+        ...(mentions.length > 0 ? { mentions: buildGraphMentionsPayload(mentions) } : {}),
+      },
     );
   }
 
-  async editHtmlMessage(chatId: string, messageId: string, html: string): Promise<void> {
+  async editHtmlMessage(
+    chatId: string,
+    messageId: string,
+    html: string,
+    mentions: readonly MentionTarget[] = [],
+  ): Promise<void> {
     // Same verbatim contract as sendHtmlMessage — no textToHtml, no escaping.
     await this.graph.patch(
       `/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}`,
-      { body: { contentType: 'html', content: html } },
+      {
+        body: { contentType: 'html', content: renderHtmlWithMentions(html, mentions) },
+        ...(mentions.length > 0 ? { mentions: buildGraphMentionsPayload(mentions) } : {}),
+      },
     );
   }
 
@@ -377,6 +510,56 @@ export class GraphTeamsChats implements TeamsChatsPort {
       contentType: declared ?? downloaded.contentType,
       name: attachment.name ?? `${attachment.id}.bin`,
     };
+  }
+
+  async listPinnedMessages(chatId: string): Promise<PinnedMessage[]> {
+    let raw: { value?: GraphPinnedMessage[] };
+    try {
+      raw = await this.graph.get<{ value?: GraphPinnedMessage[] }>(
+        `/chats/${encodeURIComponent(chatId)}/pinnedMessages?$expand=message`,
+      );
+    } catch (caught) {
+      // Empirical, not documented: GET .../pinnedMessages on a chat with ZERO pins answers a
+      // bare 404 "NotFound" rather than 200 with an empty value array (verified live
+      // 2026-08-26 — pinning, then unpinning the chat's only pin, then listing again 404s where
+      // every other call on the same chatId keeps succeeding). Any OTHER caller of this method
+      // already went through the allowlist, so a 404 here is read as "nothing pinned", not "chat
+      // does not exist" — treating it as a real failure would make list_pinned_messages error on
+      // the single most common case: a chat with nothing pinned.
+      if (caught instanceof GraphError && caught.status === 404) {
+        return [];
+      }
+      throw caught;
+    }
+    return (raw.value ?? []).flatMap((entry) => {
+      const mapped = toPinnedMessage(entry);
+      return mapped ? [mapped] : [];
+    });
+  }
+
+  async pinMessage(chatId: string, messageId: string): Promise<PinnedMessage[]> {
+    // A chat effectively holds ONE pin: pinning a second message silently REPLACES the first
+    // while this POST reports success either way (verified live 2026-08-25) — see
+    // TeamsChatsPort.pinMessage's doc comment. Re-listing after the POST, rather than trusting
+    // its own response, is what lets the caller see that replacement happen instead of believing
+    // both messages are pinned.
+    await this.graph.post<unknown>(`/chats/${encodeURIComponent(chatId)}/pinnedMessages`, {
+      'message@odata.bind': `${GRAPH_BASE_URL}/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}`,
+    });
+    return this.listPinnedMessages(chatId);
+  }
+
+  async unpinMessage(chatId: string, messageId: string): Promise<void> {
+    // DELETE takes the PIN's own id, not the chat message id, so the message id has to be
+    // resolved through the current pinned list first.
+    const pinned = await this.listPinnedMessages(chatId);
+    const match = pinned.find((entry) => entry.messageId === messageId);
+    if (!match) {
+      throw new Error(`Message ${messageId} is not currently pinned in chat ${chatId} — nothing to unpin.`);
+    }
+    await this.graph.del(
+      `/chats/${encodeURIComponent(chatId)}/pinnedMessages/${encodeURIComponent(match.id)}`,
+    );
   }
 }
 

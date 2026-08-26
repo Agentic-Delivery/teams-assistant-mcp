@@ -10,10 +10,13 @@ import { applyWatermark, toChatMessage } from './messages.js';
 import type {
   AttachmentPayload,
   ChatSummary,
+  MentionTarget,
   OutboundFile,
   OutboundImage,
+  PinnedMessage,
   TeamsChatsPort,
 } from './graph/teams-chats.js';
+import { resolveMentionTargets } from './graph/mentions.js';
 
 const PILOT = '19:pilot@thread.v2';
 const WATCHED = '19:watched@thread.v2';
@@ -35,11 +38,26 @@ class FakeTeamsChats implements TeamsChatsPort {
   };
   failingChats = new Set<string>();
 
+  members: Record<string, Array<{ id?: string; displayName: string }>> = {
+    [PILOT]: [
+      { id: 'aad-alice', displayName: 'Alice Anderson' },
+      { id: 'aad-bob', displayName: 'Bob Brown' },
+    ],
+    [OUTSIDE]: [{ id: 'aad-hr', displayName: 'HR' }],
+  };
+
   async listChats(): Promise<ChatSummary[]> {
     return [
-      { id: PILOT, topic: 'Pilot', chatType: 'group', members: ['Alice', 'Bob'] },
-      { id: OUTSIDE, topic: 'HR private', chatType: 'group', members: ['HR'] },
+      { id: PILOT, topic: 'Pilot', chatType: 'group', members: this.members[PILOT] ?? [] },
+      { id: OUTSIDE, topic: 'HR private', chatType: 'group', members: this.members[OUTSIDE] ?? [] },
     ];
+  }
+
+  readonly resolveMentionsCalls: Array<{ chatId: string; names: readonly string[] }> = [];
+
+  async resolveMentions(chatId: string, names: readonly string[]): Promise<MentionTarget[]> {
+    this.resolveMentionsCalls.push({ chatId, names });
+    return resolveMentionTargets(names, this.members[chatId] ?? []);
   }
 
   async readMessages(chatId: string, since?: string) {
@@ -61,8 +79,11 @@ class FakeTeamsChats implements TeamsChatsPort {
     return applyWatermark(mapped, since);
   }
 
-  async sendMessage(chatId: string, text: string) {
+  readonly sentMentions: Array<readonly MentionTarget[]> = [];
+
+  async sendMessage(chatId: string, text: string, mentions: readonly MentionTarget[] = []) {
     this.sent.push({ chatId, text });
+    this.sentMentions.push(mentions);
     return toChatMessage(
       { id: 'sent-1', chatId, createdDateTime: '2026-08-19T10:00:00Z', body: { content: text } },
       chatId,
@@ -71,8 +92,9 @@ class FakeTeamsChats implements TeamsChatsPort {
 
   readonly sentHtml: Array<{ chatId: string; html: string }> = [];
 
-  async sendHtmlMessage(chatId: string, html: string) {
+  async sendHtmlMessage(chatId: string, html: string, mentions: readonly MentionTarget[] = []) {
     this.sentHtml.push({ chatId, html });
+    this.sentMentions.push(mentions);
     // contentType 'html' here so toChatMessage's htmlToText round-trip mirrors the real Graph
     // readback — the same shape a genuine sendHtmlMessage readback would return.
     return toChatMessage(
@@ -91,20 +113,28 @@ class FakeTeamsChats implements TeamsChatsPort {
   readonly htmlEdits: Array<{ chatId: string; messageId: string; html: string }> = [];
   readonly deletes: Array<{ chatId: string; messageId: string }> = [];
 
-  async replyToMessage(chatId: string, replyToMessageId: string, text: string) {
+  async replyToMessage(
+    chatId: string,
+    replyToMessageId: string,
+    text: string,
+    mentions: readonly MentionTarget[] = [],
+  ) {
     this.replies.push({ chatId, replyToMessageId, text });
+    this.sentMentions.push(mentions);
     return toChatMessage(
       { id: 'reply-1', chatId, createdDateTime: '2026-08-19T10:00:00Z', body: { content: text } },
       chatId,
     );
   }
 
-  async editMessage(chatId: string, messageId: string, newText: string) {
+  async editMessage(chatId: string, messageId: string, newText: string, mentions: readonly MentionTarget[] = []) {
     this.edits.push({ chatId, messageId, newText });
+    this.sentMentions.push(mentions);
   }
 
-  async editHtmlMessage(chatId: string, messageId: string, html: string) {
+  async editHtmlMessage(chatId: string, messageId: string, html: string, mentions: readonly MentionTarget[] = []) {
     this.htmlEdits.push({ chatId, messageId, html });
+    this.sentMentions.push(mentions);
   }
 
   async deleteMessage(chatId: string, messageId: string) {
@@ -142,6 +172,31 @@ class FakeTeamsChats implements TeamsChatsPort {
       contentType: 'application/pdf',
       name: '../../escape.pdf',
     };
+  }
+
+  // One pin per chat, replaced on every pin — mirrors the real single-pin-slot Graph behaviour.
+  pinned: Record<string, PinnedMessage | undefined> = {};
+  // Toggle to simulate Graph accepting the POST but the re-list NOT showing it pinned — the
+  // pathological case the server must catch rather than reporting pinned:true regardless.
+  pinConfirms = true;
+
+  async pinMessage(chatId: string, messageId: string): Promise<PinnedMessage[]> {
+    if (this.pinConfirms) {
+      this.pinned[chatId] = { id: `pin-${messageId}`, messageId, preview: `preview of ${messageId}` };
+    }
+    return this.listPinnedMessages(chatId);
+  }
+
+  async unpinMessage(chatId: string, messageId: string): Promise<void> {
+    if (this.pinned[chatId]?.messageId !== messageId) {
+      throw new Error(`Message ${messageId} is not currently pinned in chat ${chatId} — nothing to unpin.`);
+    }
+    delete this.pinned[chatId];
+  }
+
+  async listPinnedMessages(chatId: string): Promise<PinnedMessage[]> {
+    const entry = this.pinned[chatId];
+    return entry ? [entry] : [];
   }
 }
 
@@ -181,7 +236,7 @@ beforeEach(async () => {
 });
 
 describe('tool surface', () => {
-  it('offers the ten chat tools plus the poll helper', async () => {
+  it('offers the chat tools, the pin tools, and the poll helper', async () => {
     const { tools } = await client.listTools();
 
     expect(tools.map((tool) => tool.name).sort()).toEqual([
@@ -189,6 +244,8 @@ describe('tool surface', () => {
       'edit_chat_message',
       'get_chat_attachment',
       'list_chats',
+      'list_pinned_messages',
+      'pin_chat_message',
       'poll_chats',
       'react_to_chat_message',
       'read_chat_messages',
@@ -196,6 +253,7 @@ describe('tool surface', () => {
       'send_chat_file',
       'send_chat_image',
       'send_chat_message',
+      'unpin_chat_message',
     ]);
   });
 });
@@ -259,6 +317,18 @@ describe('reply_chat_message', () => {
     expect(result.isError).toBe(true);
     expect(chats.replies).toEqual([]);
   });
+
+  it('mentions are resolved against the chat and forwarded to replyToMessage', async () => {
+    const result = await call(client, 'reply_chat_message', {
+      chatId: PILOT,
+      replyToMessageId: 'm1',
+      text: 'Bob, thoughts?',
+      mentions: ['Bob'],
+    });
+
+    expect(result.isError).toBe(false);
+    expect(chats.sentMentions).toEqual([[{ name: 'Bob', id: 'aad-bob', displayName: 'Bob Brown' }]]);
+  });
 });
 
 describe('edit_chat_message', () => {
@@ -308,6 +378,20 @@ describe('edit_chat_message', () => {
     expect(chats.htmlEdits).toEqual([{ chatId: PILOT, messageId: 'm1', html }]);
     expect(chats.edits).toEqual([]);
   });
+
+  it('mentions are resolved against the chat and forwarded to editMessage', async () => {
+    const result = await call(client, 'edit_chat_message', {
+      chatId: PILOT,
+      messageId: 'm1',
+      newText: 'Alice, please re-check',
+      mentions: ['Alice'],
+    });
+
+    expect(result.isError).toBe(false);
+    expect(chats.sentMentions).toEqual([
+      [{ name: 'Alice', id: 'aad-alice', displayName: 'Alice Anderson' }],
+    ]);
+  });
 });
 
 describe('delete_chat_message', () => {
@@ -333,6 +417,105 @@ describe('delete_chat_message', () => {
   });
 });
 
+describe('pin_chat_message / unpin_chat_message / list_pinned_messages', () => {
+  it('pins a message and returns the resulting pinned-list state', async () => {
+    const result = await call(client, 'pin_chat_message', { chatId: PILOT, messageId: 'm1' });
+    const payload = result.json() as { pinnedMessages: Array<{ messageId: string }> };
+
+    expect(result.isError).toBe(false);
+    expect(payload.pinnedMessages).toEqual([{ id: 'pin-m1', messageId: 'm1', preview: 'preview of m1' }]);
+  });
+
+  it('pinning a second message REPLACES the first — the resulting list shows only the new one', async () => {
+    await call(client, 'pin_chat_message', { chatId: PILOT, messageId: 'm1' });
+    const second = await call(client, 'pin_chat_message', { chatId: PILOT, messageId: 'm2' });
+    const payload = second.json() as { pinnedMessages: Array<{ messageId: string }> };
+
+    expect(payload.pinnedMessages.map((entry) => entry.messageId)).toEqual(['m2']);
+  });
+
+  it('pin refuses a read-only chat', async () => {
+    const result = await call(client, 'pin_chat_message', { chatId: WATCHED, messageId: 'w1' });
+
+    expect(result.isError).toBe(true);
+  });
+
+  it('pin refuses a chat outside the allowlist', async () => {
+    const result = await call(client, 'pin_chat_message', { chatId: OUTSIDE, messageId: 'm1' });
+
+    expect(result.isError).toBe(true);
+  });
+
+  it('refuses to claim pinned:true when the post-pin re-list does not actually show the message pinned (review round 2, MINOR 4)', async () => {
+    // Graph reporting POST success is not proof the pin landed — only the re-list is. If the
+    // target messageId is missing from that list, the outcome must be reported as a loud
+    // failure, never as pinned:true on faith in the write's own response.
+    chats.pinConfirms = false;
+
+    const result = await call(client, 'pin_chat_message', { chatId: PILOT, messageId: 'm1' });
+
+    expect(result.isError).toBe(true);
+    expect(result.text).toMatch(/not (confirmed|show|pinned)/i);
+  });
+
+  it('lists what is currently pinned', async () => {
+    await call(client, 'pin_chat_message', { chatId: PILOT, messageId: 'm1' });
+    const result = await call(client, 'list_pinned_messages', { chatId: PILOT });
+    const payload = result.json() as { pinnedMessages: Array<{ messageId: string }> };
+
+    expect(result.isError).toBe(false);
+    expect(payload.pinnedMessages).toEqual([{ id: 'pin-m1', messageId: 'm1', preview: 'preview of m1' }]);
+  });
+
+  it('lists an empty pinnedMessages array when nothing is pinned', async () => {
+    const result = await call(client, 'list_pinned_messages', { chatId: PILOT });
+    const payload = result.json() as { pinnedMessages: unknown[] };
+
+    expect(result.isError).toBe(false);
+    expect(payload.pinnedMessages).toEqual([]);
+  });
+
+  it('list works on a read-only chat (readable, not postable)', async () => {
+    const result = await call(client, 'list_pinned_messages', { chatId: WATCHED });
+
+    expect(result.isError).toBe(false);
+  });
+
+  it('list refuses a chat outside the allowlist', async () => {
+    const result = await call(client, 'list_pinned_messages', { chatId: OUTSIDE });
+
+    expect(result.isError).toBe(true);
+  });
+
+  it('unpins the currently-pinned message', async () => {
+    await call(client, 'pin_chat_message', { chatId: PILOT, messageId: 'm1' });
+    const result = await call(client, 'unpin_chat_message', { chatId: PILOT, messageId: 'm1' });
+
+    expect(result.isError).toBe(false);
+    expect(await chats.listPinnedMessages(PILOT)).toEqual([]);
+  });
+
+  it('unpin refuses a message that is not the one currently pinned — never silently no-ops', async () => {
+    await call(client, 'pin_chat_message', { chatId: PILOT, messageId: 'm1' });
+    const result = await call(client, 'unpin_chat_message', { chatId: PILOT, messageId: 'm2' });
+
+    expect(result.isError).toBe(true);
+    expect(result.text).toMatch(/not currently pinned/);
+  });
+
+  it('unpin refuses a read-only chat', async () => {
+    const result = await call(client, 'unpin_chat_message', { chatId: WATCHED, messageId: 'w1' });
+
+    expect(result.isError).toBe(true);
+  });
+
+  it('unpin refuses a chat outside the allowlist', async () => {
+    const result = await call(client, 'unpin_chat_message', { chatId: OUTSIDE, messageId: 'm1' });
+
+    expect(result.isError).toBe(true);
+  });
+});
+
 describe('list_chats', () => {
   it('shows the allowlisted chats and never the ones outside it', async () => {
     const result = await call(client, 'list_chats');
@@ -350,6 +533,17 @@ describe('list_chats', () => {
 
     expect(payload.chats.find((chat) => chat.id === PILOT)?.visibleToAccount).toBe(true);
     expect(payload.chats.find((chat) => chat.id === WATCHED)?.visibleToAccount).toBe(false);
+  });
+
+  it('members stays a plain array of display names — AAD ids (needed only for @mentions) are not part of this tool\'s output', async () => {
+    const payload = (await call(client, 'list_chats')).json() as {
+      chats: Array<{ id: string; members?: string[] }>;
+    };
+
+    expect(payload.chats.find((chat) => chat.id === PILOT)?.members).toEqual([
+      'Alice Anderson',
+      'Bob Brown',
+    ]);
   });
 });
 
@@ -425,6 +619,40 @@ describe('send_chat_message', () => {
     expect(result.isError).toBe(false);
     expect(chats.sent).toEqual([{ chatId: PILOT, text: '<b>not bold</b>' }]);
     expect(chats.sentHtml).toEqual([]);
+  });
+
+  it('mentions are resolved against the chat and forwarded to sendMessage', async () => {
+    const result = await call(client, 'send_chat_message', {
+      chatId: PILOT,
+      text: 'Alice can you take this?',
+      mentions: ['Alice'],
+    });
+
+    expect(result.isError).toBe(false);
+    expect(chats.resolveMentionsCalls).toEqual([{ chatId: PILOT, names: ['Alice'] }]);
+    expect(chats.sentMentions).toEqual([
+      [{ name: 'Alice', id: 'aad-alice', displayName: 'Alice Anderson' }],
+    ]);
+  });
+
+  it('no mentions given: resolveMentions is never called and an empty array is forwarded', async () => {
+    const result = await call(client, 'send_chat_message', { chatId: PILOT, text: 'Hi' });
+
+    expect(result.isError).toBe(false);
+    expect(chats.resolveMentionsCalls).toEqual([]);
+    expect(chats.sentMentions).toEqual([[]]);
+  });
+
+  it('an unresolvable mention name refuses the whole call — never a silent drop', async () => {
+    const result = await call(client, 'send_chat_message', {
+      chatId: PILOT,
+      text: 'Nobody knows this',
+      mentions: ['Nobody'],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.text).toMatch(/No chat member matches/);
+    expect(chats.sent).toEqual([]); // refused before ever reaching the send
   });
 });
 

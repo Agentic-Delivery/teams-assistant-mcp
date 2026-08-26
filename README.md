@@ -40,21 +40,24 @@ Claude Code  --stdio-->  teams-assistant-mcp  --HTTPS-->  Microsoft Graph  -->  
                           TokenProvider  (ROPC today, swappable)
 ```
 
-The server speaks MCP over stdio and exposes eleven tools:
+The server speaks MCP over stdio and exposes fourteen tools:
 
 | Tool | What it does |
 |---|---|
 | `list_chats` | The allowlisted chats, annotated with whether the account can actually see each one |
 | `read_chat_messages` | Messages from one chat, oldest first, with a watermark for the next call |
-| `send_chat_message` | Posts to a chat whose allowlist entry has `canPost: true`; `format: 'text'` (default) escapes and renders, `format: 'html'` posts raw HTML verbatim |
+| `send_chat_message` | Posts to a chat whose allowlist entry has `canPost: true`; `format: 'text'` (default) escapes and renders, `format: 'html'` posts raw HTML verbatim; optional `mentions` — see "@mentions" below |
 | `send_chat_image` | Posts a PNG/JPEG that renders inline, from a local path or base64 bytes |
 | `send_chat_file` | Uploads a local file to the account's OneDrive (`TEAMS_MCP_UPLOAD_DIR`, default `ai-test`) and shares it into the chat |
-| `reply_chat_message` | Posts a quoted reply to a specific message — chats have no reply threads, so this is the quote card the Teams UI produces |
-| `edit_chat_message` | Replaces the text of a message this account sent (Graph refuses anyone else's); same `format` option as `send_chat_message` |
+| `reply_chat_message` | Posts a quoted reply to a specific message — chats have no reply threads, so this is the quote card the Teams UI produces; optional `mentions` |
+| `edit_chat_message` | Replaces the text of a message this account sent (Graph refuses anyone else's); same `format` and `mentions` options as `send_chat_message` |
 | `react_to_chat_message` | Puts an emoji reaction on a message — the receipt gesture for "seen, being handled" |
 | `delete_chat_message` | Soft-deletes a message this account sent — the reversible kind; no hard delete offered |
 | `get_chat_attachment` | Downloads one attachment to a local file and returns the path — shared files, and pasted images which appear as `inline-image-N` |
 | `poll_chats` | Reads every allowlisted chat in one call, carrying a watermark per chat |
+| `pin_chat_message` | Pins a message — see "Pinning" below for the one-pin-per-chat behaviour |
+| `unpin_chat_message` | Unpins a message; refuses if it is not the one currently pinned |
+| `list_pinned_messages` | Lists what is currently pinned, with a plain-text preview |
 
 Besides the tools, the server runs a background inbox poller — see below.
 
@@ -69,6 +72,39 @@ it already had.
 Graph returns message bodies as HTML even for plain typed text, so `messages.ts` flattens that to
 text. Mentions keep their visible name and lose the markup. This is not a general HTML renderer
 and does not try to be.
+
+## @mentions
+
+A plain `<at id="N">Name</at>` tag in the body does NOT notify anyone — Graph only rings the
+bell when the message also carries a parallel `mentions` array entry with the person's real AAD
+user id. `send_chat_message`, `reply_chat_message` and `edit_chat_message` all take an optional
+`mentions: string[]` — display names to actually notify, resolved case-insensitively as an
+unambiguous substring against the chat's current member list ("Shiv" matches "Garg, Shivankit").
+A name matching zero or more than one member is refused with a clear error; nothing is ever
+silently dropped.
+
+How the name gets placed depends on `format`:
+- `format: 'text'` (default): the mention's name must literally occur somewhere in your message
+  text — that occurrence becomes the notifying tag. Just write the person's name where you mean
+  to mention them ("Shiv can you review this?").
+- `format: 'html'`: place a literal `@{Name}` token at each spot to mention (e.g. `@{Shiv}`); the
+  server swaps it for the `<at>` tag. Every name in `mentions` needs a matching token and every
+  token needs a declared mention, or the call is refused.
+
+Only mention people who need to act — an owner, a question addressed to them. Tagging everyone
+named in a message is how notifications stop meaning anything; see the `teams-styling` skill's
+"Mentions" section for the full doctrine.
+
+## Pinning
+
+`pin_chat_message` / `unpin_chat_message` / `list_pinned_messages` manage a chat's pinned
+message(s). **A Teams chat effectively holds only ONE pin**: pinning a second message silently
+REPLACES the first while Graph still reports the POST as a success (verified live 2026-08-25 and
+reconfirmed 2026-08-26) — there is no "add another pin". `pin_chat_message` returns the resulting
+`pinnedMessages` list so the replacement is visible rather than assumed. Listing an empty
+collection is itself an undocumented quirk: Graph answers a bare 404 where a normal empty
+collection would be `200` with `value: []` (verified live 2026-08-26); the server reads that 404
+as "nothing pinned" and returns an empty list rather than surfacing it as a failure.
 
 ## The background inbox
 
@@ -109,14 +145,18 @@ Two knobs: `TEAMS_INBOX_PATH` moves the inbox (the sidecar follows it), and
 
 ## The standalone CLIs
 
-Five small commands ship beside the server for scripts, cron jobs and background monitors that
-need Teams without a running MCP session: `teams-post <chatId> [--html]` (text on stdin),
-`teams-reply <chatId> <messageId>` (text on stdin), `teams-edit <chatId> <messageId> [--html]`
-(new text on stdin), `teams-react <chatId> <messageId> <emoji>` and `teams-read <chatId>
-[--limit N] [--since ISO]`. Same allowlist, same auth, same code paths as the server tools —
-including the send reliability below. `--html` on `teams-post`/`teams-edit` posts stdin as raw
-Teams-subset HTML, verbatim — the caller is responsible for entity-escaping their own `<`, `>`,
-`&`; see the `teams-styling` plugin for the verified vocabulary.
+Seven small commands ship beside the server for scripts, cron jobs and background monitors that
+need Teams without a running MCP session: `teams-post <chatId> [--html] [--mention "Name"]...`
+(text on stdin), `teams-reply <chatId> <messageId> [--mention "Name"]...` (text on stdin),
+`teams-edit <chatId> <messageId> [--html] [--mention "Name"]...` (new text on stdin), `teams-react
+<chatId> <messageId> <emoji>`, `teams-read <chatId> [--limit N] [--since ISO]`, `teams-pin
+<chatId> <messageId>` and `teams-unpin <chatId> <messageId>`. Same allowlist, same auth, same
+code paths as the server tools — including the send reliability below. `--html` on
+`teams-post`/`teams-edit` posts stdin as raw Teams-subset HTML, verbatim — the caller is
+responsible for entity-escaping their own `<`, `>`, `&`; see the `teams-styling` plugin for the
+verified vocabulary. `--mention
+"Name"` (repeatable) @mentions that person, same resolution and placement rules as the
+`mentions` tool parameter — see "@mentions" above.
 
 Their output contract exists because of a real incident (2026-08-24): an ad-hoc wrapper's
 caller grepped for a success token the wrapper never printed, read eleven successful posts as

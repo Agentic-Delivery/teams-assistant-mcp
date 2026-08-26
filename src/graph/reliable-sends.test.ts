@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { GraphClient, GraphError } from './graph-client.js';
 import { ReliableTeamsChats } from './reliable-sends.js';
-import { GraphTeamsChats, type TeamsChatsPort } from './teams-chats.js';
+import { GraphTeamsChats, type MentionTarget, type TeamsChatsPort } from './teams-chats.js';
 import type { TokenProvider } from '../auth/token-provider.js';
 import { toChatMessage, type ChatMessage, type ReadResult } from '../messages.js';
 
@@ -23,6 +23,7 @@ function portWith(overrides: Partial<TeamsChatsPort>): TeamsChatsPort {
   return {
     listChats: reject,
     readMessages: () => Promise.resolve({ messages: [] } as unknown as ReadResult),
+    resolveMentions: reject,
     sendMessage: reject,
     sendHtmlMessage: reject,
     sendImage: reject,
@@ -33,6 +34,9 @@ function portWith(overrides: Partial<TeamsChatsPort>): TeamsChatsPort {
     deleteMessage: reject,
     setReaction: reject,
     getAttachment: reject,
+    pinMessage: reject,
+    unpinMessage: reject,
+    listPinnedMessages: reject,
     ...overrides,
   } as TeamsChatsPort;
 }
@@ -199,7 +203,7 @@ describe('reliable sends — readback before any retry', () => {
     await chats.editMessage('19:a@thread.v2', 'm1', 'new');
     await chats.deleteMessage('19:a@thread.v2', 'm1');
 
-    expect(inner.editMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1', 'new');
+    expect(inner.editMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1', 'new', []);
     expect(inner.deleteMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1');
   });
 });
@@ -211,7 +215,7 @@ describe('reliable sends — html format: readback dedup compares TEXT, not raw 
     const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
 
     expect(await chats.sendHtmlMessage('19:a@thread.v2', '<b>Deploy</b> done')).toBe(sent);
-    expect(inner.sendHtmlMessage).toHaveBeenCalledWith('19:a@thread.v2', '<b>Deploy</b> done');
+    expect(inner.sendHtmlMessage).toHaveBeenCalledWith('19:a@thread.v2', '<b>Deploy</b> done', []);
     expect(inner.sendHtmlMessage).toHaveBeenCalledTimes(1);
   });
 
@@ -249,7 +253,7 @@ describe('reliable sends — html format: readback dedup compares TEXT, not raw 
     const result = await chats.sendHtmlMessage('19:a@thread.v2', '<b>Deploy</b> done');
 
     expect(result.id).toBe('second-try');
-    expect(sendHtmlMessage).toHaveBeenNthCalledWith(2, '19:a@thread.v2', '<b>Deploy</b> done');
+    expect(sendHtmlMessage).toHaveBeenNthCalledWith(2, '19:a@thread.v2', '<b>Deploy</b> done', []);
   });
 
   it('editHtmlMessage delegates untouched — a PATCH targets an existing id, nothing to guard', async () => {
@@ -258,7 +262,7 @@ describe('reliable sends — html format: readback dedup compares TEXT, not raw 
 
     await chats.editHtmlMessage('19:a@thread.v2', 'm1', '<b>corrected</b>');
 
-    expect(inner.editHtmlMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1', '<b>corrected</b>');
+    expect(inner.editHtmlMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1', '<b>corrected</b>', []);
   });
 
   it('an html body that reduces to no text at all (image/hr-only) gets no guard: one attempt, the send failure itself, no readback', async () => {
@@ -727,5 +731,172 @@ describe('the real assembly — MessageFetchThrottled through the decorator', ()
     expect(error.message).toMatch(/nothing was posted/);
     expect(posts).toHaveLength(0);
     expect(sleeps).toEqual([]);
+  });
+});
+
+describe('reliable sends — @mentions rewrite the match key, not just the sent text', () => {
+  const MENTION: MentionTarget = { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' };
+
+  it('sendMessage with a mention matches a landed copy by the RESOLVED displayName, not the caller\'s search string', async () => {
+    // "Shiv" was typed, but the <at> tag (and so the readback) carries "Garg, Shivankit" — a
+    // match key built from the raw input text ("Shiv please review") would never equal a landed
+    // copy's readback ("Garg, Shivankit please review") and would retry a genuinely landed send
+    // into a real duplicate.
+    const landed = message({ text: 'Garg, Shivankit please review' });
+    const sendMessage = vi.fn(async () => {
+      throw new GraphError('socket hang up mid-response', 0);
+    });
+    const inner = portWith({
+      sendMessage,
+      readMessages: vi.fn(async () => ({ messages: [landed] }) as unknown as ReadResult),
+    });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    const result = await chats.sendMessage('19:a@thread.v2', 'Shiv please review', [MENTION]);
+
+    expect(result).toBe(landed);
+    expect(sendMessage).toHaveBeenCalledTimes(1); // found the landed copy — no duplicate
+  });
+
+  it('sendMessage without mentions still matches on the raw text unchanged (no regression)', async () => {
+    const landed = message({ text: 'hello channel' });
+    const sendMessage = vi.fn(async () => {
+      throw new GraphError('socket hang up mid-response', 0);
+    });
+    const inner = portWith({
+      sendMessage,
+      readMessages: vi.fn(async () => ({ messages: [landed] }) as unknown as ReadResult),
+    });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    expect(await chats.sendMessage('19:a@thread.v2', 'hello channel')).toBe(landed);
+  });
+
+  it('replyToMessage with a mention matches on the resolved displayName in the reply tail', async () => {
+    const landed = message({ text: 'quoted original text\nGarg, Shivankit can you confirm?' });
+    const replyToMessage = vi.fn(async () => {
+      throw new GraphError('socket hang up mid-response', 0);
+    });
+    const inner = portWith({
+      replyToMessage,
+      readMessages: vi.fn(async () => ({ messages: [landed] }) as unknown as ReadResult),
+    });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    const result = await chats.replyToMessage('19:a@thread.v2', 'orig-1', 'Shiv can you confirm?', [MENTION]);
+
+    expect(result).toBe(landed);
+    expect(replyToMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('sendHtmlMessage with a mention placeholder matches on the resolved displayName', async () => {
+    const landed = message({ text: 'Garg, Shivankit see the table below' });
+    const sendHtmlMessage = vi.fn(async () => {
+      throw new GraphError('socket hang up mid-response', 0);
+    });
+    const inner = portWith({
+      sendHtmlMessage,
+      readMessages: vi.fn(async () => ({ messages: [landed] }) as unknown as ReadResult),
+    });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    const result = await chats.sendHtmlMessage('19:a@thread.v2', '<p>@{Shiv} see the table below</p>', [MENTION]);
+
+    expect(result).toBe(landed);
+    expect(sendHtmlMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('reliable sends — @mention match key vs a REAL captured Teams readback (fixture, 2026-08-26)', () => {
+  // Capture provenance (re-runnable): chat 19:8af48977045e48c9b9ed5049ba8f94ad@thread.v2
+  // ("MCP dev test", allowlisted canPost), message id 1787722849960, captured 2026-08-26. Sent
+  // via a real sendMessage call mentioning "Johan" (resolved to "Spännare, Johan"), then GET the
+  // message back off Graph and read RAW body.content — bypassing toChatMessage/htmlToText
+  // entirely, so this is exactly what Teams stored, not what our own code thinks it stored.
+  //
+  // Unlike the table case in the format:'html' fixtures above, Teams did NOT rewrite anything
+  // here: the raw readback is byte-identical to what renderTextWithMentions produced — an <at>
+  // tag behaves like the other inline tags (<b>, <i>) proven untouched by the earlier capture,
+  // not like the table tags that get a <tbody> and boundary newlines inserted. So <at> needs no
+  // entry in REWRITTEN_TAG_BOUNDARY, and plain htmlToText reduction is exactly right for it.
+  const MENTION: MentionTarget = {
+    name: 'Johan',
+    id: '47588e53-8923-487c-a5db-6f5157a9d97b',
+    displayName: 'Spännare, Johan',
+  };
+  const SENT_TEXT =
+    'Mention capture test (0.4.0 feature dev) — Johan please ignore, verifying @mention notify + readback shape.';
+  const CAPTURED_RAW_READBACK =
+    '<p>Mention capture test (0.4.0 feature dev) — <at id="0">Spännare, Johan</at> please ignore, ' +
+    'verifying @mention notify + readback shape.</p>';
+
+  it('toChatMessage reduces the captured readback to the resolved displayName in place of the mention (pins the capture itself)', () => {
+    const landed = toChatMessage(
+      {
+        id: 'captured-mention-1',
+        createdDateTime: '2026-08-26T06:00:05Z',
+        from: { user: { id: 'me', displayName: 'Assistant' } },
+        body: { contentType: 'html', content: CAPTURED_RAW_READBACK },
+      },
+      '19:a@thread.v2',
+    );
+
+    expect(landed.text).toBe(
+      'Mention capture test (0.4.0 feature dev) — Spännare, Johan please ignore, verifying @mention notify + readback shape.',
+    );
+  });
+
+  it('a mention-bearing send\'s match key equals its own REAL captured readback — no duplicate on retry', async () => {
+    const landed = toChatMessage(
+      {
+        id: 'captured-mention-1',
+        createdDateTime: '2026-08-26T06:00:05Z',
+        from: { user: { id: 'me', displayName: 'Assistant' } },
+        body: { contentType: 'html', content: CAPTURED_RAW_READBACK },
+      },
+      '19:a@thread.v2',
+    );
+    const sendMessage = vi.fn(async () => {
+      throw new GraphError('socket hang up mid-response', 0);
+    });
+    const inner = portWith({
+      sendMessage,
+      readMessages: vi.fn(async () => ({ messages: [landed] }) as unknown as ReadResult),
+    });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    const result = await chats.sendMessage('19:a@thread.v2', SENT_TEXT, [MENTION]);
+
+    expect(result).toBe(landed);
+    expect(sendMessage).toHaveBeenCalledTimes(1); // found the REAL captured landed copy — no duplicate
+  });
+});
+
+describe('reliable sends — resolveMentions and pin/unpin/list are pure passthroughs', () => {
+  it('resolveMentions delegates untouched — a read against the member list, nothing to guard', async () => {
+    const resolveMentions = vi.fn(async () => [{ name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' }]);
+    const inner = portWith({ resolveMentions });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {} });
+
+    const result = await chats.resolveMentions('19:a@thread.v2', ['Shiv']);
+
+    expect(resolveMentions).toHaveBeenCalledWith('19:a@thread.v2', ['Shiv']);
+    expect(result).toEqual([{ name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' }]);
+  });
+
+  it('pinMessage, unpinMessage and listPinnedMessages all delegate untouched', async () => {
+    const pinMessage = vi.fn(async () => [{ id: 'pin-1', messageId: 'm1', preview: 'x' }]);
+    const unpinMessage = vi.fn(async () => undefined);
+    const listPinnedMessages = vi.fn(async () => [{ id: 'pin-1', messageId: 'm1', preview: 'x' }]);
+    const inner = portWith({ pinMessage, unpinMessage, listPinnedMessages });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {} });
+
+    await chats.pinMessage('19:a@thread.v2', 'm1');
+    await chats.unpinMessage('19:a@thread.v2', 'm1');
+    await chats.listPinnedMessages('19:a@thread.v2');
+
+    expect(pinMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1');
+    expect(unpinMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1');
+    expect(listPinnedMessages).toHaveBeenCalledWith('19:a@thread.v2');
   });
 });
