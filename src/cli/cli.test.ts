@@ -9,7 +9,7 @@ import { ReliableTeamsChats } from '../graph/reliable-sends.js';
 import type { TeamsChatsPort } from '../graph/teams-chats.js';
 import type { ChatMessage, ReadResult } from '../messages.js';
 import { loadConfig } from '../config.js';
-import { doEdit, doPost, parseSendFlags, succeed } from './common.js';
+import { doEdit, doPin, doPost, doReply, parseSendFlags, succeed } from './common.js';
 
 const repoRoot = join(import.meta.dirname, '..', '..');
 const tsx = join(repoRoot, 'node_modules', '.bin', 'tsx');
@@ -101,6 +101,30 @@ describe('the CLI contract — exit codes, and nothing but the JSON line on stdo
     expect(result.stdout).toBe('');
   });
 
+  // Review round 2, MINOR 7 (2026-08-26): `--mention --html` used to consume "--html" as the
+  // mention NAME (silently, no error here) and only fail later, confusingly, when resolveMentions
+  // couldn't find a chat member called "--html". A flag-like value is refused loudly at parse time
+  // instead.
+  it('teams-post rejects a flag-like value for --mention instead of silently accepting it as a name: exit 2', async () => {
+    const result = await runCli(
+      'post.ts',
+      ['19:readonly@thread.v2', '--mention', '--html'],
+      fixtureEnv(),
+    );
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/--mention/);
+  });
+
+  it('teams-post --mention at the end of argv with nothing after it: exit 2, same as any missing value', async () => {
+    const result = await runCli('post.ts', ['19:readonly@thread.v2', '--mention'], fixtureEnv());
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/--mention/);
+  });
+
   it('teams-post --html: still gated by the allowlist exactly like plain text (exit 3, no network reached)', async () => {
     // This proves --html does not get swallowed as an extra positional (which would misparse
     // chatId or trip a usage error) — it does NOT prove the flag routes to sendHtmlMessage,
@@ -153,6 +177,20 @@ describe('the CLI contract — exit codes, and nothing but the JSON line on stdo
     const result = await runCli(
       'edit.ts',
       ['19:readonly@thread.v2', 'msg-1', '--html'],
+      fixtureEnv(),
+    );
+
+    expect(result.code).toBe(3);
+    expect(result.stdout).toBe('');
+  });
+
+  it('teams-reply --mention: still gated by the allowlist exactly like a plain reply (exit 3, no network reached)', async () => {
+    // Same shape as the --html test above: proves --mention/"Shiv" are parsed as a flag+value
+    // pair, not misread as positionals, without needing a live resolveMentions call. The
+    // resolution/forwarding itself is proven in-process below (doReply).
+    const result = await runCli(
+      'reply.ts',
+      ['19:readonly@thread.v2', 'msg-1', '--mention', 'Shiv'],
       fixtureEnv(),
     );
 
@@ -306,6 +344,96 @@ describe('teams-post / teams-edit — the --html routing decision (in-process, n
     expect(editMessage).toHaveBeenCalledWith('19:a@thread.v2', 'msg-1', 'Shiv see above', [
       { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' },
     ]);
+  });
+
+  // Review round 2, MINOR 5 (2026-08-26): teams-reply had no --mention even though the MCP tool
+  // and the port both support it on replies — a half-shipped surface.
+  it('doReply with --mention resolves the name and forwards it to replyToMessage', async () => {
+    const resolveMentions = vi.fn(async () => [
+      { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+    ]);
+    const replyToMessage = vi.fn(async () => stubMessage('r1'));
+    const chats = new ReliableTeamsChats(fakePort({ resolveMentions, replyToMessage }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    const result = await doReply({ chats, allowlist }, '19:a@thread.v2', 'orig-1', 'Shiv can you confirm?', ['Shiv']);
+
+    expect(resolveMentions).toHaveBeenCalledWith('19:a@thread.v2', ['Shiv']);
+    expect(replyToMessage).toHaveBeenCalledWith('19:a@thread.v2', 'orig-1', 'Shiv can you confirm?', [
+      { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+    ]);
+    expect(result).toEqual({ action: 'reply', id: 'r1', inReplyTo: 'orig-1', chat: 'chat A' });
+  });
+
+  it('doReply with no --mention never calls resolveMentions', async () => {
+    const resolveMentions = vi.fn();
+    const replyToMessage = vi.fn(async () => stubMessage('r2'));
+    const chats = new ReliableTeamsChats(fakePort({ resolveMentions, replyToMessage }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    await doReply({ chats, allowlist }, '19:a@thread.v2', 'orig-1', 'plain reply', []);
+
+    expect(resolveMentions).not.toHaveBeenCalled();
+  });
+});
+
+describe('doPin — confirms the target message actually landed before claiming success (review round 2, MINOR 4)', () => {
+  function fakePinPort(overrides: Partial<TeamsChatsPort>): TeamsChatsPort {
+    const reject = () => Promise.reject(new Error('not part of this test'));
+    return {
+      listChats: reject,
+      readMessages: () => Promise.resolve({ messages: [] } as unknown as ReadResult),
+      resolveMentions: reject,
+      sendMessage: reject,
+      sendHtmlMessage: reject,
+      sendImage: reject,
+      sendFile: reject,
+      replyToMessage: reject,
+      editMessage: reject,
+      editHtmlMessage: reject,
+      deleteMessage: reject,
+      setReaction: reject,
+      getAttachment: reject,
+      pinMessage: reject,
+      unpinMessage: reject,
+      listPinnedMessages: reject,
+      ...overrides,
+    } as TeamsChatsPort;
+  }
+
+  const allowlist = new ChatAllowlist([{ id: '19:a@thread.v2', label: 'chat A', canPost: true }]);
+
+  it('resolves normally when the re-list shows the target message pinned', async () => {
+    const pinMessage = vi.fn(async () => [{ id: 'pin-m1', messageId: 'm1', preview: 'x' }]);
+    const chats = new ReliableTeamsChats(fakePinPort({ pinMessage }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    const result = await doPin({ chats, allowlist }, '19:a@thread.v2', 'm1');
+
+    expect(result).toEqual({
+      action: 'pin',
+      messageId: 'm1',
+      chat: 'chat A',
+      pinnedMessages: [{ id: 'pin-m1', messageId: 'm1', preview: 'x' }],
+    });
+  });
+
+  it('throws — never succeed()s — when the re-list does not show the target message pinned', async () => {
+    const pinMessage = vi.fn(async () => [] as never[]);
+    const chats = new ReliableTeamsChats(fakePinPort({ pinMessage }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    await expect(doPin({ chats, allowlist }, '19:a@thread.v2', 'm1')).rejects.toThrow(
+      /not (confirmed|show|pinned)/i,
+    );
   });
 });
 

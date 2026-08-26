@@ -59,14 +59,17 @@ a mention is for. One clear action-owner tag beats five drive-by name-checks.
 **The placeholder contract for `format: 'html'`**: since raw HTML is posted verbatim (no
 escaping, no rewriting), the server cannot infer where in your markup a mention belongs — you
 mark the spot yourself with a literal `@{Name}` token (e.g. `@{Shiv}`), matched case-insensitively
-against the `mentions` list you also pass. The server replaces each token with the real `<at
-id="N">...</at>` tag and the id it references in the parallel `mentions` request field. Every
-name you declare in `mentions` needs exactly one `@{Name}` token somewhere in the html, and every
-token needs a matching declared name — an orphaned mention (declared but never placed) or an
-orphaned token (placed but never declared, usually a typo) is refused rather than silently
-posted as literal `@{Shiv}` text with no notification behind it. `format: 'text'` needs no
-placeholder — write the person's plain name where you mean to mention them and the server finds
-that occurrence for you.
+against the `mentions` list you also pass. The server replaces every occurrence of each token
+with the real `<at id="N">...</at>` tag and the id it references in the parallel `mentions`
+request field — place `@{Shiv}` more than once if you genuinely mean the same person at several
+spots, they all get the same id. Every name you declare in `mentions` needs AT LEAST ONE
+`@{Name}` token somewhere in the html, and every token needs a matching declared name — an
+orphaned mention (declared but never placed) or an orphaned token (placed but never declared,
+usually a typo) is refused rather than silently posted as literal `@{Shiv}` text with no
+notification behind it. `format: 'text'` needs no placeholder — write the person's plain name
+where you mean to mention them (every whole-word occurrence gets tagged, but never a name that's
+only part of a URL or another word — see mentions.ts if you need the exact matching rules) and
+the server finds it for you.
 
 ## Verified rendering vocabulary — all of these WORK
 

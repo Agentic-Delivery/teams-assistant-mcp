@@ -430,6 +430,32 @@ describe('teams chats — @mentions', () => {
     expect(resolved).toEqual([{ name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' }]);
   });
 
+  it('resolveMentions follows pagination on /members — a member on page 2 still resolves (review round 2, MINOR 3)', async () => {
+    // A single-page get() used to silently truncate the roster to whatever fit on page 1, and a
+    // member past that page would come back "No chat member matches" — a false negative that
+    // looks exactly like the member genuinely not being in the chat.
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        json({
+          value: [{ id: 'membership-1', displayName: 'Alice Anderson', userId: 'aad-alice' }],
+          '@odata.nextLink':
+            'https://graph.microsoft.com/v1.0/chats/19%3Aa%40thread.v2/members?$skiptoken=x',
+        }),
+      )
+      .mockResolvedValueOnce(
+        json({ value: [{ id: 'membership-2', displayName: 'Garg, Shivankit', userId: 'aad-shiv' }] }),
+      );
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
+    );
+
+    const resolved = await chats.resolveMentions('19:a@thread.v2', ['Shiv']);
+
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    expect(resolved).toEqual([{ name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' }]);
+  });
+
   it('sendMessage with mentions posts an <at> tag AND the parallel Graph mentions array', async () => {
     const fetchFn = vi.fn(async () =>
       json({ id: 'sent', createdDateTime: '2026-08-19T10:00:00Z', body: { content: 'x' } }),

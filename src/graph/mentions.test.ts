@@ -119,6 +119,64 @@ describe('renderTextWithMentions — plain-text path (send_chat_message default 
 
     expect(() => renderTextWithMentions('no names here', [target])).toThrow(/does not occur anywhere/);
   });
+
+  // Review round 2, MAJOR 1 (2026-08-26): a mention name occurring inside a URL used to corrupt
+  // the outbound HTML — the placeholder was substituted into raw text BEFORE textToHtml
+  // autolinked the URL, so the name-inside-URL got tokenized too, and the final <at>-tag swap
+  // landed inside the eventual href attribute value, whose own quote character terminates the
+  // attribute early (malformed HTML). URL spans must be excluded from substitution entirely.
+  it('does not corrupt a URL that happens to contain the mention name as a path segment', () => {
+    const target: MentionTarget = { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' };
+
+    const rendered = renderTextWithMentions('see https://x.com/shiv/pr Shiv', [target]);
+
+    // The URL renders as one intact, unmangled anchor — no <at> markup anywhere inside it.
+    expect(rendered).toContain('<a href="https://x.com/shiv/pr">https://x.com/shiv/pr</a>');
+    expect(rendered).not.toMatch(/<a href="[^"]*<at/);
+    // The real, standalone mention target outside the URL still gets tagged.
+    expect(rendered).toContain('<at id="0">Garg, Shivankit</at>');
+    expect(rendered).toBe(
+      '<p>see <a href="https://x.com/shiv/pr">https://x.com/shiv/pr</a> <at id="0">Garg, Shivankit</at></p>',
+    );
+  });
+
+  it('a mention name occurring ONLY inside a URL is not an eligible occurrence — throws, does not silently skip', () => {
+    const target: MentionTarget = { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' };
+
+    expect(() => renderTextWithMentions('see https://x.com/shiv/pr for details', [target])).toThrow(
+      /does not occur anywhere/,
+    );
+  });
+
+  // Review round 2, MAJOR 2 (2026-08-26): no word-boundary requirement meant "Shiv" matched
+  // inside "Shivankit's", silently corrupting the VISIBLE text (not just misplacing the tag) —
+  // the rendered message would read "...<at>Garg, Shivankit</at>ankit's branch...".
+  it('requires a word boundary — does not match "Shiv" inside "Shivankit\'s"', () => {
+    const target: MentionTarget = { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' };
+
+    const rendered = renderTextWithMentions("Shivankit's branch is ready — Shiv please review", [target]);
+
+    expect(rendered).toBe(
+      '<p>Shivankit\'s branch is ready — <at id="0">Garg, Shivankit</at> please review</p>',
+    );
+  });
+
+  it('throws the loud "does not occur" error when only a sub-word match exists — never a silent skip', () => {
+    const target: MentionTarget = { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' };
+
+    expect(() => renderTextWithMentions("Shivankit's branch is ready", [target])).toThrow(
+      /does not occur anywhere/,
+    );
+  });
+
+  it('a name with non-ASCII letters still respects word boundaries (Unicode-aware)', () => {
+    const target: MentionTarget = { name: 'Johan', id: 'aad-johan', displayName: 'Spännare, Johan' };
+
+    // "Johana" is a different word entirely; only the standalone "Johan" should match.
+    expect(() => renderTextWithMentions('Johana is not Johan', [target])).not.toThrow();
+    const rendered = renderTextWithMentions('Johana is not Johan', [target]);
+    expect(rendered).toBe('<p>Johana is not <at id="0">Spännare, Johan</at></p>');
+  });
 });
 
 describe('renderHtmlWithMentions — the format:"html" @{Name} placeholder contract', () => {

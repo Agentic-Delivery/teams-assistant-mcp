@@ -1,4 +1,4 @@
-import { escapeHtml, textToHtml } from '../formatting.js';
+import { escapeHtml, findUrlSpans, textToHtml } from '../formatting.js';
 
 /** One chat member as Graph's `$expand=members`/`/members` shape actually carries it. */
 export interface ChatMember {
@@ -26,6 +26,48 @@ export interface MentionTarget {
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * `name` matched only when NOT tight against another letter/number on either side ("Shiv" must
+ * not match inside "Shivankit") — Unicode-aware (`\p{L}`/`\p{N}` with the `u` flag) so an accented
+ * name like "Spännare" gets correct boundaries too. Built fresh per call: a shared `g`-flagged
+ * RegExp instance would carry `lastIndex` state across the separate `.test()` calls this is used
+ * for (existence checks over several segments), silently skipping real matches.
+ */
+function wordBoundaryPattern(name: string, flags: string): RegExp {
+  return new RegExp(`(?<![\\p{L}\\p{N}])${escapeRegExp(name)}(?![\\p{L}\\p{N}])`, flags);
+}
+
+interface TextSegment {
+  /** true when this segment IS a URL — never eligible for mention substitution. */
+  isUrl: boolean;
+  value: string;
+}
+
+/**
+ * Splits `text` into alternating URL / non-URL segments using the exact boundaries `textToHtml`
+ * will itself wrap in an `<a href>` (findUrlSpans, shared with formatting.ts). A mention name is
+ * only ever searched for — and only ever substituted — inside the non-URL segments: a name that
+ * merely happens to appear inside a URL's path/query is part of the link's literal text, not a
+ * mention, and tokenizing it there used to land <at> markup inside the href attribute value,
+ * whose own quote character terminates the attribute early (malformed HTML) — verified 2026-08-26
+ * review round with `see https://x.com/shiv/pr Shiv` and mention "Shiv".
+ */
+function splitOnUrls(text: string): TextSegment[] {
+  const segments: TextSegment[] = [];
+  let consumed = 0;
+  for (const { start, end } of findUrlSpans(text)) {
+    if (start > consumed) {
+      segments.push({ isUrl: false, value: text.slice(consumed, start) });
+    }
+    segments.push({ isUrl: true, value: text.slice(start, end) });
+    consumed = end;
+  }
+  if (consumed < text.length) {
+    segments.push({ isUrl: false, value: text.slice(consumed) });
+  }
+  return segments;
 }
 
 /**
@@ -87,37 +129,51 @@ export function buildGraphMentionsPayload(
 const PLACEHOLDER_GUARD = '\uE000';
 
 /**
- * Renders plain text to the outbound HTML body, same as textToHtml, except every case-insensitive
- * occurrence of each mention's `name` becomes a `<at id="N">displayName</at>` tag that Graph's
- * `mentions` array (buildGraphMentionsPayload) will actually notify.
+ * Renders plain text to the outbound HTML body, same as textToHtml, except every whole-word,
+ * case-insensitive occurrence of each mention's `name` — outside any URL — becomes a
+ * `<at id="N">displayName</at>` tag that Graph's `mentions` array (buildGraphMentionsPayload)
+ * will actually notify.
  *
  * Substitution happens via a placeholder token BEFORE textToHtml runs — inserting the raw <at>
  * markup after escaping would be safe from re-escaping, but doing the name search on already
  * paragraph/br-wrapped HTML risks matching inside markup Teams itself added (an autolinked URL,
  * say). The placeholder is inert to every transform textToHtml performs, so it always survives
- * to the swap at the end.
+ * to the swap at the end. Two eligibility rules narrow WHERE a name may match, both added after a
+ * 2026-08-26 review round found them missing:
+ *  - never inside a URL span (splitOnUrls) — a name that is really part of a link's path/query is
+ *    the link's own text, not a mention, and tokenizing it there corrupts the eventual href;
+ *  - only at a word boundary (wordBoundaryPattern) — "Shiv" must not match inside "Shivankit",
+ *    which would silently mangle the VISIBLE text, not just misplace the tag.
  *
- * Throws if a mention's name has zero occurrences in the text: a mention resolved but never
- * placed would otherwise be a silent drop — resolved, but nobody actually gets notified.
+ * Throws if a mention's name has zero ELIGIBLE occurrences (whole-word, outside any URL): a
+ * mention resolved but never placed would otherwise be a silent drop — resolved, but nobody
+ * actually gets notified. A sub-word or URL-only match does not count as an occurrence at all,
+ * so it hits this same loud failure rather than a confusing silent skip.
  */
 export function renderTextWithMentions(text: string, mentions: readonly MentionTarget[]): string {
   if (mentions.length === 0) {
     return textToHtml(text);
   }
-  let working = text;
+  let segments = splitOnUrls(text);
   const tokens = mentions.map((mention, index) => {
-    const pattern = new RegExp(escapeRegExp(mention.name), 'i');
-    if (!pattern.test(working)) {
+    const hasEligibleOccurrence = segments.some(
+      (segment) => !segment.isUrl && wordBoundaryPattern(mention.name, 'iu').test(segment.value),
+    );
+    if (!hasEligibleOccurrence) {
       throw new Error(
         `Mention "${mention.name}" (resolved to ${mention.displayName}) does not occur anywhere ` +
-          'in the text — nothing to attach the mention to, so it would notify no one silently.',
+          'in the text as a whole word outside any URL — nothing to attach the mention to, so it ' +
+          'would notify no one silently.',
       );
     }
     const token = `${PLACEHOLDER_GUARD}MENTION${index}${PLACEHOLDER_GUARD}`;
-    working = working.replace(new RegExp(escapeRegExp(mention.name), 'gi'), token);
+    const pattern = wordBoundaryPattern(mention.name, 'giu');
+    segments = segments.map((segment) =>
+      segment.isUrl ? segment : { isUrl: false, value: segment.value.replace(pattern, token) },
+    );
     return token;
   });
-  let html = textToHtml(working);
+  let html = textToHtml(segments.map((segment) => segment.value).join(''));
   mentions.forEach((mention, index) => {
     html = html.split(tokens[index] as string).join(`<at id="${index}">${escapeHtml(mention.displayName)}</at>`);
   });
