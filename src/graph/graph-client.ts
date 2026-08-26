@@ -276,6 +276,15 @@ export class GraphClient {
     }
   }
 
+  /** DELETE with no body, expecting Graph's 204 No Content. Used by unpinMessage. */
+  async del(path: string): Promise<void> {
+    const response = await this.authorized(path, { method: 'DELETE' });
+    if (!response.ok) {
+      await this.fail(response);
+    }
+    await response.body?.cancel().catch(() => undefined);
+  }
+
   async putBinary<T>(path: string, bytes: Uint8Array, contentType: string): Promise<T> {
     const response = await this.authorized(path, {
       method: 'PUT',

@@ -36,6 +36,38 @@ text; reach for styling when the content has structure a reader must scan:
 Restraint rules: at most one `<h2>` title per message (h1 is oversized in chat); style the
 signal, not every word; a message that is all bold has no bold. If in doubt, plain text.
 
+## Mentions
+
+teams-assistant-mcp 0.4.0 added real, notifying @mentions — `mentions: string[]` on
+`send_chat_message`/`reply_chat_message`/`edit_chat_message` (`--mention "Name"`, repeatable, on
+the CLIs). A plain `@Name` typed into the text or an `<at>` tag with no matching Graph `mentions`
+array entry is just decoration — it does NOT ring anyone's bell. Getting someone's actual
+attention requires this feature, not typing their name.
+
+**WHEN to tag** — @-mention a person whenever:
+- they are named as a decision owner or action owner ("Shiv owns the migration"),
+- the message asks them something directly ("Johan, does this match what you expected?"),
+- they specifically need to be notified now, not just find the message later.
+
+**WHEN NOT to tag** — do NOT mention someone every time their name comes up in the narrative
+("as Shiv mentioned yesterday...", "this affects Bob's team too"). A name appearing in prose is
+not the same as that person needing to act. Tag at most the people who actually need to DO
+something with the message — notification fatigue is real: an inbox full of pings for messages
+that needed no response trains people to stop reading pings at all, which defeats the one thing
+a mention is for. One clear action-owner tag beats five drive-by name-checks.
+
+**The placeholder contract for `format: 'html'`**: since raw HTML is posted verbatim (no
+escaping, no rewriting), the server cannot infer where in your markup a mention belongs — you
+mark the spot yourself with a literal `@{Name}` token (e.g. `@{Shiv}`), matched case-insensitively
+against the `mentions` list you also pass. The server replaces each token with the real `<at
+id="N">...</at>` tag and the id it references in the parallel `mentions` request field. Every
+name you declare in `mentions` needs exactly one `@{Name}` token somewhere in the html, and every
+token needs a matching declared name — an orphaned mention (declared but never placed) or an
+orphaned token (placed but never declared, usually a typo) is refused rather than silently
+posted as literal `@{Shiv}` text with no notification behind it. `format: 'text'` needs no
+placeholder — write the person's plain name where you mean to mention them and the server finds
+that occurrence for you.
+
 ## Verified rendering vocabulary — all of these WORK
 
 | Construct | Notes |

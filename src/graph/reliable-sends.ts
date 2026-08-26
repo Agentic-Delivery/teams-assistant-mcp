@@ -1,9 +1,11 @@
 import { DEFAULT_THROTTLE_WINDOW_MS, GraphError, MAX_RETRY_SLEEP_MS } from './graph-client.js';
+import { renderHtmlWithMentions, renderTextWithMentions, type MentionTarget } from './mentions.js';
 import type {
   AttachmentPayload,
   ChatSummary,
   OutboundFile,
   OutboundImage,
+  PinnedMessage,
   TeamsChatsPort,
 } from './teams-chats.js';
 import { htmlToText, type ChatMessage, type ReadResult } from '../messages.js';
@@ -134,14 +136,30 @@ export class ReliableTeamsChats implements TeamsChatsPort {
     return this.inner.readMessages(chatId, since, limit);
   }
 
-  sendMessage(chatId: string, text: string): Promise<ChatMessage> {
-    return this.sendGuarded(chatId, text, 'whole-message', () =>
-      this.inner.sendMessage(chatId, text),
+  resolveMentions(chatId: string, names: readonly string[]): Promise<MentionTarget[]> {
+    // A pure read against the current member list — no send/duplicate hazard, so no guard.
+    return this.inner.resolveMentions(chatId, names);
+  }
+
+  sendMessage(chatId: string, text: string, mentions: readonly MentionTarget[] = []): Promise<ChatMessage> {
+    // A mention rewrites its occurrence in the text into an <at> tag whose readback shows the
+    // RESOLVED displayName ("Garg, Shivankit"), not the caller's search string ("Shiv") — so the
+    // match key has to be built the same way the actual send will render it (renderTextWithMentions,
+    // reduced through htmlToText same as any html readback), or a landed mention-bearing send would
+    // never match its own readback and retry into a real duplicate. Mirrors sendHtmlMessage's own
+    // reasoning below, just for the plain-text path.
+    const matchText = mentions.length > 0 ? htmlToText(renderTextWithMentions(text, mentions)) : text;
+    return this.sendGuarded(chatId, matchText, 'whole-message', () =>
+      this.inner.sendMessage(chatId, text, mentions),
     );
   }
 
-  sendHtmlMessage(chatId: string, html: string): Promise<ChatMessage> {
-    const matchText = htmlMatchText(html);
+  sendHtmlMessage(chatId: string, html: string, mentions: readonly MentionTarget[] = []): Promise<ChatMessage> {
+    // renderHtmlWithMentions is pure and deterministic, so recomputing it here (rather than
+    // threading the rendered string through) costs nothing and keeps this class ignorant of the
+    // send stack's inner shape — same reasoning as sendMessage above, applied before htmlMatchText.
+    const rendered = mentions.length > 0 ? renderHtmlWithMentions(html, mentions) : html;
+    const matchText = htmlMatchText(rendered);
     if (normalized(matchText) === '') {
       // html like '<img src="...">' or '<hr>' reduces to no text at all — there is no readback
       // key to guard with. Worse than merely "no retry": an EMPTY wanted string is a match
@@ -149,7 +167,7 @@ export class ReliableTeamsChats implements TeamsChatsPort {
       // by equality), so a genuinely failed send could claim an EARLIER own message — an
       // unrelated image, say — sent minutes ago as "this attempt's landed copy". Same shape as
       // sendImage's own comment below: one attempt, honest error, no blind retry.
-      return this.inner.sendHtmlMessage(chatId, html);
+      return this.inner.sendHtmlMessage(chatId, html, mentions);
     }
     // sendGuarded's second argument is the MATCH text, not necessarily what gets posted: a
     // landed copy's readback always comes back as htmlToText(body) (toChatMessage runs every
@@ -157,7 +175,7 @@ export class ReliableTeamsChats implements TeamsChatsPort {
     // would never match and every retry would re-post a duplicate. htmlMatchText reduces the
     // caller's html the same way (see its own doc comment for the empirically-found subtlety).
     return this.sendGuarded(chatId, matchText, 'whole-message', () =>
-      this.inner.sendHtmlMessage(chatId, html),
+      this.inner.sendHtmlMessage(chatId, html, mentions),
     );
   }
 
@@ -171,24 +189,41 @@ export class ReliableTeamsChats implements TeamsChatsPort {
     return this.inner.sendFile(chatId, file, text);
   }
 
-  replyToMessage(chatId: string, replyToMessageId: string, text: string): Promise<ChatMessage> {
+  replyToMessage(
+    chatId: string,
+    replyToMessageId: string,
+    text: string,
+    mentions: readonly MentionTarget[] = [],
+  ): Promise<ChatMessage> {
     // A landed reply's text carries the quoted original BEFORE our own words, so the match is
     // "ends with what we sent" — never containment, which the quoted original itself could
-    // satisfy when someone replies with words the original already contains.
-    return this.sendGuarded(chatId, text, 'reply-tail', () =>
-      this.inner.replyToMessage(chatId, replyToMessageId, text),
+    // satisfy when someone replies with words the original already contains. Same mentions
+    // reasoning as sendMessage above.
+    const matchText = mentions.length > 0 ? htmlToText(renderTextWithMentions(text, mentions)) : text;
+    return this.sendGuarded(chatId, matchText, 'reply-tail', () =>
+      this.inner.replyToMessage(chatId, replyToMessageId, text, mentions),
     );
   }
 
-  editMessage(chatId: string, messageId: string, newText: string): Promise<void> {
-    return this.inner.editMessage(chatId, messageId, newText);
+  editMessage(
+    chatId: string,
+    messageId: string,
+    newText: string,
+    mentions: readonly MentionTarget[] = [],
+  ): Promise<void> {
+    return this.inner.editMessage(chatId, messageId, newText, mentions);
   }
 
-  editHtmlMessage(chatId: string, messageId: string, html: string): Promise<void> {
+  editHtmlMessage(
+    chatId: string,
+    messageId: string,
+    html: string,
+    mentions: readonly MentionTarget[] = [],
+  ): Promise<void> {
     // A PATCH has no send/duplicate hazard to guard against — it targets an existing message
     // id, so there is nothing here for sendGuarded's readback dance to do. Same passthrough as
     // editMessage.
-    return this.inner.editHtmlMessage(chatId, messageId, html);
+    return this.inner.editHtmlMessage(chatId, messageId, html, mentions);
   }
 
   deleteMessage(chatId: string, messageId: string): Promise<void> {
@@ -207,6 +242,20 @@ export class ReliableTeamsChats implements TeamsChatsPort {
     attachmentId?: string,
   ): Promise<AttachmentPayload> {
     return this.inner.getAttachment(chatId, messageId, attachmentId);
+  }
+
+  pinMessage(chatId: string, messageId: string): Promise<PinnedMessage[]> {
+    // Pinning is idempotent in effect (a chat holds one pin regardless of how many times this
+    // lands), so there is nothing here for a readback guard to do.
+    return this.inner.pinMessage(chatId, messageId);
+  }
+
+  unpinMessage(chatId: string, messageId: string): Promise<void> {
+    return this.inner.unpinMessage(chatId, messageId);
+  }
+
+  listPinnedMessages(chatId: string): Promise<PinnedMessage[]> {
+    return this.inner.listPinnedMessages(chatId);
   }
 
   /**

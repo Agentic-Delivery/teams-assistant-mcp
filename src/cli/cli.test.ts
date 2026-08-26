@@ -9,7 +9,7 @@ import { ReliableTeamsChats } from '../graph/reliable-sends.js';
 import type { TeamsChatsPort } from '../graph/teams-chats.js';
 import type { ChatMessage, ReadResult } from '../messages.js';
 import { loadConfig } from '../config.js';
-import { doEdit, doPost, succeed } from './common.js';
+import { doEdit, doPost, parseSendFlags, succeed } from './common.js';
 
 const repoRoot = join(import.meta.dirname, '..', '..');
 const tsx = join(repoRoot, 'node_modules', '.bin', 'tsx');
@@ -172,6 +172,7 @@ describe('teams-post / teams-edit — the --html routing decision (in-process, n
     return {
       listChats: reject,
       readMessages: async () => ({ messages: [] }) as unknown as ReadResult,
+      resolveMentions: reject,
       sendMessage: reject,
       sendHtmlMessage: reject,
       sendImage: reject,
@@ -182,6 +183,9 @@ describe('teams-post / teams-edit — the --html routing decision (in-process, n
       deleteMessage: reject,
       setReaction: reject,
       getAttachment: reject,
+      pinMessage: reject,
+      unpinMessage: reject,
+      listPinnedMessages: reject,
       ...overrides,
     } as TeamsChatsPort;
   }
@@ -200,7 +204,7 @@ describe('teams-post / teams-edit — the --html routing decision (in-process, n
 
     const result = await doPost({ chats, allowlist }, '19:a@thread.v2', 'hello', false);
 
-    expect(sendMessage).toHaveBeenCalledWith('19:a@thread.v2', 'hello');
+    expect(sendMessage).toHaveBeenCalledWith('19:a@thread.v2', 'hello', []);
     expect(sendHtmlMessage).not.toHaveBeenCalled();
     expect(result).toEqual({ action: 'post', id: 'm1', chat: 'chat A' });
   });
@@ -215,7 +219,7 @@ describe('teams-post / teams-edit — the --html routing decision (in-process, n
 
     const result = await doPost({ chats, allowlist }, '19:a@thread.v2', '<b>hi</b>', true);
 
-    expect(sendHtmlMessage).toHaveBeenCalledWith('19:a@thread.v2', '<b>hi</b>');
+    expect(sendHtmlMessage).toHaveBeenCalledWith('19:a@thread.v2', '<b>hi</b>', []);
     expect(sendMessage).not.toHaveBeenCalled();
     expect(result).toEqual({ action: 'post', id: 'm2', chat: 'chat A' });
   });
@@ -230,7 +234,7 @@ describe('teams-post / teams-edit — the --html routing decision (in-process, n
 
     const result = await doEdit({ chats, allowlist }, '19:a@thread.v2', 'msg-1', 'corrected', false);
 
-    expect(editMessage).toHaveBeenCalledWith('19:a@thread.v2', 'msg-1', 'corrected');
+    expect(editMessage).toHaveBeenCalledWith('19:a@thread.v2', 'msg-1', 'corrected', []);
     expect(editHtmlMessage).not.toHaveBeenCalled();
     expect(result).toEqual({ action: 'edit', id: 'msg-1', chat: 'chat A' });
   });
@@ -251,9 +255,137 @@ describe('teams-post / teams-edit — the --html routing decision (in-process, n
       true,
     );
 
-    expect(editHtmlMessage).toHaveBeenCalledWith('19:a@thread.v2', 'msg-1', '<b>corrected</b>');
+    expect(editHtmlMessage).toHaveBeenCalledWith('19:a@thread.v2', 'msg-1', '<b>corrected</b>', []);
     expect(editMessage).not.toHaveBeenCalled();
     expect(result).toEqual({ action: 'edit', id: 'msg-1', chat: 'chat A' });
+  });
+
+  it('doPost with --mention resolves the name and forwards the resolved mention to sendMessage', async () => {
+    const resolveMentions = vi.fn(async () => [
+      { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+    ]);
+    const sendMessage = vi.fn(async () => stubMessage('m3'));
+    const chats = new ReliableTeamsChats(fakePort({ resolveMentions, sendMessage }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    await doPost({ chats, allowlist }, '19:a@thread.v2', 'Shiv please review', false, ['Shiv']);
+
+    expect(resolveMentions).toHaveBeenCalledWith('19:a@thread.v2', ['Shiv']);
+    expect(sendMessage).toHaveBeenCalledWith('19:a@thread.v2', 'Shiv please review', [
+      { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+    ]);
+  });
+
+  it('doPost with no --mention never calls resolveMentions', async () => {
+    const resolveMentions = vi.fn();
+    const sendMessage = vi.fn(async () => stubMessage('m4'));
+    const chats = new ReliableTeamsChats(fakePort({ resolveMentions, sendMessage }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    await doPost({ chats, allowlist }, '19:a@thread.v2', 'hello', false);
+
+    expect(resolveMentions).not.toHaveBeenCalled();
+  });
+
+  it('doEdit with --mention resolves the name and forwards it to editMessage', async () => {
+    const resolveMentions = vi.fn(async () => [
+      { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+    ]);
+    const editMessage = vi.fn(async () => undefined);
+    const chats = new ReliableTeamsChats(fakePort({ resolveMentions, editMessage }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    await doEdit({ chats, allowlist }, '19:a@thread.v2', 'msg-1', 'Shiv see above', false, ['Shiv']);
+
+    expect(editMessage).toHaveBeenCalledWith('19:a@thread.v2', 'msg-1', 'Shiv see above', [
+      { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+    ]);
+  });
+});
+
+describe('parseSendFlags — --html and repeatable --mention', () => {
+  it('finds no flags in an empty argv', () => {
+    expect(parseSendFlags([])).toEqual({ html: false, mentions: [], rest: [] });
+  });
+
+  it('finds a bare --html', () => {
+    expect(parseSendFlags(['--html'])).toEqual({ html: true, mentions: [], rest: [] });
+  });
+
+  it('collects one --mention', () => {
+    expect(parseSendFlags(['--mention', 'Shiv'])).toEqual({ html: false, mentions: ['Shiv'], rest: [] });
+  });
+
+  it('collects several repeated --mention flags, in order', () => {
+    expect(parseSendFlags(['--mention', 'Shiv', '--mention', 'Johan'])).toEqual({
+      html: false,
+      mentions: ['Shiv', 'Johan'],
+      rest: [],
+    });
+  });
+
+  it('mixes --html and --mention in any order', () => {
+    expect(parseSendFlags(['--mention', 'Shiv', '--html'])).toEqual({
+      html: true,
+      mentions: ['Shiv'],
+      rest: [],
+    });
+  });
+
+  it('leaves unrecognised arguments in rest, untouched', () => {
+    expect(parseSendFlags(['--weird', 'value'])).toEqual({ html: false, mentions: [], rest: ['--weird', 'value'] });
+  });
+});
+
+describe('teams-pin / teams-unpin — exit codes (subprocess)', () => {
+  it('teams-pin missing arguments: exit 2, stdout empty', async () => {
+    const result = await runCli('pin.ts', [], {});
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/usage/);
+  });
+
+  it('teams-pin a chat outside the allowlist: exit 3, stdout empty', async () => {
+    const result = await runCli('pin.ts', ['19:never-heard-of@thread.v2', 'm1'], fixtureEnv());
+
+    expect(result.code).toBe(3);
+    expect(result.stdout).toBe('');
+  });
+
+  it('teams-pin an allowlisted chat without canPost: exit 3, stdout empty', async () => {
+    const result = await runCli('pin.ts', ['19:readonly@thread.v2', 'm1'], fixtureEnv());
+
+    expect(result.code).toBe(3);
+    expect(result.stdout).toBe('');
+  });
+
+  it('teams-unpin missing arguments: exit 2, stdout empty', async () => {
+    const result = await runCli('unpin.ts', [], {});
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/usage/);
+  });
+
+  it('teams-unpin a chat outside the allowlist: exit 3, stdout empty', async () => {
+    const result = await runCli('unpin.ts', ['19:never-heard-of@thread.v2', 'm1'], fixtureEnv());
+
+    expect(result.code).toBe(3);
+    expect(result.stdout).toBe('');
+  });
+
+  it('teams-unpin an allowlisted chat without canPost: exit 3, stdout empty', async () => {
+    const result = await runCli('unpin.ts', ['19:readonly@thread.v2', 'm1'], fixtureEnv());
+
+    expect(result.code).toBe(3);
+    expect(result.stdout).toBe('');
   });
 });
 

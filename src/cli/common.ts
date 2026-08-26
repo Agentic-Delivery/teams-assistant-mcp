@@ -2,6 +2,7 @@ import { buildChats } from '../build-chats.js';
 import { ChatNotAllowedError, type ChatAllowlist } from '../allowlist.js';
 import { loadConfig } from '../config.js';
 import type { ReliableTeamsChats } from '../graph/reliable-sends.js';
+import type { MentionTarget } from '../graph/teams-chats.js';
 
 /**
  * Shared plumbing for the standalone CLIs (teams-post, teams-reply, teams-edit, teams-react,
@@ -24,6 +25,42 @@ export function buildContext(): CliContext {
 }
 
 /**
+ * Parses the flags teams-post and teams-edit share off their trailing argv: `--html` (a bare
+ * flag) and repeatable `--mention <name>` (one name per occurrence, in order). Anything else is
+ * left in `rest` untouched — callers that take positional args after the chat/message ids
+ * (none currently do) are free to inspect it.
+ */
+export function parseSendFlags(args: readonly string[]): { html: boolean; mentions: string[]; rest: string[] } {
+  let html = false;
+  const mentions: string[] = [];
+  const rest: string[] = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--html') {
+      html = true;
+    } else if (arg === '--mention') {
+      const value = args[i + 1];
+      if (value === undefined) usage('--mention needs a name');
+      mentions.push(value);
+      i += 1;
+    } else {
+      rest.push(arg as string);
+    }
+  }
+  return { html, mentions, rest };
+}
+
+/** Resolves --mention names against the chat's member list, or [] when none were given — same
+ *  as the MCP tools' resolveMentions/mentions plumbing in server.ts. */
+async function resolveMentions(
+  chats: CliContext['chats'],
+  chatId: string,
+  mentions: readonly string[],
+): Promise<MentionTarget[]> {
+  return mentions.length > 0 ? chats.resolveMentions(chatId, mentions) : [];
+}
+
+/**
  * teams-post's --html routing, pulled out of post.ts so it is unit-testable without a live
  * send: a subprocess test cannot distinguish "the --html branch runs" from "the flag was
  * ignored", because assertPostable always throws (or not) before either send path is ever
@@ -35,9 +72,13 @@ export async function doPost(
   chatId: string,
   text: string,
   html: boolean,
+  mentions: readonly string[] = [],
 ): Promise<{ action: 'post'; id: string; chat: string }> {
   const entry = allowlist.assertPostable(chatId);
-  const sent = html ? await chats.sendHtmlMessage(chatId, text) : await chats.sendMessage(chatId, text);
+  const resolved = await resolveMentions(chats, chatId, mentions);
+  const sent = html
+    ? await chats.sendHtmlMessage(chatId, text, resolved)
+    : await chats.sendMessage(chatId, text, resolved);
   return { action: 'post', id: sent.id, chat: entry.label };
 }
 
@@ -48,12 +89,14 @@ export async function doEdit(
   messageId: string,
   newText: string,
   html: boolean,
+  mentions: readonly string[] = [],
 ): Promise<{ action: 'edit'; id: string; chat: string }> {
   const entry = allowlist.assertPostable(chatId);
+  const resolved = await resolveMentions(chats, chatId, mentions);
   if (html) {
-    await chats.editHtmlMessage(chatId, messageId, newText);
+    await chats.editHtmlMessage(chatId, messageId, newText, resolved);
   } else {
-    await chats.editMessage(chatId, messageId, newText);
+    await chats.editMessage(chatId, messageId, newText, resolved);
   }
   return { action: 'edit', id: messageId, chat: entry.label };
 }

@@ -358,6 +358,300 @@ describe('teams chats over graph', () => {
 
     expect((await chats.listChats())[0]?.topic).toBe('Alice, Bob');
   });
+
+  it('keeps each member\'s AAD userId, not the membership id, alongside displayName', async () => {
+    // $expand=members carries BOTH a membership `id` (composite, useless for a mention) and a
+    // `userId` (the actual AAD id a mention needs) — see the live capture this fixture is based
+    // on (2026-08-25, /chats/{id}/members). Dropping userId here is exactly the bug a mention
+    // silently posting an <at> tag that never notifies would trace back to.
+    const fetchFn = vi.fn(async () =>
+      json({
+        value: [
+          {
+            id: '19:a@thread.v2',
+            chatType: 'group',
+            topic: 'Pilot',
+            members: [
+              { id: 'MEMBERSHIP-COMPOSITE-ID', displayName: 'Garg, Shivankit', userId: 'aad-shiv' },
+            ],
+          },
+        ],
+      }),
+    );
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
+    );
+
+    expect((await chats.listChats())[0]?.members).toEqual([
+      { id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+    ]);
+  });
+});
+
+describe('graph client — del()', () => {
+  it('DELETEs with no body and treats 204 as success', async () => {
+    const fetchFn = vi.fn(async () => new Response(null, { status: 204 }));
+    const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never });
+
+    await expect(client.del('/chats/x/pinnedMessages/pin-1')).resolves.toBeUndefined();
+
+    const [url, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('https://graph.microsoft.com/v1.0/chats/x/pinnedMessages/pin-1');
+    expect(init.method).toBe('DELETE');
+    expect(init.body).toBeUndefined();
+  });
+
+  it('surfaces a non-2xx DELETE as a GraphError, same as any other verb', async () => {
+    const fetchFn = vi.fn(async () => json({ error: { code: 'NotFound', message: 'not found' } }, 404));
+    const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never });
+
+    await expect(client.del('/chats/x/pinnedMessages/pin-1')).rejects.toThrow(/not found/);
+  });
+});
+
+describe('teams chats — @mentions', () => {
+  it('resolveMentions fetches /chats/{id}/members and resolves against it', async () => {
+    const fetchFn = vi.fn(async () =>
+      json({
+        value: [
+          { id: 'membership-1', displayName: 'Garg, Shivankit', userId: 'aad-shiv' },
+          { id: 'membership-2', displayName: 'Spännare, Johan', userId: 'aad-johan' },
+        ],
+      }),
+    );
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
+    );
+
+    const resolved = await chats.resolveMentions('19:a@thread.v2', ['Shiv']);
+
+    const [url] = fetchFn.mock.calls[0] as unknown as [string];
+    expect(url).toBe('https://graph.microsoft.com/v1.0/chats/19%3Aa%40thread.v2/members');
+    expect(resolved).toEqual([{ name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' }]);
+  });
+
+  it('sendMessage with mentions posts an <at> tag AND the parallel Graph mentions array', async () => {
+    const fetchFn = vi.fn(async () =>
+      json({ id: 'sent', createdDateTime: '2026-08-19T10:00:00Z', body: { content: 'x' } }),
+    );
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
+    );
+    const mention = { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' };
+
+    await chats.sendMessage('19:a@thread.v2', 'Shiv please review', [mention]);
+
+    const [, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as {
+      body: { content: string };
+      mentions: Array<{ id: number; mentionText: string; mentioned: { user: { id: string; displayName: string } } }>;
+    };
+    expect(body.body.content).toBe('<p><at id="0">Garg, Shivankit</at> please review</p>');
+    expect(body.mentions).toEqual([
+      { id: 0, mentionText: 'Garg, Shivankit', mentioned: { user: { id: 'aad-shiv', displayName: 'Garg, Shivankit' } } },
+    ]);
+  });
+
+  it('sendMessage without mentions posts no mentions array at all', async () => {
+    const fetchFn = vi.fn(async () =>
+      json({ id: 'sent', createdDateTime: '2026-08-19T10:00:00Z', body: { content: 'x' } }),
+    );
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
+    );
+
+    await chats.sendMessage('19:a@thread.v2', 'no mentions here');
+
+    const [, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as Record<string, unknown>;
+    expect('mentions' in body).toBe(false);
+  });
+
+  it('sendHtmlMessage replaces @{Name} placeholders and posts the mentions array', async () => {
+    const fetchFn = vi.fn(async () =>
+      json({ id: 'sent', createdDateTime: '2026-08-19T10:00:00Z', body: { content: 'x' } }),
+    );
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
+    );
+    const mention = { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' };
+
+    await chats.sendHtmlMessage('19:a@thread.v2', '<table><tr><td>@{Shiv}</td></tr></table>', [mention]);
+
+    const [, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as { body: { content: string }; mentions: unknown[] };
+    expect(body.body.content).toBe('<table><tr><td><at id="0">Garg, Shivankit</at></td></tr></table>');
+    expect(body.mentions).toHaveLength(1);
+  });
+
+  it('replyToMessage carries mentions on the reply text, not the quoted original', async () => {
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        json({
+          id: 'orig-1',
+          createdDateTime: '2026-08-19T08:00:00Z',
+          from: { user: { id: 'oid-9', displayName: 'Alice Anderson' } },
+          body: { contentType: 'html', content: '<p>Shiv already knows about this</p>' },
+        }),
+      )
+      .mockResolvedValueOnce(
+        json({ id: 'reply-1', createdDateTime: '2026-08-19T10:00:00Z', body: { content: 'x' } }),
+      );
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
+    );
+    const mention = { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' };
+
+    await chats.replyToMessage('19:a@thread.v2', 'orig-1', 'Shiv can you confirm?', [mention]);
+
+    const [, init] = fetchFn.mock.calls[1] as unknown as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as { body: { content: string } };
+    // The quote card is untouched html; only OUR text after it carries the <at> tag.
+    expect(body.body.content).toBe(
+      '<attachment id="orig-1"></attachment><p><at id="0">Garg, Shivankit</at> can you confirm?</p>',
+    );
+  });
+
+  it('editMessage and editHtmlMessage carry mentions through the PATCH body', async () => {
+    const fetchFn = vi.fn(async () => new Response(null, { status: 204 }));
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
+    );
+    const mention = { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' };
+
+    await chats.editMessage('19:a@thread.v2', 'm1', 'Shiv see above', [mention]);
+
+    const [, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as { body: { content: string }; mentions: unknown[] };
+    expect(body.body.content).toBe('<p><at id="0">Garg, Shivankit</at> see above</p>');
+    expect(body.mentions).toHaveLength(1);
+  });
+});
+
+describe('teams chats — pinned messages', () => {
+  it('listPinnedMessages GETs $expand=message and previews the body through html-to-text', async () => {
+    const fetchFn = vi.fn(async () =>
+      json({
+        value: [
+          {
+            id: 'pin-1',
+            message: { id: 'm1', body: { contentType: 'html', content: '<p>Deploy plan</p>' } },
+          },
+        ],
+      }),
+    );
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
+    );
+
+    const pinned = await chats.listPinnedMessages('19:a@thread.v2');
+
+    const [url] = fetchFn.mock.calls[0] as unknown as [string];
+    expect(url).toBe(
+      'https://graph.microsoft.com/v1.0/chats/19%3Aa%40thread.v2/pinnedMessages?$expand=message',
+    );
+    expect(pinned).toEqual([{ id: 'pin-1', messageId: 'm1', preview: 'Deploy plan' }]);
+  });
+
+  it('pinMessage POSTs message@odata.bind, then RE-LISTS rather than trusting the POST response', async () => {
+    // The single-pin-slot replace behaviour (verified live 2026-08-25) means the POST's own
+    // response is not proof of the resulting state — only a fresh list is.
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(json({ id: 'pin-2' }, 201))
+      .mockResolvedValueOnce(
+        json({
+          value: [{ id: 'pin-2', message: { id: 'm2', body: { contentType: 'text', content: 'later' } } }],
+        }),
+      );
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
+    );
+
+    const result = await chats.pinMessage('19:a@thread.v2', 'm2');
+
+    const [postUrl, postInit] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
+    expect(postUrl).toBe('https://graph.microsoft.com/v1.0/chats/19%3Aa%40thread.v2/pinnedMessages');
+    expect(JSON.parse(postInit.body as string)).toEqual({
+      'message@odata.bind':
+        'https://graph.microsoft.com/v1.0/chats/19%3Aa%40thread.v2/messages/m2',
+    });
+    const [listUrl] = fetchFn.mock.calls[1] as unknown as [string];
+    expect(listUrl).toContain('/pinnedMessages?$expand=message');
+    expect(result).toEqual([{ id: 'pin-2', messageId: 'm2', preview: 'later' }]);
+  });
+
+  it('unpinMessage resolves the message id to its PIN id via a list, then DELETEs the pin id', async () => {
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        json({
+          value: [{ id: 'pin-9', message: { id: 'm9', body: { contentType: 'text', content: 'x' } } }],
+        }),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
+    );
+
+    await chats.unpinMessage('19:a@thread.v2', 'm9');
+
+    const [deleteUrl, deleteInit] = fetchFn.mock.calls[1] as unknown as [string, RequestInit];
+    // The DELETE targets the PIN's id ("pin-9"), never the chat message id ("m9").
+    expect(deleteUrl).toBe(
+      'https://graph.microsoft.com/v1.0/chats/19%3Aa%40thread.v2/pinnedMessages/pin-9',
+    );
+    expect(deleteInit.method).toBe('DELETE');
+  });
+
+  it('unpinMessage refuses when the given message id is not the one currently pinned', async () => {
+    const fetchFn = vi.fn(async () =>
+      json({
+        value: [{ id: 'pin-9', message: { id: 'm9', body: { contentType: 'text', content: 'x' } } }],
+      }),
+    );
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
+    );
+
+    await expect(chats.unpinMessage('19:a@thread.v2', 'not-pinned')).rejects.toThrow(
+      /not currently pinned/,
+    );
+    expect(fetchFn).toHaveBeenCalledTimes(1); // no DELETE was ever attempted
+  });
+
+  it('listPinnedMessages reads a 404 as "nothing pinned", not as a failure (verified live 2026-08-26)', async () => {
+    // Empirical, undocumented Graph behaviour: GET .../pinnedMessages on a chat with zero pins
+    // answers a bare 404 "NotFound" rather than 200 with an empty value array — caught live by
+    // pinning, unpinning the chat's only pin, then listing again. Every other call on the same
+    // chatId (including the unpin that just ran) keeps succeeding, so the 404 here means "no
+    // pins", not "chat not found".
+    const fetchFn = vi.fn(async () => json({ error: { code: 'NotFound', message: 'NotFound' } }, 404));
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
+    );
+
+    await expect(chats.listPinnedMessages('19:a@thread.v2')).resolves.toEqual([]);
+  });
+
+  it('unpinMessage still refuses cleanly when the chat has nothing pinned at all (the 404-as-empty path)', async () => {
+    const fetchFn = vi.fn(async () => json({ error: { code: 'NotFound', message: 'NotFound' } }, 404));
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
+    );
+
+    await expect(chats.unpinMessage('19:a@thread.v2', 'm1')).rejects.toThrow(/not currently pinned/);
+  });
+
+  it('a non-404 listPinnedMessages failure is NOT swallowed — only 404 means "empty"', async () => {
+    const fetchFn = vi.fn(async () => json({ error: { code: 'Forbidden', message: 'nope' } }, 403));
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
+    );
+
+    await expect(chats.listPinnedMessages('19:a@thread.v2')).rejects.toThrow(/nope/);
+  });
 });
 
 describe('graph client — empty-success bodies (the 11-copy broadcast incident, 2026-08-24)', () => {
