@@ -8,10 +8,11 @@ import type { ChatSummary } from './graph/teams-chats.js';
 const MAX_NAMES = 6;
 
 export function formatChat(chat: ChatSummary): string {
-  const shown = chat.members.slice(0, MAX_NAMES).join(', ');
-  const overflow = chat.members.length - MAX_NAMES;
+  const names = chat.members.map((member) => member.displayName);
+  const shown = names.slice(0, MAX_NAMES).join(', ');
+  const overflow = names.length - MAX_NAMES;
   const members =
-    chat.members.length === 0 ? '(none visible)' : overflow > 0 ? `${shown}, +${overflow} more` : shown;
+    names.length === 0 ? '(none visible)' : overflow > 0 ? `${shown}, +${overflow} more` : shown;
   return [
     chat.id,
     `  type     ${chat.chatType}`,
