@@ -119,14 +119,97 @@ describe('GraphTeamsChats.resolveMentions — member cache (0.4.1, live-diagnose
     expect(calls).toHaveLength(1);
   });
 
-  it('without a members cache configured, resolveMentions falls back to the plain uncached call (back-compat)', async () => {
+  // 0.4.1 review round 1: the catch around a cache hit used to be unconditional, so an AMBIGUOUS
+  // or EMPTY-NAME caller error (which a refresh cannot fix) silently spent a Graph call and only
+  // then surfaced the same error — or, worse, a different one if the refresh happened to fail.
+  it('an ambiguous name against the cached roster rethrows immediately — no refresh call spent on a caller error', async () => {
+    const cache = new MembersCache({ path });
+    cache.set(CHAT, [
+      { id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+      { id: 'aad-shiv2', displayName: 'Shivam, Kumar' },
+    ]);
     const { fetchFn, calls } = countingMembersFetch(membersPage);
-    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch });
-    const chats = new GraphTeamsChats(graph);
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
 
-    const resolved = await chats.resolveMentions(CHAT, ['Shiv']);
+    await expect(chats.resolveMentions(CHAT, ['Shiv'])).rejects.toThrow(/ambiguous/);
+    expect(calls).toHaveLength(0);
+  });
 
-    expect(resolved).toEqual([{ name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' }]);
-    expect(calls).toHaveLength(1);
+  it('an empty mention name rethrows immediately — no refresh call spent on a caller error', async () => {
+    const cache = new MembersCache({ path });
+    cache.set(CHAT, [{ id: 'aad-shiv', displayName: 'Garg, Shivankit' }]);
+    const { fetchFn, calls } = countingMembersFetch(membersPage);
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    await expect(chats.resolveMentions(CHAT, ['   '])).rejects.toThrow(/cannot be empty/);
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe('buildChats — the composition actually wires the members cache (0.4.1 review round 1)', () => {
+  // MAJOR 1: an optional membersCache let the wiring in build-chats.ts be silently dropped with
+  // no test noticing (mutation-verified: deleting the wiring left the full suite green). This
+  // test drives a mention resolution through the REAL composition buildChats returns — not a
+  // hand-built GraphTeamsChats — so a future regression here can only pass by actually reaching
+  // Graph's /members endpoint, which the counting fetchFn below would then catch.
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'build-chats-members-'));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('a pre-warmed cache at config.membersCachePath resolves a mention through buildChats() with ZERO /members calls', async () => {
+    const { loadConfig } = await import('../config.js');
+    const { buildChats } = await import('../build-chats.js');
+    const configPath = join(dir, 'teams-mcp.config.json');
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(
+      configPath,
+      JSON.stringify({ allowedChats: [{ id: CHAT, label: 'pilot', canPost: true }] }),
+    );
+    const config = loadConfig({
+      TEAMS_MCP_CONFIG: configPath,
+      TEAMS_MCP_TENANT_ID: 'tenant',
+      TEAMS_MCP_USERNAME: 'assistant@example.com',
+      TEAMS_MCP_PASSWORD: 'secret',
+      TEAMS_MCP_TOKEN_CACHE: join(dir, '.token-cache.json'),
+    });
+
+    // Pre-warm exactly where buildChats will look for it.
+    new MembersCache({ path: config.membersCachePath }).set(CHAT, [
+      { id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+    ]);
+
+    const { calls } = countingMembersFetch(membersPage);
+    const failEverythingElse = vi.fn(async () => {
+      throw new Error('this test only exercises resolveMentions — nothing else should be called');
+    });
+    // buildChats wires its own GraphClient from RopcTokenProvider internals we cannot inject a
+    // fetchFn into directly, so this proves the cache wiring the only honest way available at
+    // this seam: resolveMentions must never reach the network at all on a cache hit, regardless
+    // of what fetchFn would have answered — swap the global fetch for the test's duration.
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      if (String(url).includes('/members')) {
+        calls.push(String(url));
+        return membersPage();
+      }
+      return failEverythingElse(url, init);
+    }) as typeof fetch;
+    try {
+      const { chats, tokenProvider } = buildChats(config);
+      vi.spyOn(tokenProvider, 'getAccessToken').mockResolvedValue('fake-token');
+
+      const resolved = await chats.resolveMentions(CHAT, ['Shiv']);
+
+      expect(resolved).toEqual([{ name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' }]);
+      expect(calls).toHaveLength(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

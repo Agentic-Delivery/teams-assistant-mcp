@@ -1,9 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 import { GraphClient, GraphError } from './graph-client.js';
 import { ReliableTeamsChats } from './reliable-sends.js';
-import { GraphTeamsChats, type MentionTarget, type TeamsChatsPort } from './teams-chats.js';
+import { GraphTeamsChats, type MembersCachePort, type MentionTarget, type TeamsChatsPort } from './teams-chats.js';
 import type { TokenProvider } from '../auth/token-provider.js';
 import { toChatMessage, type ChatMessage, type ReadResult } from '../messages.js';
+
+// None of this file's "real assembly" describe blocks touch mention resolution; membersCache is
+// a required GraphTeamsChats dependency (0.4.1 review round 1), so a trivial no-op double stands
+// in everywhere below, module-scoped so every describe block can see it.
+const noMembersCache: MembersCachePort = { get: () => undefined, set: () => {} };
 
 function message(overrides: Partial<ChatMessage>): ChatMessage {
   return {
@@ -576,7 +581,7 @@ describe('the real assembly — GraphClient + GraphTeamsChats + ReliableTeamsCha
       sleepFn: async (ms) => { sleeps.push(ms); now += ms; },
       nowFn: () => now,
     });
-    const chats = new ReliableTeamsChats(new GraphTeamsChats(client), {
+    const chats = new ReliableTeamsChats(new GraphTeamsChats(client, { membersCache: noMembersCache }), {
       selfDisplayName: 'Assistant',
       sleepFn: async (ms) => { sleeps.push(ms); now += ms; },
       nowFn: () => new Date(now),
@@ -608,7 +613,7 @@ describe('the real assembly — GraphClient + GraphTeamsChats + ReliableTeamsCha
     });
     let now = Date.parse('2026-08-25T06:00:00Z');
     const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async (ms) => { now += ms; }, nowFn: () => now, readRetries: 0 });
-    const chats = new ReliableTeamsChats(new GraphTeamsChats(client), { selfDisplayName: 'Assistant', sleepFn: async () => { /* no clock advance: the gate stays closed */ }, nowFn: () => new Date(now) });
+    const chats = new ReliableTeamsChats(new GraphTeamsChats(client, { membersCache: noMembersCache }), { selfDisplayName: 'Assistant', sleepFn: async () => { /* no clock advance: the gate stays closed */ }, nowFn: () => new Date(now) });
 
     const error = (await chats.sendMessage('19:a@thread.v2', 'hello').catch((c: unknown) => c)) as GraphError;
 
@@ -660,7 +665,7 @@ describe('the real assembly — round 2', () => {
     const sleeps: number[] = [];
     const sleepFn = async (ms: number) => { sleeps.push(ms); if (opts.advance) now += ms; };
     const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn, nowFn: () => now, readRetries: 0 });
-    const chats = new ReliableTeamsChats(new GraphTeamsChats(client), { selfDisplayName: 'Assistant', sleepFn, nowFn: () => new Date(now) });
+    const chats = new ReliableTeamsChats(new GraphTeamsChats(client, { membersCache: noMembersCache }), { selfDisplayName: 'Assistant', sleepFn, nowFn: () => new Date(now) });
     return { chats, sleeps };
   }
 
@@ -723,7 +728,7 @@ describe('the real assembly — MessageFetchThrottled through the decorator', ()
     });
     let now = 0;
     const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async (ms) => { sleeps.push(ms); now += ms; }, nowFn: () => now });
-    const chats = new ReliableTeamsChats(new GraphTeamsChats(client), { selfDisplayName: 'Assistant', sleepFn: async (ms) => { sleeps.push(ms); now += ms; }, nowFn: () => new Date(now) });
+    const chats = new ReliableTeamsChats(new GraphTeamsChats(client, { membersCache: noMembersCache }), { selfDisplayName: 'Assistant', sleepFn: async (ms) => { sleeps.push(ms); now += ms; }, nowFn: () => new Date(now) });
 
     const error = (await chats.replyToMessage('19:a@thread.v2', 'old-id', 'hi').catch((c: unknown) => c)) as GraphError;
 

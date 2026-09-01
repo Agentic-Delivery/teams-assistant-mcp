@@ -1,9 +1,16 @@
 import { describe, expect, it, vi } from 'vitest';
 import { GraphClient, GraphError } from './graph-client.js';
+import type { MembersCachePort } from './teams-chats.js';
 import { GraphTeamsChats } from './teams-chats.js';
 import type { TokenProvider } from '../auth/token-provider.js';
 
 const stubToken: TokenProvider = { kind: 'stub', getAccessToken: async () => 'the-token' };
+
+// membersCache is a required GraphTeamsChats dependency (0.4.1 review: an optional cache let
+// production silently fall back to the throttled /members endpoint with no test noticing). None
+// of the behaviour in THIS file touches mention resolution, so every construction below wires a
+// trivial no-op double — the member-cache behaviour itself is covered in teams-chats.test.ts.
+const noMembersCache: MembersCachePort = { get: () => undefined, set: () => {} };
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -69,8 +76,7 @@ describe('teams chats over graph', () => {
       json({ id: 'sent', createdDateTime: '2026-08-19T10:00:00Z', body: { content: 'Hi' } }),
     );
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     await chats.sendMessage('19:a@thread.v2', 'Hi\nsee https://example.com/plan');
 
@@ -105,8 +111,7 @@ describe('teams chats over graph', () => {
         }),
       );
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     const payload = await chats.getAttachment('19:a@thread.v2', 'm1');
 
@@ -146,8 +151,7 @@ describe('teams chats over graph', () => {
         }),
       );
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     const payload = await chats.getAttachment('19:a@thread.v2', 'm2');
 
@@ -164,8 +168,7 @@ describe('teams chats over graph', () => {
       json({ id: 'sent', createdDateTime: '2026-08-19T10:00:00Z', body: { content: '<img …>' } }),
     );
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     await chats.sendImage(
       '19:a@thread.v2',
@@ -208,8 +211,7 @@ describe('teams chats over graph', () => {
       );
     const chats = new GraphTeamsChats(
       new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-      { uploadDir: 'ai-test' },
-    );
+      { membersCache: noMembersCache, uploadDir: 'ai-test' });
 
     await chats.sendFile(
       '19:a@thread.v2',
@@ -255,8 +257,7 @@ describe('teams chats over graph', () => {
         json({ id: 'reply-1', createdDateTime: '2026-08-19T10:00:00Z', body: { content: 'Here' } }),
       );
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     await chats.replyToMessage('19:a@thread.v2', 'orig-1', 'In the ai-test folder');
 
@@ -284,8 +285,7 @@ describe('teams chats over graph', () => {
   it('edits a message with a PATCH carrying the replacement body', async () => {
     const fetchFn = vi.fn(async () => new Response(null, { status: 204 }));
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     await chats.editMessage('19:a@thread.v2', 'm7', 'corrected text');
 
@@ -300,8 +300,7 @@ describe('teams chats over graph', () => {
   it('soft-deletes a message through the /me softDelete action, with no body', async () => {
     const fetchFn = vi.fn(async () => new Response(null, { status: 204 }));
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     await chats.deleteMessage('19:a@thread.v2', 'm7');
 
@@ -318,8 +317,7 @@ describe('teams chats over graph', () => {
       json({ error: { code: 'Forbidden', message: 'User is not the sender of the message' } }, 403),
     );
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     await expect(chats.editMessage('19:a@thread.v2', 'not-mine', 'x')).rejects.toThrow(
       /not the sender/,
@@ -329,8 +327,7 @@ describe('teams chats over graph', () => {
   it('refuses to share a file when OneDrive returns no usable eTag', async () => {
     const fetchFn = vi.fn(async () => json({ id: 'ITEM-ID', name: 'notes.txt' }));
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     await expect(
       chats.sendFile('19:a@thread.v2', { bytes: new Uint8Array([1]), name: 'notes.txt' }),
@@ -353,8 +350,7 @@ describe('teams chats over graph', () => {
       }),
     );
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     expect((await chats.listChats())[0]?.topic).toBe('Alice, Bob');
   });
@@ -379,8 +375,7 @@ describe('teams chats over graph', () => {
       }),
     );
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     expect((await chats.listChats())[0]?.members).toEqual([
       { id: 'aad-shiv', displayName: 'Garg, Shivankit' },
@@ -420,8 +415,7 @@ describe('teams chats — @mentions', () => {
       }),
     );
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     const resolved = await chats.resolveMentions('19:a@thread.v2', ['Shiv']);
 
@@ -447,8 +441,7 @@ describe('teams chats — @mentions', () => {
         json({ value: [{ id: 'membership-2', displayName: 'Garg, Shivankit', userId: 'aad-shiv' }] }),
       );
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     const resolved = await chats.resolveMentions('19:a@thread.v2', ['Shiv']);
 
@@ -461,8 +454,7 @@ describe('teams chats — @mentions', () => {
       json({ id: 'sent', createdDateTime: '2026-08-19T10:00:00Z', body: { content: 'x' } }),
     );
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
     const mention = { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' };
 
     await chats.sendMessage('19:a@thread.v2', 'Shiv please review', [mention]);
@@ -483,8 +475,7 @@ describe('teams chats — @mentions', () => {
       json({ id: 'sent', createdDateTime: '2026-08-19T10:00:00Z', body: { content: 'x' } }),
     );
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     await chats.sendMessage('19:a@thread.v2', 'no mentions here');
 
@@ -498,8 +489,7 @@ describe('teams chats — @mentions', () => {
       json({ id: 'sent', createdDateTime: '2026-08-19T10:00:00Z', body: { content: 'x' } }),
     );
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
     const mention = { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' };
 
     await chats.sendHtmlMessage('19:a@thread.v2', '<table><tr><td>@{Shiv}</td></tr></table>', [mention]);
@@ -525,8 +515,7 @@ describe('teams chats — @mentions', () => {
         json({ id: 'reply-1', createdDateTime: '2026-08-19T10:00:00Z', body: { content: 'x' } }),
       );
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
     const mention = { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' };
 
     await chats.replyToMessage('19:a@thread.v2', 'orig-1', 'Shiv can you confirm?', [mention]);
@@ -542,8 +531,7 @@ describe('teams chats — @mentions', () => {
   it('editMessage and editHtmlMessage carry mentions through the PATCH body', async () => {
     const fetchFn = vi.fn(async () => new Response(null, { status: 204 }));
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
     const mention = { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' };
 
     await chats.editMessage('19:a@thread.v2', 'm1', 'Shiv see above', [mention]);
@@ -568,8 +556,7 @@ describe('teams chats — pinned messages', () => {
       }),
     );
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     const pinned = await chats.listPinnedMessages('19:a@thread.v2');
 
@@ -592,8 +579,7 @@ describe('teams chats — pinned messages', () => {
         }),
       );
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     const result = await chats.pinMessage('19:a@thread.v2', 'm2');
 
@@ -618,8 +604,7 @@ describe('teams chats — pinned messages', () => {
       )
       .mockResolvedValueOnce(new Response(null, { status: 204 }));
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     await chats.unpinMessage('19:a@thread.v2', 'm9');
 
@@ -638,8 +623,7 @@ describe('teams chats — pinned messages', () => {
       }),
     );
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     await expect(chats.unpinMessage('19:a@thread.v2', 'not-pinned')).rejects.toThrow(
       /not currently pinned/,
@@ -655,8 +639,7 @@ describe('teams chats — pinned messages', () => {
     // pins", not "chat not found".
     const fetchFn = vi.fn(async () => json({ error: { code: 'NotFound', message: 'NotFound' } }, 404));
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     await expect(chats.listPinnedMessages('19:a@thread.v2')).resolves.toEqual([]);
   });
@@ -664,8 +647,7 @@ describe('teams chats — pinned messages', () => {
   it('unpinMessage still refuses cleanly when the chat has nothing pinned at all (the 404-as-empty path)', async () => {
     const fetchFn = vi.fn(async () => json({ error: { code: 'NotFound', message: 'NotFound' } }, 404));
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     await expect(chats.unpinMessage('19:a@thread.v2', 'm1')).rejects.toThrow(/not currently pinned/);
   });
@@ -673,8 +655,7 @@ describe('teams chats — pinned messages', () => {
   it('a non-404 listPinnedMessages failure is NOT swallowed — only 404 means "empty"', async () => {
     const fetchFn = vi.fn(async () => json({ error: { code: 'Forbidden', message: 'nope' } }, 403));
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     await expect(chats.listPinnedMessages('19:a@thread.v2')).rejects.toThrow(/nope/);
   });
@@ -813,8 +794,7 @@ describe('reactions', () => {
   it('setReaction posts the bare payload and accepts the 204 answer', async () => {
     const fetchFn = vi.fn(async () => new Response(null, { status: 204 }));
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-    );
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     await expect(chats.setReaction('19:a@thread.v2', 'msg-1', '👍')).resolves.toBeUndefined();
 
@@ -958,7 +938,7 @@ describe('teams chats — single-message fetch falls back to the list under thro
       return json({ value: [raw('other', 'x'), raw('1787644105434', 'Logo:')] });
     });
     const sleeps: number[] = [];
-    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async (ms) => void sleeps.push(ms), nowFn: () => 0 }));
+    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async (ms) => void sleeps.push(ms), nowFn: () => 0 }), { membersCache: noMembersCache });
 
     const sent = await chats.replyToMessage('19:a@thread.v2', '1787644105434', 'Takk!');
 
@@ -973,7 +953,7 @@ describe('teams chats — single-message fetch falls back to the list under thro
 
   it('replyToMessage: not in the last 50 either → a named MessageFetchThrottled error, nothing posted', async () => {
     const fetchFn = vi.fn(async (url: string) => (url.endsWith('/messages/old-id') ? throttled() : json({ value: [raw('other', 'x')] })));
-    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }));
+    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }), { membersCache: noMembersCache });
 
     await expect(chats.replyToMessage('19:a@thread.v2', 'old-id', 'hi')).rejects.toMatchObject({ code: 'MessageFetchThrottled', status: 429, retryAfterSeconds: 60 });
     expect(fetchFn.mock.calls.some(([, init]) => (init as RequestInit)?.method === 'POST')).toBe(false);
@@ -1020,7 +1000,7 @@ describe('teams chats — getAttachment under the single-message throttle', () =
       if (url.includes('/hostedContents/')) return new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { 'content-type': 'image/png' } });
       return json({ value: [listed] });
     });
-    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }));
+    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }), { membersCache: noMembersCache });
 
     const payload = await chats.getAttachment('19:a@thread.v2', 'm-1', 'att-1');
 
@@ -1048,7 +1028,7 @@ describe('teams chats — the fallback is for throttles only (the non-triggering
       if (url.endsWith('/messages/gone')) return new Response(JSON.stringify({ error: { code: 'NotFound', message: 'Message not found' } }), { status: 404, headers: { 'content-type': 'application/json' } });
       return json({ value: [] });
     });
-    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }));
+    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }), { membersCache: noMembersCache });
 
     await expect(chats.replyToMessage('19:a@thread.v2', 'gone', 'hi')).rejects.toMatchObject({ status: 404, code: 'NotFound' });
     expect(fetchFn).toHaveBeenCalledTimes(1);
@@ -1064,7 +1044,7 @@ describe('teams chats — getAttachment without an id skips the quote card', () 
       if (url.includes('/shares/')) return new Response(new Uint8Array([7, 7]), { status: 200, headers: { 'content-type': 'image/png' } });
       return json({ value: [msg] });
     });
-    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }));
+    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }), { membersCache: noMembersCache });
 
     const payload = await chats.getAttachment('19:a@thread.v2', 'm-2');
 
@@ -1079,7 +1059,7 @@ describe('teams chats — a quoted reply with no file says so honestly', () => {
     const msg = { id: 'm-3', createdDateTime: '2026-08-25T07:48:25Z', from: { user: { displayName: 'Celine', id: 'u1' } }, body: { contentType: 'html', content: 'see above' },
       attachments: [{ id: 'quote-1', contentType: 'messageReference', name: null, contentUrl: null }] };
     const fetchFn = vi.fn(async () => json(msg));
-    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }));
+    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }), { membersCache: noMembersCache });
 
     await expect(chats.getAttachment('19:a@thread.v2', 'm-3')).rejects.toThrow(/only a quoted-message card/);
     expect(fetchFn.mock.calls.some(([url]) => String(url).includes('/hostedContents/'))).toBe(false);
