@@ -7,6 +7,7 @@ import {
   type ChatMember,
   type MentionTarget,
 } from './mentions.js';
+import { MembersCache } from './members-cache.js';
 import { textToHtml } from '../formatting.js';
 import { type ChatMessage, type ReadResult, applyWatermark, htmlToText, toChatMessage } from '../messages.js';
 
@@ -120,6 +121,13 @@ interface GraphDriveItem {
 export interface GraphTeamsChatsOptions {
   /** OneDrive folder (under the account's drive root) where outbound files are uploaded. */
   uploadDir?: string;
+  /**
+   * Disk-persisted per-chat membership cache — see members-cache.ts's doc comment for why this
+   * exists (0.4.1: a shared Graph throttle budget on `/members` starved mention resolution).
+   * Optional for back-compat with direct construction in tests; production wiring always
+   * supplies one (build-chats.ts).
+   */
+  membersCache?: MembersCache;
 }
 
 export const DEFAULT_UPLOAD_DIR = 'ai-test';
@@ -166,12 +174,14 @@ function toPinnedMessage(entry: GraphPinnedMessage): PinnedMessage | undefined {
 
 export class GraphTeamsChats implements TeamsChatsPort {
   private readonly uploadDir: string;
+  private readonly membersCache: MembersCache | undefined;
 
   constructor(
     private readonly graph: GraphClient,
     options: GraphTeamsChatsOptions = {},
   ) {
     this.uploadDir = options.uploadDir?.trim() || DEFAULT_UPLOAD_DIR;
+    this.membersCache = options.membersCache;
   }
 
   async listChats(): Promise<ChatSummary[]> {
@@ -214,8 +224,44 @@ export class GraphTeamsChats implements TeamsChatsPort {
     });
   }
 
+  /**
+   * Cache-first: a hit resolves every name against the on-disk roster with ZERO Graph calls. A
+   * miss — no cache, an expired entry, or a name the cached roster does not have — refreshes ONCE
+   * (a single `/members` call, never a retry loop) and re-checks against the fresh roster; a name
+   * still unresolved after that gets resolveMentionTargets's own clear error. A 429 on that
+   * refresh is never swallowed into "no match" — it surfaces as its own THROTTLED error naming
+   * Retry-After, so a caller sees a throttle, not a false "no such member" (0.4.1, live-diagnosed:
+   * this endpoint shares a throttle budget with another daemon on the same first-party client id).
+   */
   async resolveMentions(chatId: string, names: readonly string[]): Promise<MentionTarget[]> {
-    return resolveMentionTargets(names, await this.membersOf(chatId));
+    const cache = this.membersCache;
+    if (!cache) {
+      return resolveMentionTargets(names, await this.membersOf(chatId));
+    }
+    const cached = cache.get(chatId);
+    if (cached) {
+      try {
+        return resolveMentionTargets(names, cached);
+      } catch {
+        // Fall through to a single refresh — see doc comment above.
+      }
+    }
+    const fresh = await this.membersOf(chatId).catch((caught: unknown) => {
+      if (caught instanceof GraphError && caught.status === 429) {
+        const named = caught.retryAfterSeconds !== undefined ? ` — retry after ${caught.retryAfterSeconds}s` : '';
+        throw new GraphError(
+          `THROTTLED: member list refresh for mention resolution was throttled${named}; ` +
+            'nothing was resolved. Wait the named window and try again — this does not mean the ' +
+            'name does not exist.',
+          429,
+          'MembersRefreshThrottled',
+          caught.retryAfterSeconds,
+        );
+      }
+      throw caught;
+    });
+    cache.set(chatId, fresh);
+    return resolveMentionTargets(names, fresh);
   }
 
   async readMessages(chatId: string, since?: string, limit = 50): Promise<ReadResult> {

@@ -1,6 +1,8 @@
 import { FileTokenCache } from './auth/token-cache.js';
 import { RopcTokenProvider } from './auth/ropc-token-provider.js';
+import type { TokenProvider } from './auth/token-provider.js';
 import { GraphClient } from './graph/graph-client.js';
+import { MembersCache } from './graph/members-cache.js';
 import { GraphTeamsChats, type GraphTeamsChatsOptions } from './graph/teams-chats.js';
 import { ReliableTeamsChats } from './graph/reliable-sends.js';
 import type { TeamsMcpConfig } from './config.js';
@@ -14,6 +16,9 @@ export interface ChatsStack {
   chats: ReliableTeamsChats;
   /** The raw client, for the few callers that need Graph beyond chats (the inbox poller's /me). */
   graph: GraphClient;
+  /** Exposed so a caller (the inbox poller's stuck-auth recovery, 0.4.1) can force a re-mint
+   *  without reaching back into this module's private wiring. */
+  tokenProvider: TokenProvider;
 }
 
 export function buildChats(
@@ -28,10 +33,12 @@ export function buildChats(
     cache: new FileTokenCache(config.tokenCachePath),
   });
   const graph = new GraphClient({ tokenProvider });
+  const membersCache = new MembersCache({ path: config.membersCachePath, ttlMs: config.membersTtlMs });
   // Readback-before-retry on every send: a failure report is a claim about the response path,
   // not the chat, and re-sending without checking is how one broadcast became eleven.
-  const chats = new ReliableTeamsChats(new GraphTeamsChats(graph, options), {
-    selfDisplayName: config.assistantDisplayName,
-  });
-  return { chats, graph };
+  const chats = new ReliableTeamsChats(
+    new GraphTeamsChats(graph, { ...options, membersCache: options.membersCache ?? membersCache }),
+    { selfDisplayName: config.assistantDisplayName },
+  );
+  return { chats, graph, tokenProvider };
 }
