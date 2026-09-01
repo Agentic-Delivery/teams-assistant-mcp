@@ -16,6 +16,16 @@ export interface TokenProvider {
    * identity provider when the cached token is expired or missing.
    */
   getAccessToken(): Promise<string>;
+
+  /**
+   * Forces the NEXT getAccessToken() to drop any cached token and re-authenticate from scratch,
+   * regardless of what the cache's own expiry says. Exists for a live-diagnosed stuck-auth mode
+   * (0.4.1): a cached token can go bad server-side (revoked, conditional-access change) without
+   * the local clock ever knowing, and a provider that only ever checks its own expiry would keep
+   * handing out the same dead token forever. Optional — a provider with nothing cache-shaped to
+   * invalidate may omit it.
+   */
+  invalidate?(): void;
 }
 
 export class AuthenticationError extends Error {

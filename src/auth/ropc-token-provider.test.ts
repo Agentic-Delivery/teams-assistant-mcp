@@ -116,6 +116,26 @@ describe('ROPC token provider', () => {
     );
   });
 
+  it('invalidate() forces the next call to drop the cached token and re-run ROPC, even though it has not locally expired (0.4.1)', async () => {
+    const grants: string[] = [];
+    const fetchFn = vi.fn(async (_url: string, init: RequestInit) => {
+      const grant = new URLSearchParams(init.body as string).get('grant_type') ?? '';
+      grants.push(grant);
+      return tokenResponse({ access_token: `tok-${grants.length}`, expires_in: 3600 });
+    });
+    const subject = provider(fetchFn as unknown as typeof fetch);
+
+    expect(await subject.getAccessToken()).toBe('tok-1');
+    expect(await subject.getAccessToken()).toBe('tok-1'); // still fresh by the clock: no re-auth
+
+    subject.invalidate?.();
+    expect(await subject.getAccessToken()).toBe('tok-2');
+
+    // A forced re-auth is a full password grant, not a refresh_token exchange: the cached token
+    // (however it went bad — a live 401 the clock doesn't know about) is dropped outright.
+    expect(grants).toEqual(['password', 'password']);
+  });
+
   it('is substitutable — anything satisfying TokenProvider works in its place', async () => {
     const deviceCodeLookalike: TokenProvider = {
       kind: 'device-code',
