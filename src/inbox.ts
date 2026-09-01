@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type { ChatAllowlist } from './allowlist.js';
 import type { TeamsChatsPort } from './graph/teams-chats.js';
@@ -36,8 +36,13 @@ export interface InboxPollerDeps {
 }
 
 interface ChatState {
-  /** ISO-8601 createdDateTime of the newest delivered message; exclusive, like read watermarks. */
-  watermark: string;
+  /**
+   * ISO-8601 createdDateTime of the newest delivered message; exclusive, like read watermarks.
+   * Optional: a chat that has been polled at least once but never had a message yet has an
+   * entry with no watermark — see the bootstrap comment in pollOnce for why this differs from
+   * having no entry at all.
+   */
+  watermark?: string;
   /** Id of that newest message, so an exact replay is dropped even if the port re-serves it. */
   lastId?: string;
 }
@@ -127,9 +132,20 @@ export class InboxPoller {
         }
         attempted += 1;
         const known = this.state[entry.id];
+        // 0.4.1 (live-diagnosed: a restart was observed replaying ~40 old messages): no entry on
+        // record for this chat means "history unknown to THIS process" — not "chat is empty" —
+        // whether that is because the sidecar was lost, corrupted, or this is a genuinely fresh
+        // install. Backfilling whatever already existed at that moment used to be the "safe"
+        // fallback; it is what actually produced the backfill. The fix: a chat with no known
+        // watermark gets exactly one settling poll that ESTABLISHES the watermark and delivers
+        // nothing — every poll after that behaves exactly as before.
+        const isBootstrap = known === undefined;
         try {
           const result = await this.deps.chats.readMessages(entry.id, known?.watermark);
           for (const message of result.messages) {
+            if (isBootstrap) {
+              continue;
+            }
             if (message.id === known?.lastId) {
               continue;
             }
@@ -151,12 +167,15 @@ export class InboxPoller {
             );
           }
           const newest = result.messages.at(-1);
-          if (result.watermark) {
-            this.state[entry.id] = {
-              watermark: result.watermark,
-              ...(newest?.id ? { lastId: newest.id } : {}),
-            };
-          }
+          // Always record an entry — even an empty one — once a chat has been successfully
+          // polled: that is what ends bootstrap mode for it. A cycle with no messages must not
+          // erase a watermark/lastId a PRIOR cycle already established.
+          const watermark = result.watermark ?? known?.watermark;
+          const lastId = newest?.id ?? known?.lastId;
+          this.state[entry.id] = {
+            ...(watermark ? { watermark } : {}),
+            ...(lastId ? { lastId } : {}),
+          };
         } catch (error) {
           // One unreachable chat must not blank out the poll for the others.
           failures.push(
@@ -206,14 +225,22 @@ export class InboxPoller {
         return parsed as Record<string, ChatState>;
       }
     } catch {
-      // Missing or corrupt state means starting from "now-ish": the first poll re-reads the
-      // recent window once. Better a rare duplicate after losing the file than never starting.
+      // Missing or corrupt state is a fresh install as far as this process is concerned: every
+      // chat starts in bootstrap mode (see pollOnce) and the next cycle settles from NOW, never
+      // replaying old history — see the 0.4.1 comment on isBootstrap for why "safe" used to mean
+      // the opposite of that.
     }
     return {};
   }
 
+  /** Write-to-temp-then-rename: a crash mid-write must never leave a half-written sidecar that
+   *  the next startup's loadState() reads as corrupt and treats as a fresh install. */
   private async saveState(): Promise<void> {
-    await writeFile(this.deps.statePath, JSON.stringify(this.state ?? {}, null, 2));
+    const path = this.deps.statePath;
+    await mkdir(dirname(path), { recursive: true });
+    const tmpPath = `${path}.tmp-${process.pid}-${this.now()}`;
+    await writeFile(tmpPath, JSON.stringify(this.state ?? {}, null, 2));
+    await rename(tmpPath, path);
   }
 
   /**
