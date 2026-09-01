@@ -103,7 +103,7 @@ README's "Throttle budgets are per client id" section.
 
 **`TEAMS_MCP_TOKEN_CACHE` and the member cache** — the per-chat @mention member cache
 (`TEAMS_MCP_MEMBERS_TTL_SECONDS`, default 24h) is written next to whatever `TEAMS_MCP_TOKEN_CACHE`
-resolves to, as `members-cache.json` in the same directory. Both files hold per-instance state, so
+resolves to, as `.members-cache.json` in the same directory. Both files hold per-instance state, so
 this is another reason two long-lived instances for the same account want separate working
 directories (and separate `TEAMS_MCP_TOKEN_CACHE` paths), not just separate client ids.
 

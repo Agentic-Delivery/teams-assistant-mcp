@@ -1,4 +1,5 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -78,14 +79,95 @@ describe('MembersCache — disk-persisted, per-chat, TTL-bounded (0.4.1)', () =>
     expect(cache.get(CHAT)).toBeUndefined();
   });
 
-  it('writing never leaves a partially-written file behind — set is atomic', async () => {
+  // 0.4.1 review round 1, MINOR: the top-level shape check (object, not array) let a per-entry
+  // garbage shape straight through — `fetchedAt: "nope"` makes `now() - fetchedAt` produce NaN,
+  // and `NaN > ttlMs` is false, so a garbage entry used to read as "still fresh" and get served
+  // as real members. Each entry's own shape is now validated too.
+  it('an entry whose members is not an array degrades to "never cached" for that chat', async () => {
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(path, JSON.stringify({ [CHAT]: { members: 'not-an-array', fetchedAt: Date.now() } }));
     const cache = new MembersCache({ path });
+
+    expect(cache.get(CHAT)).toBeUndefined();
+  });
+
+  it('an entry whose fetchedAt is not a number degrades to "never cached" rather than reading as eternally fresh', async () => {
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(path, JSON.stringify({ [CHAT]: { members, fetchedAt: 'not-a-number' } }));
+    const cache = new MembersCache({ path });
+
+    expect(cache.get(CHAT)).toBeUndefined();
+  });
+
+  it('one chat with a garbage entry does not poison a sibling chat with a valid one', async () => {
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(
+      path,
+      JSON.stringify({
+        [CHAT]: { members: null, fetchedAt: Date.now() },
+        '19:other@thread.v2': { members, fetchedAt: Date.now() },
+      }),
+    );
+    const cache = new MembersCache({ path });
+
+    expect(cache.get(CHAT)).toBeUndefined();
+    expect(cache.get('19:other@thread.v2')).toEqual(members);
+  });
+
+  // MAJOR 4 (review round 1): the previous version of this test only asserted no leftover
+  // .tmp-* file was left behind, which passes identically whether set() writes via temp+rename
+  // OR writes the destination directly (mutation-verified: deleting the rename call and writing
+  // straight to `path` left this exact assertion green). Injecting the write primitives is what
+  // makes the destination-reached-only-via-rename claim an honest, mutation-proof observable.
+  it('set() reaches the destination path ONLY via rename, never a direct write (atomicity)', () => {
+    const directWrites: string[] = [];
+    const renames: Array<{ from: string; to: string }> = [];
+    const cache = new MembersCache({
+      path,
+      writeFileFn: (target, data, options) => {
+        directWrites.push(String(target));
+        writeFileSync(target, data, options);
+      },
+      renameFn: (from, to) => {
+        renames.push({ from: String(from), to: String(to) });
+        renameSync(from, to);
+      },
+    });
+
     cache.set(CHAT, members);
 
-    const { readdir } = await import('node:fs/promises');
-    const entries = await readdir(dir);
+    expect(directWrites).toHaveLength(1);
+    expect(directWrites[0]).not.toBe(path); // never written to the real destination directly
+    expect(renames).toEqual([{ from: directWrites[0], to: path }]); // the ONLY route to `path` is a rename FROM that exact temp file
+    expect(cache.get(CHAT)).toEqual(members); // and the data really did land
+  });
 
-    // Only the real file remains; no leftover .tmp-* from the rename-based write.
+  // MAJOR 2 (review round 1): mirrors the token-cache sibling's permission posture exactly —
+  // 0600, chmodSync as belt-and-braces (writeFileSync's mode option only applies on create),
+  // applied to the tmp file before the rename AND to the final path after it.
+  it('writes the cache file readable only by the owner (0600), matching the token cache sibling', () => {
+    const cache = new MembersCache({ path });
+
+    cache.set(CHAT, members);
+
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+  });
+
+  it('tightens permissions on a cache file that already existed too open', () => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path, '{}', { mode: 0o644 });
+
+    new MembersCache({ path }).set(CHAT, members);
+
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+  });
+
+  it('leaves no tmp file behind after a successful write', async () => {
+    const cache = new MembersCache({ path });
+
+    cache.set(CHAT, members);
+
+    const entries = await readdir(dir);
     expect(entries).toEqual(['members-cache.json']);
   });
 });
