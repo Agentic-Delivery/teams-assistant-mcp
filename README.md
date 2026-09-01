@@ -131,8 +131,10 @@ recent window once and moves on.
 A failing poll appends `{"error": "...", "at": "..."}` to the same file. That line is the
 difference between "the chats are quiet" and "auth is dead" — a watcher must never have to
 guess which silence it is looking at. An identical failure repeating poll after poll is written
-once, not once per poll. When *everything* fails (auth death, network gone) the interval backs
-off, doubling to a 10-minute cap and snapping back on recovery; a single failing chat — usually
+once, not once per poll — re-surfacing only at the escalation thresholds (see "Supervising the
+daemon" below). When *everything* fails (auth death, network gone) the interval backs
+off, doubling to a 10-minute cap — a 429's `Retry-After`, when Graph names one, floors the next
+delay — and snapping back on recovery; a single failing chat — usually
 one the account has not been added to yet — is surfaced but does not slow the healthy chats
 down. The poller never crashes the server; every poll is fully caught.
 
@@ -142,6 +144,47 @@ messages any more.
 
 Two knobs: `TEAMS_INBOX_PATH` moves the inbox (the sidecar follows it), and
 `TEAMS_INBOX_DISABLED=1` switches the poller off entirely for consumers that only post.
+
+## Supervising the daemon
+
+On 2026-09-01 a host reboot killed one project's poller while a second project's daemon — same
+`dist/index.js` path, different env — survived; a pgrep-based liveness check matched the survivor,
+reported the dead one as up, and an allowlisted chat sat undelivered for 1.5 hours. pgrep is the
+wrong tool here on principle: it answers "does some process matching this pattern exist", when
+the question is "is THIS inbox's pipeline delivering". Two files beside the inbox answer that
+question properly:
+
+```
+~/.teams-assistant/poller-health.json   liveness snapshot, rewritten after every poll
+~/.teams-assistant/poller.lock          single-instance lock, one poller per inbox
+```
+
+The health file is the liveness contract. After **every** poll, clean or failed, the poller
+atomically rewrites it (tmp + rename, so a reader never sees a torn snapshot):
+
+```json
+{ "pid": 1234, "inboxPath": "...", "lastAttemptAt": "...", "lastSuccessAt": "...",
+  "ok": true, "consecutiveFailures": 0, "backoffMs": 30000 }
+```
+
+How a watcher should judge it: `lastAttemptAt` older than a couple of `backoffMs` (the delay the
+poller itself announced before its next attempt — the normal 30 s interval, or longer while
+backing off) means the poller is dead or wedged, whatever the process table says. A fresh
+`lastAttemptAt` with `ok: false` means the opposite failure: the process is up but its polls are
+failing — process-up and pipeline-up are different claims, and the file distinguishes them where
+pgrep cannot. `lastSuccessAt` survives failures, so it also says how long an outage has run.
+
+The lock makes "one poller per inbox" checked instead of assumed (two pollers racing on one
+shared account is how the same incident's throttling half happened). On start the server takes
+`poller.lock`; if a live pid already holds it, the newcomer says so loudly on stderr and keeps
+serving its MCP tools **without** polling — a server that only posts is still useful. A dead
+holder's lock — the reboot case — is taken over. The lock guards the polling, never the tools.
+
+The error lines in the inbox escalate rather than dedupe forever: a standing outage writes its
+line on the first failure and again at 10 and 50 consecutive failures ("still failing after N
+polls"), and a recovery after ten or more failed polls writes a `{"recovered": true,
+"afterFailures": N}` line — so a watcher reading only the file's tail can tell a five-hour
+outage, a fresh one, and a pipeline that just came back apart.
 
 ## The standalone CLIs
 

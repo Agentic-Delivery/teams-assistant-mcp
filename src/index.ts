@@ -5,6 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import { buildChats } from './build-chats.js';
 import { loadConfig } from './config.js';
 import { InboxPoller, type SignedInAccount } from './inbox.js';
+import { acquirePollerLock } from './poller-lock.js';
 import { buildServer } from './server.js';
 
 async function main(): Promise<void> {
@@ -39,6 +40,22 @@ async function main(): Promise<void> {
   const inboxPath = resolve(
     process.env['TEAMS_INBOX_PATH']?.trim() || join(homedir(), '.teams-assistant', 'inbox.jsonl'),
   );
+
+  // One poller per inbox, enforced: on 2026-09-01 two daemons for different projects raced on
+  // one shared account and fed each other's throttle penalty. A live holder wins; this server
+  // keeps serving its tools without polling, which is loudly said rather than silently done.
+  // A dead holder's lock (the reboot case) is taken over.
+  const lock = await acquirePollerLock({ lockPath: join(dirname(inboxPath), 'poller.lock') });
+  if (!lock.acquired) {
+    process.stderr.write(
+      `inbox poller NOT started: pid ${lock.holderPid} already polls ${inboxPath} ` +
+        `(holds ${join(dirname(inboxPath), 'poller.lock')}` +
+        `${lock.holderStartedAt ? `, since ${lock.holderStartedAt}` : ''}); ` +
+        'this server keeps serving MCP tools without polling\n',
+    );
+    return;
+  }
+
   const poller = new InboxPoller({
     chats,
     allowlist: config.allowlist,
