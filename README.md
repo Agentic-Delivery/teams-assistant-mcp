@@ -149,11 +149,16 @@ corrupted sidecar — starts from NOW: that first poll only establishes the wate
 nothing, rather than backfilling whatever already existed in the chat (0.4.1; a live restart had
 backfilled roughly 40 old messages under the previous "re-read the recent window once" fallback).
 
-If the poller sees several consecutive auth-shaped failures (a 401, or an error naming
-`invalid_grant`/an AADSTS code/token expiry — default threshold 3), it forces the token provider to
-drop its cached token and re-authenticate from scratch, with one log line, rather than waiting on a
+If the poller sees several consecutive poll failures (default threshold 3), it forces the token
+provider to drop its cached token and re-authenticate from scratch, rather than waiting on a
 process restart to notice a token gone bad server-side (0.4.1; observed live: only a restart
-recovered from this).
+recovered from this). Two tiers, same threshold: a 401 or an error naming `invalid_grant`/an
+AADSTS code/token expiry is the fast, recognisable path; any OTHER consistent run of failures also
+triggers the same remedy as a last resort, because the actual live incident's own log line —
+`inbox poll failed: <chat>: fetch failed`, repeated, no status code, while Graph itself answered
+200 to parallel probes — matched neither shape (see KNOWN-ISSUES.md for the verbatim evidence). The
+remedy fires once per failing streak and logs what actually happened at each step (requested, then
+still failing, or recovered), not just the initial intent.
 
 A failing poll appends `{"error": "...", "at": "..."}` to the same file. That line is the
 difference between "the chats are quiet" and "auth is dead" — a watcher must never have to

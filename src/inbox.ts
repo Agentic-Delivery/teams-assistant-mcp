@@ -40,8 +40,13 @@ export interface InboxPollerDeps {
    * exists to break out of. Typically wired to the token provider's own `invalidate()`.
    */
   onAuthStuck?: () => void;
-  /** Consecutive auth-shaped poll failures before onAuthStuck fires. Default 3. */
+  /** Consecutive poll failures (of any shape — see the 0.4.1 last-resort-tier doc comment on
+   *  trackAuthHealth) before onAuthStuck fires. Default 3. */
   authFailureThreshold?: number;
+  /** Injectable write primitives for saveState — tests use these to prove the sidecar's
+   *  destination path is reached ONLY via rename, never a direct write (0.4.1 review round 1). */
+  writeFileFn?: typeof writeFile;
+  renameFn?: typeof rename;
 }
 
 /**
@@ -50,6 +55,13 @@ export interface InboxPollerDeps {
  * usual vocabulary (invalid_grant, an AADSTS code, "token" + "expir…") — because the actual shape
  * Graph answers with when a token goes bad server-side was not pinned down from code inspection
  * alone; see trackAuthHealth's doc comment for what IS known and what remains a hypothesis.
+ *
+ * NOT exhaustive by design: the live incident's own log line — `inbox poll failed: <chat>: fetch
+ * failed`, repeated, no status code, while parallel curl probes got 200 from Graph — matches
+ * NONE of these shapes (see KNOWN-ISSUES.md's incident entry for the verbatim evidence). This
+ * function is used for LOG WORDING (was this recognisably auth-related, or not) — it no longer
+ * gates whether the forced re-mint fires at all; trackAuthHealth's last-resort tier covers the
+ * shapeless case this function cannot name.
  */
 function isAuthShaped(error: unknown): boolean {
   if (!(error instanceof Error)) {
@@ -98,6 +110,11 @@ export class InboxPoller {
   private readonly onAuthStuck: (() => void) | undefined;
   private readonly authFailureThreshold: number;
   private authFailureStreak = 0;
+  /** True once onAuthStuck has fired for the CURRENT failing streak — prevents firing again on
+   *  every subsequent poll while still failing; see trackAuthHealth's doc comment. */
+  private authRemedyFired = false;
+  private readonly writeFileFn: typeof writeFile;
+  private readonly renameFn: typeof rename;
 
   constructor(private readonly deps: InboxPollerDeps) {
     this.pollMs = deps.pollMs ?? DEFAULT_POLL_MS;
@@ -107,6 +124,8 @@ export class InboxPoller {
     this.now = deps.nowFn ?? (() => Date.now());
     this.onAuthStuck = deps.onAuthStuck;
     this.authFailureThreshold = deps.authFailureThreshold ?? DEFAULT_AUTH_FAILURE_THRESHOLD;
+    this.writeFileFn = deps.writeFileFn ?? writeFile;
+    this.renameFn = deps.renameFn ?? rename;
   }
 
   /**
@@ -257,34 +276,50 @@ export class InboxPoller {
   }
 
   /**
-   * Live-diagnosed stuck-auth mode (0.4.1): repeated "fetch failed"-shaped polls while Graph
-   * itself was reachable, recovered only by a process restart. Code inspection could not
-   * conclusively pin the root cause down to one line — RopcTokenProvider trusts its cached
-   * token purely by local clock (getAccessToken never learns that a LIVE 401 just happened), so
-   * a token that goes bad server-side without the local expiry ever catching up would explain
-   * it, but nothing here proves that is what actually happened live. This is deliberately the
-   * defensive fallback the 0.4.1 brief allows for exactly that situation: N consecutive
-   * auth-shaped poll failures force a token re-mint (dropping the cached token, re-running ROPC)
-   * rather than waiting on a human to notice and restart the process. A single success resets
-   * the streak; a non-auth-shaped failure neither advances nor resets it, so one unrelated blip
-   * between two real auth failures does not erase progress toward the threshold.
+   * Live-diagnosed stuck-auth mode (0.4.1): repeated poll failures while Graph itself was
+   * reachable, recovered only by a process restart. Review round 1 supplied the incident's own
+   * log evidence — `inbox poll failed: <chat>: fetch failed`, repeated, NO status code, Graph
+   * answering 200 to parallel curl probes the whole time (recorded verbatim in KNOWN-ISSUES.md).
+   * That shape matches nothing isAuthShaped recognises, so a detector gated on auth vocabulary
+   * would never have fired on the actual incident.
+   *
+   * Two tiers, same threshold (N=3, DEFAULT_AUTH_FAILURE_THRESHOLD): auth-shaped failures are the
+   * fast, well-understood path (RopcTokenProvider trusting a dead cached token purely by local
+   * clock is a plausible mechanism, though unconfirmed); ANY OTHER consecutive failure shape is
+   * the LAST-RESORT tier — a spurious forced re-mint during a genuine network outage costs one
+   * extra password grant on the next successful call and nothing else, which is cheap next to
+   * staying stuck until a human restarts the process.
+   *
+   * The remedy fires ONCE per failing streak, not once per poll: firing only FLAGS the cached
+   * token (invalidate() is synchronous, no network call) — the actual re-mint attempt happens on
+   * the next getAccessToken() call, whose outcome shows up as the NEXT poll's own clean/failing
+   * result. Resetting the streak the instant onAuthStuck is called would therefore claim a
+   * recovery the code cannot know yet; the streak (and authRemedyFired) resets ONLY when a
+   * subsequent poll actually comes back clean.
    */
   private trackAuthHealth(clean: boolean, authShaped: boolean): void {
     if (clean) {
+      if (this.authRemedyFired) {
+        this.log('inbox poller: recovered after a forced token re-authentication');
+      }
       this.authFailureStreak = 0;
-      return;
-    }
-    if (!authShaped) {
+      this.authRemedyFired = false;
       return;
     }
     this.authFailureStreak += 1;
-    if (this.authFailureStreak >= this.authFailureThreshold) {
-      this.authFailureStreak = 0;
-      this.log(
-        `inbox poller: ${this.authFailureThreshold} consecutive auth-shaped poll failures — forcing token re-mint`,
-      );
-      this.onAuthStuck?.();
+    if (this.authFailureStreak < this.authFailureThreshold) {
+      return;
     }
+    if (this.authRemedyFired) {
+      this.log('inbox poller: still failing after a forced token re-authentication');
+      return;
+    }
+    this.authRemedyFired = true;
+    const shape = authShaped
+      ? 'consecutive auth-shaped poll failures'
+      : 'consecutive poll failures of unrecognised shape (last-resort: Graph is not clearing on its own)';
+    this.log(`inbox poller: ${this.authFailureThreshold} ${shape} — requested a forced token re-authentication`);
+    this.onAuthStuck?.();
   }
 
   private isSelf(fromId: string | undefined, from: string): boolean {
@@ -315,8 +350,8 @@ export class InboxPoller {
     const path = this.deps.statePath;
     await mkdir(dirname(path), { recursive: true });
     const tmpPath = `${path}.tmp-${process.pid}-${this.now()}`;
-    await writeFile(tmpPath, JSON.stringify(this.state ?? {}, null, 2));
-    await rename(tmpPath, path);
+    await this.writeFileFn(tmpPath, JSON.stringify(this.state ?? {}, null, 2));
+    await this.renameFn(tmpPath, path);
   }
 
   /**

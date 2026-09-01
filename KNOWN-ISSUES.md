@@ -62,17 +62,37 @@ install, or the sidecar lost/corrupted) — it re-read the chat's recent window 
 everything in it as new. Fixed: a chat with no known watermark now gets one settling poll that
 establishes the watermark and delivers nothing; see the README's "The background inbox" section.
 
-## Stuck-auth mode recoverable only by a process restart (defensive fix 0.4.1)
+## Stuck-auth mode recoverable only by a process restart (defensive fix 0.4.1, widened in review round 1)
 
 Observed twice live: the inbox poller failing every cycle while Graph itself was reachable, with
 only a process restart clearing it. Code inspection could not conclusively pin the live root cause
 to one line, but `RopcTokenProvider` trusting its cached token purely by local clock — with no way
 for a live 401 to tell it the token had gone bad server-side — is a plausible mechanism that would
-produce exactly this symptom. 0.4.1 ships the defensive fix the diagnosis calls for either way:
-after several (default 3) consecutive auth-shaped poll failures, the poller forces the token
-provider to drop its cached token and re-authenticate from scratch. If the stuck state recurs
-under this fix, that is evidence the live mechanism is something else and needs a fresh
-diagnosis — the counter and its threshold are `authFailureThreshold` on `InboxPollerDeps`.
+produce exactly this symptom.
+
+**Incident artifact (review round 1), recorded verbatim rather than paraphrased:** the daemon
+logged, repeatedly:
+
+```
+inbox poll failed: <chat>: fetch failed
+```
+
+No status code was visible in the log line. Parallel `curl` probes against Graph answered 200 the
+entire time the daemon was stuck. This shape matches none of `isAuthShaped`'s vocabulary (401,
+`invalid_grant`, an AADSTS code, "token"+"expir…") — a detector gated on that vocabulary alone
+would never have fired on the actual incident.
+
+0.4.1 originally shipped a detector gated on `isAuthShaped`; review round 1 widened it to two
+tiers, same threshold (default 3, `authFailureThreshold` on `InboxPollerDeps`): auth-shaped
+failures are the fast, well-understood path, and — because the evidence above shows the real
+symptom is shapeless — ANY OTHER consecutive poll failure shape now also forces the same remedy
+(drop the cached token, re-authenticate from scratch) as a last resort. A spurious forced re-mint
+during a genuine network outage costs one extra password grant on the next successful call and
+nothing else; staying stuck until a human restarts the process is the more expensive failure mode.
+The remedy fires once per failing streak (not once per poll) and only resets once a subsequent
+poll actually comes back clean — see `InboxPoller.trackAuthHealth`'s doc comment. If the stuck
+state recurs under this fix, that is evidence the live mechanism is something else again and needs
+a fresh diagnosis.
 
 ## Quoted replies to old messages fail under the single-message throttle (0.2.1)
 
