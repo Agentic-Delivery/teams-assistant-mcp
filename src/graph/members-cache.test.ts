@@ -119,9 +119,10 @@ describe('MembersCache — disk-persisted, per-chat, TTL-bounded (0.4.1)', () =>
   // OR writes the destination directly (mutation-verified: deleting the rename call and writing
   // straight to `path` left this exact assertion green). Injecting the write primitives is what
   // makes the destination-reached-only-via-rename claim an honest, mutation-proof observable.
-  it('set() reaches the destination path ONLY via rename, never a direct write (atomicity)', () => {
+  it('set() reaches the destination path ONLY via rename, never a direct write (atomicity), and the tmp file is already 0600 before that rename', () => {
     const directWrites: string[] = [];
     const renames: Array<{ from: string; to: string }> = [];
+    const tmpModesAtRenameTime: number[] = [];
     const cache = new MembersCache({
       path,
       writeFileFn: (target, data, options) => {
@@ -129,6 +130,12 @@ describe('MembersCache — disk-persisted, per-chat, TTL-bounded (0.4.1)', () =>
         writeFileSync(target, data, options);
       },
       renameFn: (from, to) => {
+        // review round 2, follow-on: mutation M4b showed the tmp file's OWN mode can be dropped
+        // unnoticed when only the final path's mode is asserted (a chmodSync on the final path
+        // alone still leaves this test green). Capturing the tmp file's mode HERE — after
+        // writeFile+chmodSync have run, before the rename moves it away — is the only point it
+        // can still be observed at all.
+        tmpModesAtRenameTime.push(statSync(from).mode & 0o777);
         renames.push({ from: String(from), to: String(to) });
         renameSync(from, to);
       },
@@ -139,6 +146,7 @@ describe('MembersCache — disk-persisted, per-chat, TTL-bounded (0.4.1)', () =>
     expect(directWrites).toHaveLength(1);
     expect(directWrites[0]).not.toBe(path); // never written to the real destination directly
     expect(renames).toEqual([{ from: directWrites[0], to: path }]); // the ONLY route to `path` is a rename FROM that exact temp file
+    expect(tmpModesAtRenameTime).toEqual([0o600]);
     expect(cache.get(CHAT)).toEqual(members); // and the data really did land
   });
 

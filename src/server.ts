@@ -4,6 +4,7 @@ import { basename, extname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { z } from 'zod';
 import type { ChatAllowlist } from './allowlist.js';
+import { retryAfterSuffix } from './graph/graph-client.js';
 import type { ChatMessage, MentionTarget, PinnedMessage, TeamsChatsPort } from './graph/teams-chats.js';
 
 export interface ServerDeps {
@@ -26,14 +27,20 @@ function ok(payload: unknown): ToolResult {
 
 /**
  * Every failure reaches the model as text rather than a transport error, including an allowlist
- * refusal — the model needs to read why it was refused and stop, not retry blindly.
+ * refusal — the model needs to read why it was refused and stop, not retry blindly. A Graph 429's
+ * Retry-After is appended via retryAfterSuffix (graph-client.ts) — the same renderer the CLI's
+ * formatCliError uses — so the agent driving the MCP server sees the same wait time an operator
+ * running teams-post would (0.4.1 review round 2: this used to read only error.name/error.message
+ * and never retryAfterSeconds at all, a silent regression for the MCP tool path specifically).
  */
 function guard(handler: () => Promise<ToolResult>): Promise<ToolResult> {
   return handler().catch((error: unknown) => ({
     content: [
       {
         type: 'text' as const,
-        text: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+        text:
+          (error instanceof Error ? `${error.name}: ${error.message}` : String(error)) +
+          retryAfterSuffix(error),
       },
     ],
     isError: true,

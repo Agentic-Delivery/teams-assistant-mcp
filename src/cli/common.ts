@@ -1,7 +1,7 @@
 import { buildChats } from '../build-chats.js';
 import { ChatNotAllowedError, type ChatAllowlist } from '../allowlist.js';
 import { loadConfig } from '../config.js';
-import { GraphError } from '../graph/graph-client.js';
+import { retryAfterSuffix } from '../graph/graph-client.js';
 import type { ReliableTeamsChats } from '../graph/reliable-sends.js';
 import type { MentionTarget, PinnedMessage } from '../graph/teams-chats.js';
 
@@ -179,14 +179,13 @@ export function usage(text: string): never {
  * lives in GraphClient/ReliableTeamsChats), so the CLI's own error text is the only place left to
  * say "wait, don't just run it again" — named in seconds, straight from Graph's own Retry-After,
  * when Graph actually sent one. Nothing is invented when it didn't (a 429 with no named window
- * gets no "retry after" claim at all — a wrong number is worse than none).
+ * gets no "retry after" claim at all — a wrong number is worse than none). The phrasing itself
+ * comes from retryAfterSuffix (graph-client.ts) — the MCP tool path's guard() (server.ts) renders
+ * the same suffix on the same errors, so the two consumer-facing surfaces never disagree.
  */
 function formatCliError(caught: unknown): string {
   const base = caught instanceof Error ? caught.message : String(caught);
-  if (caught instanceof GraphError && caught.status === 429 && caught.retryAfterSeconds !== undefined) {
-    return `${base} (throttled, retry after ${caught.retryAfterSeconds}s)`;
-  }
-  return base;
+  return `${base}${retryAfterSuffix(caught)}`;
 }
 
 export async function run(main: () => Promise<void>): Promise<void> {
