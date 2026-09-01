@@ -5,11 +5,12 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { buildChats } from '../build-chats.js';
 import { ChatAllowlist } from '../allowlist.js';
+import { GraphError } from '../graph/graph-client.js';
 import { ReliableTeamsChats } from '../graph/reliable-sends.js';
 import type { TeamsChatsPort } from '../graph/teams-chats.js';
 import type { ChatMessage, ReadResult } from '../messages.js';
 import { loadConfig } from '../config.js';
-import { doEdit, doPin, doPost, doReply, parseSendFlags, succeed } from './common.js';
+import { doEdit, doPin, doPost, doReply, parseSendFlags, run, succeed } from './common.js';
 
 const repoRoot = join(import.meta.dirname, '..', '..');
 const tsx = join(repoRoot, 'node_modules', '.bin', 'tsx');
@@ -563,5 +564,84 @@ describe('succeed() drains stdout before exiting', () => {
     expect(exit).not.toHaveBeenCalled(); // the old bug: exiting here truncates at 64 KiB
     flushCallback?.();
     expect(exit).toHaveBeenCalledWith(0);
+  });
+});
+
+describe('run() — Retry-After discipline on the send path (0.4.1)', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  function captured() {
+    const lines: string[] = [];
+    const write = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    const exit = vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
+    return { write, exit, text: () => lines.join('') };
+  }
+
+  it('a Graph 429 with a named Retry-After: the CLI error output names it, operator-readable', async () => {
+    const { exit, text } = captured();
+
+    await run(async () => {
+      throw new GraphError('Too many requests', 429, 'TooManyRequests', 17);
+    });
+
+    expect(text()).toMatch(/throttled, retry after 17s/);
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+
+  it('a Graph 429 with NO named Retry-After: no invented number is printed', async () => {
+    const { text } = captured();
+
+    await run(async () => {
+      throw new GraphError('Too many requests', 429, 'TooManyRequests');
+    });
+
+    expect(text()).not.toMatch(/throttled, retry after/);
+    expect(text()).toMatch(/Too many requests/);
+  });
+
+  it('a non-429 failure: no throttle phrasing is added at all', async () => {
+    const { text } = captured();
+
+    await run(async () => {
+      throw new Error('network unreachable');
+    });
+
+    expect(text()).not.toMatch(/throttled, retry after/);
+    expect(text()).toMatch(/network unreachable/);
+  });
+
+  it('a 429 raised from deep in the send/reply/edit flow (ReliableTeamsChats rethrow) still surfaces Retry-After', async () => {
+    const { text } = captured();
+    const chats = new ReliableTeamsChats(
+      {
+        listChats: () => Promise.reject(new Error('n/a')),
+        readMessages: () => Promise.resolve({ messages: [] }),
+        resolveMentions: () => Promise.reject(new Error('n/a')),
+        sendMessage: () => Promise.reject(new GraphError('Too many requests', 429, 'TooManyRequests', 9)),
+        sendHtmlMessage: () => Promise.reject(new Error('n/a')),
+        sendImage: () => Promise.reject(new Error('n/a')),
+        sendFile: () => Promise.reject(new Error('n/a')),
+        replyToMessage: () => Promise.reject(new Error('n/a')),
+        editMessage: () => Promise.reject(new Error('n/a')),
+        editHtmlMessage: () => Promise.reject(new Error('n/a')),
+        deleteMessage: () => Promise.reject(new Error('n/a')),
+        setReaction: () => Promise.reject(new Error('n/a')),
+        getAttachment: () => Promise.reject(new Error('n/a')),
+        pinMessage: () => Promise.reject(new Error('n/a')),
+        unpinMessage: () => Promise.reject(new Error('n/a')),
+        listPinnedMessages: () => Promise.reject(new Error('n/a')),
+      },
+      { selfDisplayName: 'Assistant', sleepFn: async () => {} },
+    );
+    const allowlist = new ChatAllowlist([{ id: '19:a@thread.v2', label: 'chat A', canPost: true }]);
+
+    await run(async () => {
+      await doPost({ chats, allowlist }, '19:a@thread.v2', 'hello', false);
+    });
+
+    expect(text()).toMatch(/throttled, retry after 9s/);
   });
 });
