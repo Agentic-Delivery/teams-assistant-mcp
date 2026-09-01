@@ -1,6 +1,7 @@
 import { buildChats } from '../build-chats.js';
 import { ChatNotAllowedError, type ChatAllowlist } from '../allowlist.js';
 import { loadConfig } from '../config.js';
+import { GraphError } from '../graph/graph-client.js';
 import type { ReliableTeamsChats } from '../graph/reliable-sends.js';
 import type { MentionTarget, PinnedMessage } from '../graph/teams-chats.js';
 
@@ -172,11 +173,27 @@ export function usage(text: string): never {
   process.exit(2);
 }
 
+/**
+ * A Graph 429 anywhere in the send/reply/edit flow must never look like an ordinary failure an
+ * operator might reflexively retry by hand: writes never auto-retry past a 429 (that rule already
+ * lives in GraphClient/ReliableTeamsChats), so the CLI's own error text is the only place left to
+ * say "wait, don't just run it again" — named in seconds, straight from Graph's own Retry-After,
+ * when Graph actually sent one. Nothing is invented when it didn't (a 429 with no named window
+ * gets no "retry after" claim at all — a wrong number is worse than none).
+ */
+function formatCliError(caught: unknown): string {
+  const base = caught instanceof Error ? caught.message : String(caught);
+  if (caught instanceof GraphError && caught.status === 429 && caught.retryAfterSeconds !== undefined) {
+    return `${base} (throttled, retry after ${caught.retryAfterSeconds}s)`;
+  }
+  return base;
+}
+
 export async function run(main: () => Promise<void>): Promise<void> {
   try {
     await main();
   } catch (caught) {
-    process.stderr.write(`${caught instanceof Error ? caught.message : String(caught)}\n`);
+    process.stderr.write(`${formatCliError(caught)}\n`);
     process.exit(caught instanceof ChatNotAllowedError ? 3 : 1);
   }
 }
