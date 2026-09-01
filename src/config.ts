@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { type AllowedChat, ChatAllowlist } from './allowlist.js';
+import { DEFAULT_MEMBERS_TTL_MS } from './graph/members-cache.js';
 
 export interface TeamsMcpConfig {
   tenantId: string;
@@ -15,7 +16,17 @@ export interface TeamsMcpConfig {
    */
   assistantDisplayName: string;
   allowlist: ChatAllowlist;
+  /** Members cache lives next to the token cache — one instance dir, one cache, same reasoning
+   *  as the inbox watermark sidecar living next to the inbox. */
+  membersCachePath: string;
+  /** TEAMS_MCP_MEMBERS_TTL_SECONDS overrides the 24h default (see members-cache.ts). */
+  membersTtlMs: number;
 }
+
+/** Derived, not hardcoded a second time: members-cache.ts's DEFAULT_MEMBERS_TTL_MS is the single
+ *  source of truth for "24h" (0.4.1 review round 1: two independently-hardcoded "24h" constants
+ *  could silently drift apart). */
+export const DEFAULT_MEMBERS_TTL_SECONDS = DEFAULT_MEMBERS_TTL_MS / 1000;
 
 export interface AllowlistFile {
   assistantDisplayName?: string;
@@ -92,6 +103,18 @@ export function parseAllowlistFile(raw: string, source: string): AllowlistFile {
   };
 }
 
+/** A malformed or non-positive override must never crash the whole server over a typo in one
+ *  optional env var — it falls back to the default instead, same posture as every other
+ *  best-effort env knob in this file. */
+function membersTtlSecondsFrom(env: NodeJS.ProcessEnv): number {
+  const raw = pick(env, ['TEAMS_MCP_MEMBERS_TTL_SECONDS']);
+  if (raw === undefined) {
+    return DEFAULT_MEMBERS_TTL_SECONDS;
+  }
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MEMBERS_TTL_SECONDS;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): TeamsMcpConfig {
   const configPath = resolve(pick(env, ['TEAMS_MCP_CONFIG']) ?? 'teams-mcp.config.json');
 
@@ -108,13 +131,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): TeamsMcpConfig
     throw error;
   }
 
+  const tokenCachePath = resolve(pick(env, ['TEAMS_MCP_TOKEN_CACHE']) ?? '.token-cache.json');
+
   return {
     tenantId: requireEnv(env, ['TEAMS_MCP_TENANT_ID']),
     clientId: pick(env, ['TEAMS_MCP_CLIENT_ID']) ?? TEAMS_FIRST_PARTY_CLIENT_ID,
     username: requireEnv(env, ['TEAMS_MCP_USERNAME']),
     password: requireEnv(env, ['TEAMS_MCP_PASSWORD']),
-    tokenCachePath: resolve(pick(env, ['TEAMS_MCP_TOKEN_CACHE']) ?? '.token-cache.json'),
+    tokenCachePath,
     assistantDisplayName: file.assistantDisplayName ?? DEFAULT_ASSISTANT_DISPLAY_NAME,
     allowlist: new ChatAllowlist(file.allowedChats ?? []),
+    membersCachePath: join(dirname(tokenCachePath), '.members-cache.json'),
+    membersTtlMs: membersTtlSecondsFrom(env) * 1000,
   };
 }

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -73,18 +73,41 @@ describe('inbox poller', () => {
       .map((line) => JSON.parse(line) as Record<string, unknown>);
   }
 
-  it('appends one JSON line per new message, in the daemon-compatible shape', async () => {
+  // 0.4.1: a chat with no watermark on record — because this is the very first poll of a fresh
+  // install, or the state was lost/corrupted — is treated as "history unknown", not "empty".
+  // That first poll only ESTABLISHES the watermark; nothing already sitting in the chat at that
+  // moment is ever delivered. So every test below that wants to see delivery runs an initial
+  // "settling" poll first (harmless: nothing is emitted), exactly the way a real fresh install's
+  // first cycle behaves, then asserts on what a SECOND poll delivers.
+  async function settle(store: ReturnType<typeof chatStore>, chatIds = [CHAT]): Promise<void> {
+    // Poll once against whatever the store holds RIGHT NOW, before the messages under test are
+    // added, so the settle itself proves nothing about the chat's true starting content.
+    await poller(store, chatIds).pollOnce();
+  }
+
+  it('a brand-new chat (or a lost/corrupt sidecar) never backfills what already existed — starts from NOW (0.4.1)', async () => {
     const store = chatStore({
-      [CHAT]: [
-        message({ id: 'a', text: 'first', createdDateTime: '2026-08-21T10:00:00Z' }),
-        message({
-          id: 'b',
-          text: 'with a file',
-          createdDateTime: '2026-08-21T10:01:00Z',
-          attachments: [{ id: 'att-1', name: 'plan.xlsx' }],
-        }),
-      ],
+      [CHAT]: [message({ id: 'ancient', text: 'predates this process', createdDateTime: '2026-08-01T00:00:00Z' })],
     });
+
+    await poller(store).pollOnce(); // the very first poll: settles the watermark, delivers nothing
+
+    expect(await inboxLines()).toEqual([]);
+  });
+
+  it('appends one JSON line per new message, in the daemon-compatible shape', async () => {
+    const store = chatStore({});
+    await settle(store);
+    store.add(
+      CHAT,
+      message({ id: 'a', text: 'first', createdDateTime: '2026-08-21T10:00:00Z' }),
+      message({
+        id: 'b',
+        text: 'with a file',
+        createdDateTime: '2026-08-21T10:01:00Z',
+        attachments: [{ id: 'att-1', name: 'plan.xlsx' }],
+      }),
+    );
 
     await poller(store).pollOnce();
 
@@ -102,12 +125,13 @@ describe('inbox poller', () => {
   });
 
   it('never echoes the signed-in account back as an inbox event', async () => {
-    const store = chatStore({
-      [CHAT]: [
-        message({ id: 'own', fromId: me.id, from: me.displayName, text: 'my own post' }),
-        message({ id: 'theirs', text: 'a question', createdDateTime: '2026-08-21T10:01:00Z' }),
-      ],
-    });
+    const store = chatStore({});
+    await settle(store);
+    store.add(
+      CHAT,
+      message({ id: 'own', fromId: me.id, from: me.displayName, text: 'my own post' }),
+      message({ id: 'theirs', text: 'a question', createdDateTime: '2026-08-21T10:01:00Z' }),
+    );
 
     await poller(store).pollOnce();
 
@@ -115,13 +139,14 @@ describe('inbox poller', () => {
   });
 
   it('drops deleted stubs and messages with no text and no attachments', async () => {
-    const store = chatStore({
-      [CHAT]: [
-        message({ id: 'gone', isDeleted: true, text: '' }),
-        message({ id: 'event', text: '   ', createdDateTime: '2026-08-21T10:01:00Z' }),
-        message({ id: 'real', text: 'kept', createdDateTime: '2026-08-21T10:02:00Z' }),
-      ],
-    });
+    const store = chatStore({});
+    await settle(store);
+    store.add(
+      CHAT,
+      message({ id: 'gone', isDeleted: true, text: '' }),
+      message({ id: 'event', text: '   ', createdDateTime: '2026-08-21T10:01:00Z' }),
+      message({ id: 'real', text: 'kept', createdDateTime: '2026-08-21T10:02:00Z' }),
+    );
 
     await poller(store).pollOnce();
 
@@ -129,8 +154,10 @@ describe('inbox poller', () => {
   });
 
   it('does not re-emit delivered messages after a restart, thanks to the state sidecar', async () => {
-    const store = chatStore({ [CHAT]: [message({ id: 'a' })] });
-    await poller(store).pollOnce();
+    const store = chatStore({});
+    await settle(store);
+    store.add(CHAT, message({ id: 'a' }));
+    await poller(store).pollOnce(); // 'a' genuinely delivered, pre-restart
 
     // Fresh instance over the same files = a server restart.
     const restarted = poller(store);
@@ -141,21 +168,25 @@ describe('inbox poller', () => {
   });
 
   it('drops an exact replay of the newest message by id, not just by timestamp', async () => {
-    // A port that ignores the watermark and always re-serves the same message.
+    // A port that ignores the watermark and always re-serves the same message — simulates Graph
+    // returning a message exactly at the watermark boundary again, which timestamp comparison
+    // alone cannot distinguish from a genuinely new message sharing that timestamp.
     const replaying = {
       readMessages: () =>
         Promise.resolve({ messages: [message({ id: 'a' })], watermark: '2026-08-21T10:00:00Z' }),
     };
     const inbox = poller(replaying);
 
-    await inbox.pollOnce();
-    await inbox.pollOnce();
+    await inbox.pollOnce(); // settles: 'a' establishes the watermark, delivered to no one
+    await inbox.pollOnce(); // same 'a' served again — the id check must still drop it
 
-    expect((await inboxLines()).map((line) => line['id'])).toEqual(['a']);
+    expect(await inboxLines()).toEqual([]);
   });
 
   it('truncates very long messages to 2000 characters', async () => {
-    const store = chatStore({ [CHAT]: [message({ id: 'long', text: 'x'.repeat(5000) })] });
+    const store = chatStore({});
+    await settle(store);
+    store.add(CHAT, message({ id: 'long', text: 'x'.repeat(5000) }));
 
     await poller(store).pollOnce();
 
@@ -178,7 +209,9 @@ describe('inbox poller', () => {
   });
 
   it('keeps delivering the healthy chats, at full speed, when one chat fails', async () => {
-    const store = chatStore({ [OTHER]: [message({ id: 'ok', chatId: OTHER })] });
+    const store = chatStore({});
+    await settle(store, [CHAT, OTHER]);
+    store.add(OTHER, message({ id: 'ok', chatId: OTHER }));
     const flaky = {
       readMessages: (chatId: string, since?: string) =>
         chatId === CHAT
@@ -214,17 +247,72 @@ describe('inbox poller', () => {
     expect(errors).toHaveLength(2);
   });
 
-  it('starts from scratch when the state file is corrupt rather than refusing to poll', async () => {
-    const store = chatStore({ [CHAT]: [message({ id: 'a' })] });
-    await poller(store).pollOnce();
+  it('a corrupt state file degrades to starting from now, never replaying full history (0.4.1)', async () => {
+    const store = chatStore({});
+    await settle(store);
+    store.add(CHAT, message({ id: 'a' }));
+    await poller(store).pollOnce(); // 'a' genuinely delivered
 
     const { writeFile } = await import('node:fs/promises');
-    await writeFile(statePath, 'not json at all');
-    const clean = await poller(store).pollOnce();
+    await writeFile(statePath, 'not json at all'); // sidecar lost
+    store.add(CHAT, message({ id: 'b', text: 'arrives after the corruption', createdDateTime: '2026-08-21T10:10:00Z' }));
+    const clean = await poller(store).pollOnce(); // treated as a fresh install: settles, delivers nothing
 
     expect(clean).toBe(true);
-    // The one acceptable duplicate: losing the state file re-reads the recent window once.
-    expect((await inboxLines()).map((line) => line['id'])).toEqual(['a', 'a']);
+    expect((await inboxLines()).map((line) => line['id'])).toEqual(['a']); // 'a' never replayed, 'b' not yet either
+
+    store.add(CHAT, message({ id: 'c', text: 'genuinely new, after the re-settle', createdDateTime: '2026-08-21T10:20:00Z' }));
+    await poller(store).pollOnce(); // a normal poll now — 'c' postdates the re-settled watermark
+
+    // 'b' was itself the newest message present AT the re-settle poll, so it became the new
+    // watermark baseline rather than being delivered — same "settles, does not deliver" contract
+    // as the very first bootstrap. Only 'c', which arrived strictly after that, is new.
+    expect((await inboxLines()).map((line) => line['id'])).toEqual(['a', 'c']);
+  });
+
+  it('leaves no tmp file behind after a successful poll', async () => {
+    const store = chatStore({});
+    await settle(store);
+    store.add(CHAT, message({ id: 'a' }));
+    await poller(store).pollOnce();
+
+    const { readdir } = await import('node:fs/promises');
+    const entries = await readdir(join(dir, 'nested'));
+
+    expect(entries.filter((name) => name.includes('.tmp-'))).toEqual([]);
+    expect(entries).toContain('inbox-state.json');
+  });
+
+  // MAJOR 4 (review round 1): the test above only proves no leftover tmp file — that passes
+  // identically whether saveState writes via temp+rename OR writes the destination directly
+  // (mutation-verified: deleting the rename and writing straight to statePath left it green).
+  // Injecting the write primitives is what makes "the destination is reached ONLY via rename" an
+  // honest, mutation-proof observable.
+  it('the state sidecar is reached ONLY via rename, never a direct write (atomicity, 0.4.1)', async () => {
+    const directWrites: string[] = [];
+    const renames: Array<{ from: string; to: string }> = [];
+    const store = chatStore({});
+    const p = new InboxPoller({
+      chats: store,
+      allowlist: new ChatAllowlist([{ id: CHAT, label: CHAT, canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+      writeFileFn: (async (target: Parameters<typeof writeFile>[0], ...rest: unknown[]) => {
+        directWrites.push(String(target));
+        return (writeFile as (...args: unknown[]) => Promise<void>)(target, ...rest);
+      }) as typeof writeFile,
+      renameFn: (async (from: Parameters<typeof rename>[0], to: Parameters<typeof rename>[1]) => {
+        renames.push({ from: String(from), to: String(to) });
+        return rename(from, to);
+      }) as typeof rename,
+    });
+
+    await p.pollOnce();
+
+    expect(directWrites).toHaveLength(1);
+    expect(directWrites[0]).not.toBe(statePath); // never written to the real destination directly
+    expect(renames).toEqual([{ from: directWrites[0], to: statePath }]);
   });
 });
 
@@ -337,5 +425,196 @@ describe('inbox poller — the clean verdict counts only the chats actually aske
     clock += PARK_FORBIDDEN_CHAT_MS; await p.pollOnce(); // park expired: asked again
 
     expect(asked).toHaveLength(2);
+  });
+});
+
+describe('inbox poller — stuck-auth self-healing (0.4.1, live-diagnosed: only a process restart recovered)', () => {
+  let dir: string; let inboxPath: string; let statePath: string;
+  beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'inbox-authstuck-')); inboxPath = join(dir, 'inbox.jsonl'); statePath = join(dir, 'inbox-state.json'); });
+  afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  function authError(): Error {
+    return Object.assign(new Error('token expired'), { status: 401 });
+  }
+
+  it('N consecutive auth-shaped poll failures force a token re-mint exactly once', async () => {
+    let onAuthStuckCalls = 0;
+    const readMessages = () => Promise.reject(authError());
+    const p = new InboxPoller({
+      chats: { readMessages },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+      authFailureThreshold: 3,
+      onAuthStuck: () => {
+        onAuthStuckCalls += 1;
+      },
+    });
+
+    await p.pollOnce();
+    expect(onAuthStuckCalls).toBe(0);
+    await p.pollOnce();
+    expect(onAuthStuckCalls).toBe(0);
+    await p.pollOnce(); // the 3rd consecutive auth-shaped failure
+    expect(onAuthStuckCalls).toBe(1);
+  });
+
+  it('a successful poll resets the streak — three failures, one success, two more failures never fires', async () => {
+    let alive = false;
+    let onAuthStuckCalls = 0;
+    const store = chatStore({});
+    const readMessages = (chatId: string, since?: string) =>
+      alive ? store.readMessages(chatId, since) : Promise.reject(authError());
+    const p = new InboxPoller({
+      chats: { readMessages },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+      authFailureThreshold: 3,
+      onAuthStuck: () => {
+        onAuthStuckCalls += 1;
+      },
+    });
+
+    await p.pollOnce();
+    await p.pollOnce();
+    alive = true;
+    await p.pollOnce(); // recovers — resets the streak
+    alive = false;
+    await p.pollOnce();
+    await p.pollOnce();
+
+    expect(onAuthStuckCalls).toBe(0);
+  });
+
+  // MAJOR 5 (review round 1, evidence from the orchestrator's incident logs): the live symptom
+  // was literally `inbox poll failed: <chat>: fetch failed`, repeatedly, with NO status code
+  // visible in the log, while Graph answered 200 to parallel curl probes — recovered only by a
+  // process restart. A detector that only fires on 401/invalid_grant/AADSTS/token-expiry text
+  // would never have fired on the real incident. This is now a LAST-RESORT tier: N consecutive
+  // poll failures of ANY shape also force a re-mint — a spurious re-mint during a genuine network
+  // outage is cheap and harmless (the very next successful getAccessToken() call just does one
+  // extra password grant instead of reusing a cache); staying stuck is not. This test used to
+  // assert the OPPOSITE (never fires) — that assertion was locking the incident's exact shape out
+  // of the detector.
+  it('N consecutive failures of ANY shape (no status, no auth vocabulary) — the last-resort tier still forces a re-mint', async () => {
+    let onAuthStuckCalls = 0;
+    const readMessages = () => Promise.reject(new Error('fetch failed'));
+    const p = new InboxPoller({
+      chats: { readMessages },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+      authFailureThreshold: 3,
+      onAuthStuck: () => {
+        onAuthStuckCalls += 1;
+      },
+    });
+
+    await p.pollOnce();
+    expect(onAuthStuckCalls).toBe(0);
+    await p.pollOnce();
+    expect(onAuthStuckCalls).toBe(0);
+    await p.pollOnce(); // 3rd consecutive failure, shapeless — the last-resort tier
+    expect(onAuthStuckCalls).toBe(1);
+  });
+
+  it('a poller with no onAuthStuck configured never throws, even past the threshold', async () => {
+    const readMessages = () => Promise.reject(authError());
+    const p = new InboxPoller({
+      chats: { readMessages },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+      authFailureThreshold: 2,
+    });
+
+    await expect(p.pollOnce()).resolves.toBe(false);
+    await expect(p.pollOnce()).resolves.toBe(false);
+    await expect(p.pollOnce()).resolves.toBe(false);
+  });
+
+  // MAJOR 3 (review round 1): resetting the streak the instant onAuthStuck is CALLED claims an
+  // outcome (recovery) the code cannot actually know yet — invalidate() only flags the token for
+  // re-auth; the real HTTP re-mint happens on the NEXT getAccessToken() call, whose result shows
+  // up as THIS poller's next poll. The streak must not reset until a poll actually comes back
+  // clean, and firing must not repeat on every single poll once past the threshold.
+  it('the remedy fires exactly once per failing streak — not once per poll past the threshold — and only resets on an actual clean poll', async () => {
+    let alive = false;
+    let onAuthStuckCalls = 0;
+    const store = chatStore({});
+    const readMessages = (chatId: string, since?: string) =>
+      alive ? store.readMessages(chatId, since) : Promise.reject(authError());
+    const p = new InboxPoller({
+      chats: { readMessages },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+      authFailureThreshold: 3,
+      onAuthStuck: () => {
+        onAuthStuckCalls += 1;
+      },
+    });
+
+    await p.pollOnce(); // 1
+    await p.pollOnce(); // 2
+    await p.pollOnce(); // 3 — fires
+    expect(onAuthStuckCalls).toBe(1);
+    // Keep failing well past a second threshold's worth with NO recovery in between. A design
+    // that reset the streak the instant it fires would count another 3 straight to 6 and fire
+    // AGAIN here — this is exactly the case that distinguishes "reset on fire" from "reset only
+    // on an actual clean poll".
+    await p.pollOnce(); // 4
+    await p.pollOnce(); // 5
+    await p.pollOnce(); // 6 — would be a 2nd trigger under "reset on fire"
+    await p.pollOnce(); // 7
+    expect(onAuthStuckCalls).toBe(1); // still just once — no clean poll has happened yet
+
+    alive = true;
+    await p.pollOnce(); // recovers — THIS is what may reset the streak, not the earlier firing
+    alive = false;
+    await p.pollOnce(); // 1 of a NEW streak
+    await p.pollOnce(); // 2
+    expect(onAuthStuckCalls).toBe(1);
+    await p.pollOnce(); // 3 of the new streak — fires again
+    expect(onAuthStuckCalls).toBe(2);
+  });
+
+  // MAJOR 3 / MINOR (log fires, injected dep): the log line must describe what is actually known
+  // at each point — a request was made, the remedy has not yet cleared it, or it recovered — not
+  // a single "forcing…" claim asserted once and never revisited.
+  it('the log line reports outcome, not just intent: requested, then still-failing, then recovered', async () => {
+    let alive = false;
+    const store = chatStore({});
+    const readMessages = (chatId: string, since?: string) =>
+      alive ? store.readMessages(chatId, since) : Promise.reject(authError());
+    const lines: string[] = [];
+    const p = new InboxPoller({
+      chats: { readMessages },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+      authFailureThreshold: 3,
+      onAuthStuck: () => {},
+      log: (line) => lines.push(line),
+    });
+
+    await p.pollOnce();
+    await p.pollOnce();
+    await p.pollOnce(); // fires
+    expect(lines.some((l) => /requested a forced token re-authentication/.test(l))).toBe(true);
+
+    await p.pollOnce(); // still failing — the remedy has not visibly worked yet
+    expect(lines.some((l) => /still failing after a forced token re-authentication/.test(l))).toBe(true);
+
+    alive = true;
+    await p.pollOnce();
+    expect(lines.some((l) => /recovered after a forced token re-authentication/.test(l))).toBe(true);
   });
 });

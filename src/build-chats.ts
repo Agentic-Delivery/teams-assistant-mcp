@@ -1,7 +1,14 @@
 import { FileTokenCache } from './auth/token-cache.js';
 import { RopcTokenProvider } from './auth/ropc-token-provider.js';
+import type { TokenProvider } from './auth/token-provider.js';
 import { GraphClient } from './graph/graph-client.js';
+import { MembersCache } from './graph/members-cache.js';
 import { GraphTeamsChats, type GraphTeamsChatsOptions } from './graph/teams-chats.js';
+
+/** The options buildChats itself may override; membersCache is always this module's own wiring
+ *  (see below) — a caller cannot silently unwire it, since GraphTeamsChatsOptions.membersCache
+ *  is a required field on the underlying type and this Partial excludes it. */
+export type BuildChatsOptions = Partial<Omit<GraphTeamsChatsOptions, 'membersCache'>>;
 import { ReliableTeamsChats } from './graph/reliable-sends.js';
 import type { TeamsMcpConfig } from './config.js';
 
@@ -14,11 +21,14 @@ export interface ChatsStack {
   chats: ReliableTeamsChats;
   /** The raw client, for the few callers that need Graph beyond chats (the inbox poller's /me). */
   graph: GraphClient;
+  /** Exposed so a caller (the inbox poller's stuck-auth recovery, 0.4.1) can force a re-mint
+   *  without reaching back into this module's private wiring. */
+  tokenProvider: TokenProvider;
 }
 
 export function buildChats(
   config: TeamsMcpConfig,
-  options: GraphTeamsChatsOptions = {},
+  options: BuildChatsOptions = {},
 ): ChatsStack {
   const tokenProvider = new RopcTokenProvider({
     tenantId: config.tenantId,
@@ -28,10 +38,13 @@ export function buildChats(
     cache: new FileTokenCache(config.tokenCachePath),
   });
   const graph = new GraphClient({ tokenProvider });
+  // Always THIS module's own cache — membersCache is deliberately excluded from
+  // BuildChatsOptions so nothing calling buildChats can accidentally unwire it (0.4.1 review).
+  const membersCache = new MembersCache({ path: config.membersCachePath, ttlMs: config.membersTtlMs });
   // Readback-before-retry on every send: a failure report is a claim about the response path,
   // not the chat, and re-sending without checking is how one broadcast became eleven.
-  const chats = new ReliableTeamsChats(new GraphTeamsChats(graph, options), {
+  const chats = new ReliableTeamsChats(new GraphTeamsChats(graph, { ...options, membersCache }), {
     selfDisplayName: config.assistantDisplayName,
   });
-  return { chats, graph };
+  return { chats, graph, tokenProvider };
 }

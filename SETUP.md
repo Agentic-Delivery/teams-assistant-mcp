@@ -93,6 +93,20 @@ TEAMS_MCP_CLIENT_ID=YOUR_CLIENT_ID   # the Microsoft Office first-party applicat
 If chat calls fail 403 with a licensed account, run `npm run probe` and look at the `scopes`
 line of the token before suspecting anything else.
 
+`TEAMS_MCP_CLIENT_ID` is also the throttle-isolation knob: Graph's throttle budget for the chat
+endpoints is keyed by client id + signed-in user together, so two long-lived instances signed in
+as the same account with the same client id share one budget — a 429 either one earns can starve
+the other. Running more than one long-lived instance against the same account (a second server, a
+standalone polling daemon)? Give each its own `TEAMS_MCP_CLIENT_ID` (any other Microsoft
+first-party id from the same published list) so their throttle budgets are separate. See the
+README's "Throttle budgets are per client id" section.
+
+**`TEAMS_MCP_TOKEN_CACHE` and the member cache** — the per-chat @mention member cache
+(`TEAMS_MCP_MEMBERS_TTL_SECONDS`, default 24h) is written next to whatever `TEAMS_MCP_TOKEN_CACHE`
+resolves to, as `.members-cache.json` in the same directory. Both files hold per-instance state, so
+this is another reason two long-lived instances for the same account want separate working
+directories (and separate `TEAMS_MCP_TOKEN_CACHE` paths), not just separate client ids.
+
 **`TEAMS_MCP_CONFIG`** — absolute path to the allowlist file (step 5). The server refuses to
 start without it. Absolute, because the agent starts the server from the consuming project's
 directory, so a relative path resolves against the wrong repo.

@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type { ChatAllowlist } from './allowlist.js';
 import type { TeamsChatsPort } from './graph/teams-chats.js';
@@ -33,11 +33,57 @@ export interface InboxPollerDeps {
   nowFn?: () => number;
   maxBackoffMs?: number;
   log?: (line: string) => void;
+  /**
+   * Called once a poll cycle ends with an auth-shaped failure (401, or a message naming
+   * invalid_grant/an AADSTS code/token expiry) for the `authFailureThreshold`th CONSECUTIVE time
+   * — see the 0.4.1 doc comment on trackAuthHealth for the live-diagnosed stuck-auth mode this
+   * exists to break out of. Typically wired to the token provider's own `invalidate()`.
+   */
+  onAuthStuck?: () => void;
+  /** Consecutive poll failures (of any shape — see the 0.4.1 last-resort-tier doc comment on
+   *  trackAuthHealth) before onAuthStuck fires. Default 3. */
+  authFailureThreshold?: number;
+  /** Injectable write primitives for saveState — tests use these to prove the sidecar's
+   *  destination path is reached ONLY via rename, never a direct write (0.4.1 review round 1). */
+  writeFileFn?: typeof writeFile;
+  renameFn?: typeof rename;
+}
+
+/**
+ * Auth-shaped: the kind of failure a dead-but-not-yet-locally-expired cached token produces.
+ * Matched broadly on purpose — a 401 status, this server's own AuthenticationError, or Entra's
+ * usual vocabulary (invalid_grant, an AADSTS code, "token" + "expir…") — because the actual shape
+ * Graph answers with when a token goes bad server-side was not pinned down from code inspection
+ * alone; see trackAuthHealth's doc comment for what IS known and what remains a hypothesis.
+ *
+ * NOT exhaustive by design: the live incident's own log line — `inbox poll failed: <chat>: fetch
+ * failed`, repeated, no status code, while parallel curl probes got 200 from Graph — matches
+ * NONE of these shapes (see KNOWN-ISSUES.md's incident entry for the verbatim evidence). This
+ * function is used for LOG WORDING (was this recognisably auth-related, or not) — it no longer
+ * gates whether the forced re-mint fires at all; trackAuthHealth's last-resort tier covers the
+ * shapeless case this function cannot name.
+ */
+function isAuthShaped(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  if ((error as { status?: number }).status === 401) {
+    return true;
+  }
+  if (error.name === 'AuthenticationError') {
+    return true;
+  }
+  return /invalid_grant|AADSTS\d+|token[^a-z]{0,10}expir/i.test(error.message);
 }
 
 interface ChatState {
-  /** ISO-8601 createdDateTime of the newest delivered message; exclusive, like read watermarks. */
-  watermark: string;
+  /**
+   * ISO-8601 createdDateTime of the newest delivered message; exclusive, like read watermarks.
+   * Optional: a chat that has been polled at least once but never had a message yet has an
+   * entry with no watermark — see the bootstrap comment in pollOnce for why this differs from
+   * having no entry at all.
+   */
+  watermark?: string;
   /** Id of that newest message, so an exact replay is dropped even if the port re-serves it. */
   lastId?: string;
 }
@@ -46,6 +92,9 @@ export const DEFAULT_POLL_MS = 30_000;
 /** A chat that answers 403 (not a member) is re-tried this often instead of every cycle. */
 export const PARK_FORBIDDEN_CHAT_MS = 10 * 60_000;
 export const DEFAULT_MAX_BACKOFF_MS = 600_000;
+/** Twice was already enough to be worth fixing (0.4.1's live diagnosis); one more than that
+ *  guards against firing on an ordinary transient blip that would have cleared on its own. */
+export const DEFAULT_AUTH_FAILURE_THRESHOLD = 3;
 
 export class InboxPoller {
   private readonly pollMs: number;
@@ -58,6 +107,14 @@ export class InboxPoller {
   private lastErrorSignature: string | undefined;
   private readonly parked = new Map<string, number>();
   private readonly now: () => number;
+  private readonly onAuthStuck: (() => void) | undefined;
+  private readonly authFailureThreshold: number;
+  private authFailureStreak = 0;
+  /** True once onAuthStuck has fired for the CURRENT failing streak — prevents firing again on
+   *  every subsequent poll while still failing; see trackAuthHealth's doc comment. */
+  private authRemedyFired = false;
+  private readonly writeFileFn: typeof writeFile;
+  private readonly renameFn: typeof rename;
 
   constructor(private readonly deps: InboxPollerDeps) {
     this.pollMs = deps.pollMs ?? DEFAULT_POLL_MS;
@@ -65,6 +122,10 @@ export class InboxPoller {
     this.log = deps.log ?? (() => {});
     this.backoffMs = this.pollMs;
     this.now = deps.nowFn ?? (() => Date.now());
+    this.onAuthStuck = deps.onAuthStuck;
+    this.authFailureThreshold = deps.authFailureThreshold ?? DEFAULT_AUTH_FAILURE_THRESHOLD;
+    this.writeFileFn = deps.writeFileFn ?? writeFile;
+    this.renameFn = deps.renameFn ?? rename;
   }
 
   /**
@@ -117,6 +178,7 @@ export class InboxPoller {
 
       let throttled = false;
       let attempted = 0;
+      let authShapedFailure = false;
       for (const entry of this.deps.allowlist.entries()) {
         if (throttled) {
           break; // one 429 ends the cycle — every further request would feed the penalty window
@@ -127,9 +189,20 @@ export class InboxPoller {
         }
         attempted += 1;
         const known = this.state[entry.id];
+        // 0.4.1 (live-diagnosed: a restart was observed replaying ~40 old messages): no entry on
+        // record for this chat means "history unknown to THIS process" — not "chat is empty" —
+        // whether that is because the sidecar was lost, corrupted, or this is a genuinely fresh
+        // install. Backfilling whatever already existed at that moment used to be the "safe"
+        // fallback; it is what actually produced the backfill. The fix: a chat with no known
+        // watermark gets exactly one settling poll that ESTABLISHES the watermark and delivers
+        // nothing — every poll after that behaves exactly as before.
+        const isBootstrap = known === undefined;
         try {
           const result = await this.deps.chats.readMessages(entry.id, known?.watermark);
           for (const message of result.messages) {
+            if (isBootstrap) {
+              continue;
+            }
             if (message.id === known?.lastId) {
               continue;
             }
@@ -151,12 +224,15 @@ export class InboxPoller {
             );
           }
           const newest = result.messages.at(-1);
-          if (result.watermark) {
-            this.state[entry.id] = {
-              watermark: result.watermark,
-              ...(newest?.id ? { lastId: newest.id } : {}),
-            };
-          }
+          // Always record an entry — even an empty one — once a chat has been successfully
+          // polled: that is what ends bootstrap mode for it. A cycle with no messages must not
+          // erase a watermark/lastId a PRIOR cycle already established.
+          const watermark = result.watermark ?? known?.watermark;
+          const lastId = newest?.id ?? known?.lastId;
+          this.state[entry.id] = {
+            ...(watermark ? { watermark } : {}),
+            ...(lastId ? { lastId } : {}),
+          };
         } catch (error) {
           // One unreachable chat must not blank out the poll for the others.
           failures.push(
@@ -167,6 +243,9 @@ export class InboxPoller {
             throttled = true; // 2026-08-25: polling on through a throttle kept an account throttled for hours
           } else if (status === 403) {
             this.parked.set(entry.id, this.now() + PARK_FORBIDDEN_CHAT_MS);
+          }
+          if (isAuthShaped(error)) {
+            authShapedFailure = true;
           }
         }
       }
@@ -182,14 +261,65 @@ export class InboxPoller {
         // thing that ends a throttle. A single dead chat still doesn't slow the healthy ones —
         // but the denominator is the chats this cycle actually ASKED: with the 403 chats
         // parked, "one of three failed" must not hide "the only chat asked failed" (auth death).
-        return !throttled && failures.length < attempted;
+        const clean = !throttled && failures.length < attempted;
+        this.trackAuthHealth(clean, authShapedFailure);
+        return clean;
       }
       this.lastErrorSignature = undefined;
+      this.trackAuthHealth(true, false);
       return true;
     } catch (error) {
       await this.reportFailure(error instanceof Error ? error.message : String(error));
+      this.trackAuthHealth(false, isAuthShaped(error));
       return false;
     }
+  }
+
+  /**
+   * Live-diagnosed stuck-auth mode (0.4.1): repeated poll failures while Graph itself was
+   * reachable, recovered only by a process restart. Review round 1 supplied the incident's own
+   * log evidence — `inbox poll failed: <chat>: fetch failed`, repeated, NO status code, Graph
+   * answering 200 to parallel curl probes the whole time (recorded verbatim in KNOWN-ISSUES.md).
+   * That shape matches nothing isAuthShaped recognises, so a detector gated on auth vocabulary
+   * would never have fired on the actual incident.
+   *
+   * Two tiers, same threshold (N=3, DEFAULT_AUTH_FAILURE_THRESHOLD): auth-shaped failures are the
+   * fast, well-understood path (RopcTokenProvider trusting a dead cached token purely by local
+   * clock is a plausible mechanism, though unconfirmed); ANY OTHER consecutive failure shape is
+   * the LAST-RESORT tier — a spurious forced re-mint during a genuine network outage costs one
+   * extra password grant on the next successful call and nothing else, which is cheap next to
+   * staying stuck until a human restarts the process.
+   *
+   * The remedy fires ONCE per failing streak, not once per poll: firing only FLAGS the cached
+   * token (invalidate() is synchronous, no network call) — the actual re-mint attempt happens on
+   * the next getAccessToken() call, whose outcome shows up as the NEXT poll's own clean/failing
+   * result. Resetting the streak the instant onAuthStuck is called would therefore claim a
+   * recovery the code cannot know yet; the streak (and authRemedyFired) resets ONLY when a
+   * subsequent poll actually comes back clean.
+   */
+  private trackAuthHealth(clean: boolean, authShaped: boolean): void {
+    if (clean) {
+      if (this.authRemedyFired) {
+        this.log('inbox poller: recovered after a forced token re-authentication');
+      }
+      this.authFailureStreak = 0;
+      this.authRemedyFired = false;
+      return;
+    }
+    this.authFailureStreak += 1;
+    if (this.authFailureStreak < this.authFailureThreshold) {
+      return;
+    }
+    if (this.authRemedyFired) {
+      this.log('inbox poller: still failing after a forced token re-authentication');
+      return;
+    }
+    this.authRemedyFired = true;
+    const shape = authShaped
+      ? 'consecutive auth-shaped poll failures'
+      : 'consecutive poll failures of unrecognised shape (last-resort: Graph is not clearing on its own)';
+    this.log(`inbox poller: ${this.authFailureThreshold} ${shape} — requested a forced token re-authentication`);
+    this.onAuthStuck?.();
   }
 
   private isSelf(fromId: string | undefined, from: string): boolean {
@@ -206,14 +336,22 @@ export class InboxPoller {
         return parsed as Record<string, ChatState>;
       }
     } catch {
-      // Missing or corrupt state means starting from "now-ish": the first poll re-reads the
-      // recent window once. Better a rare duplicate after losing the file than never starting.
+      // Missing or corrupt state is a fresh install as far as this process is concerned: every
+      // chat starts in bootstrap mode (see pollOnce) and the next cycle settles from NOW, never
+      // replaying old history — see the 0.4.1 comment on isBootstrap for why "safe" used to mean
+      // the opposite of that.
     }
     return {};
   }
 
+  /** Write-to-temp-then-rename: a crash mid-write must never leave a half-written sidecar that
+   *  the next startup's loadState() reads as corrupt and treats as a fresh install. */
   private async saveState(): Promise<void> {
-    await writeFile(this.deps.statePath, JSON.stringify(this.state ?? {}, null, 2));
+    const path = this.deps.statePath;
+    await mkdir(dirname(path), { recursive: true });
+    const tmpPath = `${path}.tmp-${process.pid}-${this.now()}`;
+    await this.writeFileFn(tmpPath, JSON.stringify(this.state ?? {}, null, 2));
+    await this.renameFn(tmpPath, path);
   }
 
   /**

@@ -23,6 +23,23 @@ export class GraphError extends Error {
   }
 }
 
+/**
+ * THE single place a Retry-After wait gets rendered for a human, across every surface that turns
+ * a caught error into text: the CLIs' `formatCliError` (cli/common.ts) and the MCP tool path's
+ * `guard()` (server.ts) both call this — not their own copies of the phrasing. 0.4.1 review round
+ * 2: the CLI fix alone left the MCP path (guard() only ever read `error.name`/`error.message`,
+ * never `retryAfterSeconds`) silently regressed to no wait time at all, and the doc comment
+ * claiming "formatCliError is the only such renderer" was already false the moment a second
+ * caller existed. Every error class that names its own Retry-After in the message body (the old
+ * MembersRefreshThrottled/MessageFetchThrottled text in teams-chats.ts) must NOT do that anymore
+ * — this is the only place the number gets stated, so it is only ever stated once.
+ */
+export function retryAfterSuffix(error: unknown): string {
+  return error instanceof GraphError && error.status === 429 && error.retryAfterSeconds !== undefined
+    ? ` (throttled, retry after ${error.retryAfterSeconds}s)`
+    : '';
+}
+
 export interface GraphClientOptions {
   tokenProvider: TokenProvider;
   fetchFn?: typeof fetch;
@@ -117,6 +134,17 @@ export class GraphClient {
     return Math.max(0, Math.max(family, global) - now);
   }
 
+  /**
+   * The wait itself is stated exactly once, by retryAfterSuffix — the CLI's formatCliError AND
+   * the MCP tool path's guard() (server.ts) both call it, so BOTH consumer-facing surfaces render
+   * it identically (0.4.1 review round 1: this message used to say "12s remain" AND the CLI
+   * separately appended "(throttled, retry after 12s)", two renderings of one number in one
+   * line; review round 2 found guard() never rendered it AT ALL, and this comment's earlier claim
+   * that formatCliError was "the only such renderer" was already false the moment guard() existed
+   * — corrected here to name both). This message names WHICH gate is closed and nothing about
+   * timing; retryAfterSeconds (the constructor's 4th argument) is the one place that number
+   * lives, structurally, for retryAfterSuffix to use.
+   */
   private assertGateOpen(path: string): void {
     const remaining = this.throttledForMs(path);
     if (remaining > 0) {
@@ -126,7 +154,7 @@ export class GraphClient {
         ? 'the GLOBAL gate (an application-wide throttle) — every resource family is closed'
         : `the gate for ${GraphClient.gateKeyFor(path)} — other resource families may still be fine`;
       throw new GraphError(
-        `Locally throttled: a recent 429 closed ${which}; ${Math.ceil(remaining / 1000)}s remain — ${path} not sent`,
+        `Locally throttled: a recent 429 closed ${which} — ${path} not sent`,
         429,
         'LocallyThrottled',
         Math.ceil(remaining / 1000),

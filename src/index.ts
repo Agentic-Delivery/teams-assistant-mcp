@@ -11,7 +11,7 @@ async function main(): Promise<void> {
   const config = loadConfig();
 
   const uploadDir = process.env['TEAMS_MCP_UPLOAD_DIR'];
-  const { chats, graph } = buildChats(config, uploadDir ? { uploadDir } : {});
+  const { chats, graph, tokenProvider } = buildChats(config, uploadDir ? { uploadDir } : {});
 
   const server = buildServer({
     chats,
@@ -47,6 +47,10 @@ async function main(): Promise<void> {
     // The state sidecar follows the inbox file, so a TEAMS_INBOX_PATH override moves both.
     statePath: join(dirname(inboxPath), 'inbox-state.json'),
     log: (line) => process.stderr.write(`${line}\n`),
+    // 0.4.1 stuck-auth self-healing: a token that goes bad without the local cache's own expiry
+    // catching up needs an external nudge to drop it — see InboxPoller.trackAuthHealth's doc
+    // comment for the live diagnosis this closes.
+    onAuthStuck: () => tokenProvider.invalidate?.(),
   });
   poller.start();
   process.stderr.write(`inbox poller on: ${inboxPath}\n`);
