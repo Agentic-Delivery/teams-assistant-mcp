@@ -101,7 +101,7 @@ describe('GraphTeamsChats.resolveMentions — member cache (0.4.1, live-diagnose
     expect(calls).toHaveLength(1); // one refresh, not a retry loop
   });
 
-  it('a 429 on the refresh surfaces as a distinct THROTTLED error naming Retry-After, not a silent fallback', async () => {
+  it('a 429 on the refresh surfaces as a distinct THROTTLED error carrying Retry-After structurally, not a silent fallback', async () => {
     const cache = new MembersCache({ path }); // empty — refresh is unavoidable
     const { fetchFn, calls } = countingMembersFetch(() =>
       json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
@@ -114,8 +114,12 @@ describe('GraphTeamsChats.resolveMentions — member cache (0.4.1, live-diagnose
 
     expect(error).toBeInstanceOf(GraphError);
     expect((error as GraphError).status).toBe(429);
+    expect((error as GraphError).code).toBe('MembersRefreshThrottled');
+    // 0.4.1 review round 2: retryAfterSeconds is the ONE place the wait lives — the message text
+    // itself must NOT also state it (retryAfterSuffix, shared by the CLI and guard(), is the
+    // sole renderer, so it is never stated twice on the surfaces that actually show it to someone).
     expect((error as GraphError).retryAfterSeconds).toBe(62);
-    expect((error as GraphError).message).toMatch(/retry after 62s/);
+    expect((error as GraphError).message).not.toMatch(/retry after|\d+s/);
     expect(calls).toHaveLength(1);
   });
 

@@ -273,11 +273,12 @@ export class GraphTeamsChats implements TeamsChatsPort {
     }
     const fresh = await this.membersOf(chatId).catch((caught: unknown) => {
       if (caught instanceof GraphError && caught.status === 429) {
-        const named = caught.retryAfterSeconds !== undefined ? ` — retry after ${caught.retryAfterSeconds}s` : '';
+        // The wait itself is NOT stated here — retryAfterSeconds (the 4th constructor argument)
+        // is the one place that number lives; retryAfterSuffix (graph-client.ts) is the only
+        // renderer, shared by the CLI and the MCP tool path (0.4.1 review round 2).
         throw new GraphError(
-          `THROTTLED: member list refresh for mention resolution was throttled${named}; ` +
-            'nothing was resolved. Wait the named window and try again — this does not mean the ' +
-            'name does not exist.',
+          'THROTTLED: member list refresh for mention resolution was throttled; nothing was ' +
+            'resolved. Wait and try again — this does not mean the name does not exist.',
           429,
           'MembersRefreshThrottled',
           caught.retryAfterSeconds,
@@ -430,9 +431,11 @@ export class GraphTeamsChats implements TeamsChatsPort {
         .map((raw) => toChatMessage(raw, chatId))
         .find((message) => message.id === messageId);
       if (!found) {
+        // Same rule as MembersRefreshThrottled above: the wait itself is not stated in the
+        // message text — retryAfterSeconds is the one place it lives, rendered once by
+        // retryAfterSuffix (0.4.1 review round 2).
         throw new GraphError(
-          `Message ${messageId} could not be fetched (that endpoint is throttled` +
-            `${caught.retryAfterSeconds ? `, retry in ${caught.retryAfterSeconds}s` : ''}) and is not ` +
+          `Message ${messageId} could not be fetched (that endpoint is throttled) and is not ` +
             'among the chat\'s last 50 messages — nothing was posted.',
           429,
           'MessageFetchThrottled',

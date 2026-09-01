@@ -108,10 +108,12 @@ Graph's Retry-After.
 ## Retry-After
 
 Any Graph 429 in the send/reply/edit path never auto-retries — that has always been the rule for
-writes (`GraphClient.post`/`ReliableTeamsChats`). The CLIs (`teams-post`, `teams-reply`,
-`teams-edit`) now also name the wait in their error output whenever Graph named one:
-`Too many requests (throttled, retry after 62s)`, so an operator staring at a failed send does not
-blind-retry into a worse throttle.
+writes (`GraphClient.post`/`ReliableTeamsChats`). Both consumer-facing surfaces now name the wait
+whenever Graph named one — the CLIs (`teams-post`, `teams-reply`, `teams-edit`) in their stderr
+output, and the MCP tools' error result text for whichever agent is driving the server directly:
+`Too many requests (throttled, retry after 62s)`. One shared renderer (`retryAfterSuffix` in
+`src/graph/graph-client.ts`) backs both, so neither surface can drift out of sync or silently lose
+the wait time (0.4.1 review round 2: the MCP tool path originally missed it entirely).
 
 ## Pinning
 

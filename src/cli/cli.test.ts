@@ -627,7 +627,9 @@ describe('run() — Retry-After discipline on the send path (0.4.1)', () => {
     const output = text();
     expect((output.match(/12s/g) ?? []).length).toBeLessThanOrEqual(1); // the number appears at most once
     expect(output).not.toMatch(/\d+s remain/); // the old, now-redundant phrasing is gone
-    expect(output).toMatch(/throttled, retry after \d+s/); // formatCliError's phrasing is the one that survives
+    // retryAfterSuffix (graph-client.ts) is the shared renderer both formatCliError (here) and
+    // guard() (server.ts, see server.test.ts's own "guard()" describe block) call — one owner.
+    expect(output).toMatch(/throttled, retry after \d+s/);
   });
 
   it('a non-429 failure: no throttle phrasing is added at all', async () => {
