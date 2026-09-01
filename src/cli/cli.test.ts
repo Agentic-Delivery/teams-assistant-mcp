@@ -602,6 +602,34 @@ describe('run() — Retry-After discipline on the send path (0.4.1)', () => {
     expect(text()).toMatch(/Too many requests/);
   });
 
+  // MINOR (review round 1): a REAL GraphClient-thrown LocallyThrottled error used to state the
+  // wait itself ("12s remain") inside its own message, and the CLI then ALSO appended
+  // "(throttled, retry after 12s)" — two different renderings of the same number in one line.
+  // This drives the real GraphClient throttle path (not a hand-built GraphError) end to end
+  // through run(), so it catches the duplication at its actual source, not just in
+  // formatCliError's own unit tests.
+  it('a LOCALLY throttled 429 (the client-side gate, not a live Graph response) prints the wait exactly once, not twice', async () => {
+    const { text } = captured();
+    const { GraphClient } = await import('../graph/graph-client.js');
+    const stubToken = { kind: 'stub', getAccessToken: async () => 't' };
+    const fetchFn = async () =>
+      new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'Too many requests' } }), {
+        status: 429,
+        headers: { 'content-type': 'application/json', 'retry-after': '12' },
+      });
+    const client = new GraphClient({ tokenProvider: stubToken as never, fetchFn: fetchFn as never });
+
+    await run(async () => {
+      await client.get('/chats/x/members', { readRetries: 0 }).catch(() => {}); // 1st: a real 429, closes the local gate
+      await client.get('/chats/x/members', { readRetries: 0 }); // 2nd: refused LOCALLY — this is the one that must reach run()
+    });
+
+    const output = text();
+    expect((output.match(/12s/g) ?? []).length).toBeLessThanOrEqual(1); // the number appears at most once
+    expect(output).not.toMatch(/\d+s remain/); // the old, now-redundant phrasing is gone
+    expect(output).toMatch(/throttled, retry after \d+s/); // formatCliError's phrasing is the one that survives
+  });
+
   it('a non-429 failure: no throttle phrasing is added at all', async () => {
     const { text } = captured();
 

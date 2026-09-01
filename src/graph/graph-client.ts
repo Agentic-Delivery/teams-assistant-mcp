@@ -117,6 +117,14 @@ export class GraphClient {
     return Math.max(0, Math.max(family, global) - now);
   }
 
+  /**
+   * The wait itself is stated exactly once, by whoever renders this error to a human — the CLI's
+   * formatCliError, currently the only such renderer (0.4.1 review round 1: this message used to
+   * say "12s remain" AND the CLI separately appended "(throttled, retry after 12s)", two
+   * renderings of the same number in one line). This message names WHICH gate is closed and
+   * nothing about timing; retryAfterSeconds (the constructor's 4th argument) is the one place
+   * that number lives, structurally, for any renderer to use.
+   */
   private assertGateOpen(path: string): void {
     const remaining = this.throttledForMs(path);
     if (remaining > 0) {
@@ -126,7 +134,7 @@ export class GraphClient {
         ? 'the GLOBAL gate (an application-wide throttle) — every resource family is closed'
         : `the gate for ${GraphClient.gateKeyFor(path)} — other resource families may still be fine`;
       throw new GraphError(
-        `Locally throttled: a recent 429 closed ${which}; ${Math.ceil(remaining / 1000)}s remain — ${path} not sent`,
+        `Locally throttled: a recent 429 closed ${which} — ${path} not sent`,
         429,
         'LocallyThrottled',
         Math.ceil(remaining / 1000),
