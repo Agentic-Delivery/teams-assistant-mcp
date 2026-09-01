@@ -73,18 +73,41 @@ describe('inbox poller', () => {
       .map((line) => JSON.parse(line) as Record<string, unknown>);
   }
 
-  it('appends one JSON line per new message, in the daemon-compatible shape', async () => {
+  // 0.4.1: a chat with no watermark on record — because this is the very first poll of a fresh
+  // install, or the state was lost/corrupted — is treated as "history unknown", not "empty".
+  // That first poll only ESTABLISHES the watermark; nothing already sitting in the chat at that
+  // moment is ever delivered. So every test below that wants to see delivery runs an initial
+  // "settling" poll first (harmless: nothing is emitted), exactly the way a real fresh install's
+  // first cycle behaves, then asserts on what a SECOND poll delivers.
+  async function settle(store: ReturnType<typeof chatStore>, chatIds = [CHAT]): Promise<void> {
+    // Poll once against whatever the store holds RIGHT NOW, before the messages under test are
+    // added, so the settle itself proves nothing about the chat's true starting content.
+    await poller(store, chatIds).pollOnce();
+  }
+
+  it('a brand-new chat (or a lost/corrupt sidecar) never backfills what already existed — starts from NOW (0.4.1)', async () => {
     const store = chatStore({
-      [CHAT]: [
-        message({ id: 'a', text: 'first', createdDateTime: '2026-08-21T10:00:00Z' }),
-        message({
-          id: 'b',
-          text: 'with a file',
-          createdDateTime: '2026-08-21T10:01:00Z',
-          attachments: [{ id: 'att-1', name: 'plan.xlsx' }],
-        }),
-      ],
+      [CHAT]: [message({ id: 'ancient', text: 'predates this process', createdDateTime: '2026-08-01T00:00:00Z' })],
     });
+
+    await poller(store).pollOnce(); // the very first poll: settles the watermark, delivers nothing
+
+    expect(await inboxLines()).toEqual([]);
+  });
+
+  it('appends one JSON line per new message, in the daemon-compatible shape', async () => {
+    const store = chatStore({});
+    await settle(store);
+    store.add(
+      CHAT,
+      message({ id: 'a', text: 'first', createdDateTime: '2026-08-21T10:00:00Z' }),
+      message({
+        id: 'b',
+        text: 'with a file',
+        createdDateTime: '2026-08-21T10:01:00Z',
+        attachments: [{ id: 'att-1', name: 'plan.xlsx' }],
+      }),
+    );
 
     await poller(store).pollOnce();
 
@@ -102,12 +125,13 @@ describe('inbox poller', () => {
   });
 
   it('never echoes the signed-in account back as an inbox event', async () => {
-    const store = chatStore({
-      [CHAT]: [
-        message({ id: 'own', fromId: me.id, from: me.displayName, text: 'my own post' }),
-        message({ id: 'theirs', text: 'a question', createdDateTime: '2026-08-21T10:01:00Z' }),
-      ],
-    });
+    const store = chatStore({});
+    await settle(store);
+    store.add(
+      CHAT,
+      message({ id: 'own', fromId: me.id, from: me.displayName, text: 'my own post' }),
+      message({ id: 'theirs', text: 'a question', createdDateTime: '2026-08-21T10:01:00Z' }),
+    );
 
     await poller(store).pollOnce();
 
@@ -115,13 +139,14 @@ describe('inbox poller', () => {
   });
 
   it('drops deleted stubs and messages with no text and no attachments', async () => {
-    const store = chatStore({
-      [CHAT]: [
-        message({ id: 'gone', isDeleted: true, text: '' }),
-        message({ id: 'event', text: '   ', createdDateTime: '2026-08-21T10:01:00Z' }),
-        message({ id: 'real', text: 'kept', createdDateTime: '2026-08-21T10:02:00Z' }),
-      ],
-    });
+    const store = chatStore({});
+    await settle(store);
+    store.add(
+      CHAT,
+      message({ id: 'gone', isDeleted: true, text: '' }),
+      message({ id: 'event', text: '   ', createdDateTime: '2026-08-21T10:01:00Z' }),
+      message({ id: 'real', text: 'kept', createdDateTime: '2026-08-21T10:02:00Z' }),
+    );
 
     await poller(store).pollOnce();
 
@@ -129,8 +154,10 @@ describe('inbox poller', () => {
   });
 
   it('does not re-emit delivered messages after a restart, thanks to the state sidecar', async () => {
-    const store = chatStore({ [CHAT]: [message({ id: 'a' })] });
-    await poller(store).pollOnce();
+    const store = chatStore({});
+    await settle(store);
+    store.add(CHAT, message({ id: 'a' }));
+    await poller(store).pollOnce(); // 'a' genuinely delivered, pre-restart
 
     // Fresh instance over the same files = a server restart.
     const restarted = poller(store);
@@ -141,21 +168,25 @@ describe('inbox poller', () => {
   });
 
   it('drops an exact replay of the newest message by id, not just by timestamp', async () => {
-    // A port that ignores the watermark and always re-serves the same message.
+    // A port that ignores the watermark and always re-serves the same message — simulates Graph
+    // returning a message exactly at the watermark boundary again, which timestamp comparison
+    // alone cannot distinguish from a genuinely new message sharing that timestamp.
     const replaying = {
       readMessages: () =>
         Promise.resolve({ messages: [message({ id: 'a' })], watermark: '2026-08-21T10:00:00Z' }),
     };
     const inbox = poller(replaying);
 
-    await inbox.pollOnce();
-    await inbox.pollOnce();
+    await inbox.pollOnce(); // settles: 'a' establishes the watermark, delivered to no one
+    await inbox.pollOnce(); // same 'a' served again — the id check must still drop it
 
-    expect((await inboxLines()).map((line) => line['id'])).toEqual(['a']);
+    expect(await inboxLines()).toEqual([]);
   });
 
   it('truncates very long messages to 2000 characters', async () => {
-    const store = chatStore({ [CHAT]: [message({ id: 'long', text: 'x'.repeat(5000) })] });
+    const store = chatStore({});
+    await settle(store);
+    store.add(CHAT, message({ id: 'long', text: 'x'.repeat(5000) }));
 
     await poller(store).pollOnce();
 
@@ -178,7 +209,9 @@ describe('inbox poller', () => {
   });
 
   it('keeps delivering the healthy chats, at full speed, when one chat fails', async () => {
-    const store = chatStore({ [OTHER]: [message({ id: 'ok', chatId: OTHER })] });
+    const store = chatStore({});
+    await settle(store, [CHAT, OTHER]);
+    store.add(OTHER, message({ id: 'ok', chatId: OTHER }));
     const flaky = {
       readMessages: (chatId: string, since?: string) =>
         chatId === CHAT
@@ -214,17 +247,40 @@ describe('inbox poller', () => {
     expect(errors).toHaveLength(2);
   });
 
-  it('starts from scratch when the state file is corrupt rather than refusing to poll', async () => {
-    const store = chatStore({ [CHAT]: [message({ id: 'a' })] });
-    await poller(store).pollOnce();
+  it('a corrupt state file degrades to starting from now, never replaying full history (0.4.1)', async () => {
+    const store = chatStore({});
+    await settle(store);
+    store.add(CHAT, message({ id: 'a' }));
+    await poller(store).pollOnce(); // 'a' genuinely delivered
 
     const { writeFile } = await import('node:fs/promises');
-    await writeFile(statePath, 'not json at all');
-    const clean = await poller(store).pollOnce();
+    await writeFile(statePath, 'not json at all'); // sidecar lost
+    store.add(CHAT, message({ id: 'b', text: 'arrives after the corruption', createdDateTime: '2026-08-21T10:10:00Z' }));
+    const clean = await poller(store).pollOnce(); // treated as a fresh install: settles, delivers nothing
 
     expect(clean).toBe(true);
-    // The one acceptable duplicate: losing the state file re-reads the recent window once.
-    expect((await inboxLines()).map((line) => line['id'])).toEqual(['a', 'a']);
+    expect((await inboxLines()).map((line) => line['id'])).toEqual(['a']); // 'a' never replayed, 'b' not yet either
+
+    store.add(CHAT, message({ id: 'c', text: 'genuinely new, after the re-settle', createdDateTime: '2026-08-21T10:20:00Z' }));
+    await poller(store).pollOnce(); // a normal poll now — 'c' postdates the re-settled watermark
+
+    // 'b' was itself the newest message present AT the re-settle poll, so it became the new
+    // watermark baseline rather than being delivered — same "settles, does not deliver" contract
+    // as the very first bootstrap. Only 'c', which arrived strictly after that, is new.
+    expect((await inboxLines()).map((line) => line['id'])).toEqual(['a', 'c']);
+  });
+
+  it('writes the state sidecar atomically — no partially-written file survives a write (0.4.1)', async () => {
+    const store = chatStore({});
+    await settle(store);
+    store.add(CHAT, message({ id: 'a' }));
+    await poller(store).pollOnce();
+
+    const { readdir } = await import('node:fs/promises');
+    const entries = await readdir(join(dir, 'nested'));
+
+    expect(entries.filter((name) => name.includes('.tmp-'))).toEqual([]);
+    expect(entries).toContain('inbox-state.json');
   });
 });
 
