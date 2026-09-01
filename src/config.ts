@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { type AllowedChat, ChatAllowlist } from './allowlist.js';
+import { DEFAULT_MEMBERS_TTL_MS } from './graph/members-cache.js';
 
 export interface TeamsMcpConfig {
   tenantId: string;
@@ -22,7 +23,10 @@ export interface TeamsMcpConfig {
   membersTtlMs: number;
 }
 
-export const DEFAULT_MEMBERS_TTL_SECONDS = 24 * 60 * 60;
+/** Derived, not hardcoded a second time: members-cache.ts's DEFAULT_MEMBERS_TTL_MS is the single
+ *  source of truth for "24h" (0.4.1 review round 1: two independently-hardcoded "24h" constants
+ *  could silently drift apart). */
+export const DEFAULT_MEMBERS_TTL_SECONDS = DEFAULT_MEMBERS_TTL_MS / 1000;
 
 export interface AllowlistFile {
   assistantDisplayName?: string;
@@ -137,7 +141,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): TeamsMcpConfig
     tokenCachePath,
     assistantDisplayName: file.assistantDisplayName ?? DEFAULT_ASSISTANT_DISPLAY_NAME,
     allowlist: new ChatAllowlist(file.allowedChats ?? []),
-    membersCachePath: join(dirname(tokenCachePath), 'members-cache.json'),
+    membersCachePath: join(dirname(tokenCachePath), '.members-cache.json'),
     membersTtlMs: membersTtlSecondsFrom(env) * 1000,
   };
 }

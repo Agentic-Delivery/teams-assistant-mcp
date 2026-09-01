@@ -8,6 +8,11 @@ teams-mcp.config.json
 .token-cache.json
 *.token-cache.json
 
+# Per-chat @mention member cache — not secret, but per-instance state, same as the token cache
+# it lives next to; nothing here belongs in the repo either.
+.members-cache.json
+*.members-cache.json
+
 # npm pack output
 *.tgz
 

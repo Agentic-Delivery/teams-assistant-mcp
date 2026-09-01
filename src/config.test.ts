@@ -107,7 +107,7 @@ describe('member cache config (0.4.1)', () => {
 
     const config = loadConfig({ ...CREDS, TEAMS_MCP_CONFIG: path, TEAMS_MCP_TOKEN_CACHE: tokenCache });
 
-    expect(config.membersCachePath).toBe(join(tmpdir(), 'some-instance-dir', 'members-cache.json'));
+    expect(config.membersCachePath).toBe(join(tmpdir(), 'some-instance-dir', '.members-cache.json'));
     expect(config.membersTtlMs).toBe(24 * 60 * 60 * 1000);
   });
 
