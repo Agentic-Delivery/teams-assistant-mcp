@@ -95,6 +95,26 @@ Only mention people who need to act — an owner, a question addressed to them. 
 named in a message is how notifications stop meaning anything; see the `teams-styling` skill's
 "Mentions" section for the full doctrine.
 
+Mention resolution reads a per-chat member cache (disk-persisted next to the token cache, TTL
+`TEAMS_MCP_MEMBERS_TTL_SECONDS`, default 24h) instead of calling Graph's `/chats/{id}/members` on
+every send — that endpoint shares a throttle budget across every process signed in with the same
+client id (see "Throttle budgets are per client id" below), and a chat's membership in this fixed
+pilot allowlist effectively never changes. A cache hit resolves with zero Graph calls; a miss (no
+entry, an expired one, or a name the cached roster does not have) refreshes once and re-checks — a
+name still unresolved after that gets the usual clear error. A 429 on that one refresh call is
+never swallowed into a false "no such member": it surfaces as its own throttled error naming
+Graph's Retry-After.
+
+## Retry-After
+
+Any Graph 429 in the send/reply/edit path never auto-retries — that has always been the rule for
+writes (`GraphClient.post`/`ReliableTeamsChats`). Both consumer-facing surfaces now name the wait
+whenever Graph named one — the CLIs (`teams-post`, `teams-reply`, `teams-edit`) in their stderr
+output, and the MCP tools' error result text for whichever agent is driving the server directly:
+`Too many requests (throttled, retry after 62s)`. One shared renderer (`retryAfterSuffix` in
+`src/graph/graph-client.ts`) backs both, so neither surface can drift out of sync or silently lose
+the wait time (0.4.1 review round 2: the MCP tool path originally missed it entirely).
+
 ## Pinning
 
 `pin_chat_message` / `unpin_chat_message` / `list_pinned_messages` manage a chat's pinned
@@ -124,9 +144,23 @@ characters, `attachments` a count. Messages posted by the signed-in account itse
 (resolved via `/me`, so the assistant's own posts never echo back as inbox events), as are
 deleted stubs and empty system events.
 
-The sidecar remembers the delivered watermark and newest message id per chat, so a server
-restart never re-emits old messages. Losing the sidecar is safe: the next poll re-reads the
-recent window once and moves on.
+The sidecar remembers the delivered watermark and newest message id per chat (written atomically —
+temp file then rename, so a crash mid-write cannot itself corrupt it), so a server restart never
+re-emits old messages. A chat with no watermark on record — a genuinely fresh install, or a lost or
+corrupted sidecar — starts from NOW: that first poll only establishes the watermark and delivers
+nothing, rather than backfilling whatever already existed in the chat (0.4.1; a live restart had
+backfilled roughly 40 old messages under the previous "re-read the recent window once" fallback).
+
+If the poller sees several consecutive poll failures (default threshold 3), it forces the token
+provider to drop its cached token and re-authenticate from scratch, rather than waiting on a
+process restart to notice a token gone bad server-side (0.4.1; observed live: only a restart
+recovered from this). Two tiers, same threshold: a 401 or an error naming `invalid_grant`/an
+AADSTS code/token expiry is the fast, recognisable path; any OTHER consistent run of failures also
+triggers the same remedy as a last resort, because the actual live incident's own log line —
+`inbox poll failed: <chat>: fetch failed`, repeated, no status code, while Graph itself answered
+200 to parallel probes — matched neither shape (see KNOWN-ISSUES.md for the verbatim evidence). The
+remedy fires once per failing streak and logs what actually happened at each step (requested, then
+still failing, or recovered), not just the initial intent.
 
 A failing poll appends `{"error": "...", "at": "..."}` to the same file. That line is the
 difference between "the chats are quiet" and "auth is dead" — a watcher must never have to
@@ -280,13 +314,26 @@ credential, an account name, or a tenant id, and nothing ever should.
 | `TEAMS_MCP_USERNAME` | yes | Assistant account UPN |
 | `TEAMS_MCP_PASSWORD` | yes | |
 | `TEAMS_MCP_CONFIG` | yes | Path to the allowlist config. The server will not start without one |
-| `TEAMS_MCP_CLIENT_ID` | no | Defaults to the first-party Teams client id; see SETUP.md for why you usually want the Office one |
-| `TEAMS_MCP_TOKEN_CACHE` | no | Defaults to `.token-cache.json` in the working directory |
+| `TEAMS_MCP_CLIENT_ID` | no | Defaults to the first-party Teams client id; see SETUP.md for why you usually want the Office one. Also the knob for Graph throttle isolation — see "Throttle budgets are per client id" below |
+| `TEAMS_MCP_TOKEN_CACHE` | no | Defaults to `.token-cache.json` in the working directory. The members cache (see "@mentions" below) lives next to it |
+| `TEAMS_MCP_MEMBERS_TTL_SECONDS` | no | How long a chat's cached member list is trusted before a mention resolution refreshes it. Defaults to 24h (86400) |
 | `TEAMS_MCP_DOWNLOAD_DIR` | no | Where `get_chat_attachment` writes. Defaults to a temp directory |
 | `TEAMS_MCP_UPLOAD_DIR` | no | OneDrive folder where `send_chat_file` parks uploads. Defaults to `ai-test` |
 | `TEAMS_MCP_DISPLAY_NAME` | no | Overrides the expected display name for the probe |
 | `TEAMS_INBOX_PATH` | no | Where the background inbox JSONL lands. Defaults to `~/.teams-assistant/inbox.jsonl` |
 | `TEAMS_INBOX_DISABLED` | no | Set to `1` to not run the background inbox poller at all |
+
+### Throttle budgets are per client id
+
+Microsoft Graph's throttle budget for the `/chats`, `/messages` and `/members` families is keyed
+by application (client id) *and* signed-in user together. Two long-lived processes signed in as
+the same account with the same `TEAMS_MCP_CLIENT_ID` (the default first-party Teams id, if neither
+overrides it) SHARE one budget — a 429 either one earns closes the gate for both, and one daemon's
+traffic can keep the other permanently throttled even though it made none of the offending calls
+itself (verified live, 0.4.1: two daemons on the same default client id, one bystander). Giving
+each long-lived instance its own `TEAMS_MCP_CLIENT_ID` (any other Microsoft first-party id — see
+SETUP.md's client-id section) decouples their budgets. This is documentation only: the env
+override already exists (`config.ts`'s `pick(env, ['TEAMS_MCP_CLIENT_ID'])`), nothing new to wire.
 
 `env.example` lists the same variables with comments, and SETUP.md walks through filling them in
 (including why the password wants single quotes and the paths want to be absolute). Put real

@@ -117,9 +117,27 @@ interface GraphDriveItem {
   webUrl?: string;
 }
 
+/**
+ * The narrow shape resolveMentions actually needs from a members cache — deliberately an
+ * interface, not the concrete `MembersCache` class, so a test that has no reason to touch mention
+ * resolution can wire a trivial in-memory double instead of a real disk-backed cache.
+ */
+export interface MembersCachePort {
+  get(chatId: string): ChatMember[] | undefined;
+  set(chatId: string, members: ChatMember[]): void;
+}
+
 export interface GraphTeamsChatsOptions {
   /** OneDrive folder (under the account's drive root) where outbound files are uploaded. */
   uploadDir?: string;
+  /**
+   * Disk-persisted per-chat membership cache — see members-cache.ts's doc comment for why this
+   * exists (0.4.1: a shared Graph throttle budget on `/members` starved mention resolution).
+   * REQUIRED, not optional: an optional cache let production silently fall back to the throttled
+   * endpoint with no test able to catch a dropped wire (0.4.1 review round 1) — every caller,
+   * production or test, must say explicitly what it wants here.
+   */
+  membersCache: MembersCachePort;
 }
 
 export const DEFAULT_UPLOAD_DIR = 'ai-test';
@@ -166,12 +184,14 @@ function toPinnedMessage(entry: GraphPinnedMessage): PinnedMessage | undefined {
 
 export class GraphTeamsChats implements TeamsChatsPort {
   private readonly uploadDir: string;
+  private readonly membersCache: MembersCachePort;
 
   constructor(
     private readonly graph: GraphClient,
-    options: GraphTeamsChatsOptions = {},
+    options: GraphTeamsChatsOptions,
   ) {
     this.uploadDir = options.uploadDir?.trim() || DEFAULT_UPLOAD_DIR;
+    this.membersCache = options.membersCache;
   }
 
   async listChats(): Promise<ChatSummary[]> {
@@ -214,8 +234,60 @@ export class GraphTeamsChats implements TeamsChatsPort {
     });
   }
 
+  /**
+   * A miss deserves a refresh; a definitively wrong CALL does not. Only "not found" (the cached
+   * roster genuinely lacks this name) and "no AAD id" (the cached member has one, but Graph never
+   * reported an id for them) are staleness shapes a fresh roster might fix. "Ambiguous" (matches
+   * more than one member) and "empty name" are caller errors a refresh cannot fix — refreshing
+   * anyway would spend a Graph call and delay the real error behind a THROTTLED one if the
+   * endpoint happens to be down (0.4.1 review round 1: the original catch was unconditional).
+   */
+  private static isRefreshWorthy(error: unknown): boolean {
+    return (
+      error instanceof Error &&
+      (error.message.startsWith('No chat member matches') || /has no AAD user id on record/.test(error.message))
+    );
+  }
+
+  /**
+   * Cache-first: a hit resolves every name against the on-disk roster with ZERO Graph calls. A
+   * miss — no cache, an expired entry, or a name the cached roster does not have — refreshes ONCE
+   * (a single `/members` call, never a retry loop) and re-checks against the fresh roster; a name
+   * still unresolved after that gets resolveMentionTargets's own clear error. A 429 on that
+   * refresh is never swallowed into "no match" — it surfaces as its own THROTTLED error naming
+   * Retry-After, so a caller sees a throttle, not a false "no such member" (0.4.1, live-diagnosed:
+   * this endpoint shares a throttle budget with another daemon on the same first-party client id).
+   */
   async resolveMentions(chatId: string, names: readonly string[]): Promise<MentionTarget[]> {
-    return resolveMentionTargets(names, await this.membersOf(chatId));
+    const cache = this.membersCache;
+    const cached = cache.get(chatId);
+    if (cached) {
+      try {
+        return resolveMentionTargets(names, cached);
+      } catch (error) {
+        if (!GraphTeamsChats.isRefreshWorthy(error)) {
+          throw error; // ambiguous / empty name: a refresh cannot fix a caller error
+        }
+        // Fall through to a single refresh — see doc comment above.
+      }
+    }
+    const fresh = await this.membersOf(chatId).catch((caught: unknown) => {
+      if (caught instanceof GraphError && caught.status === 429) {
+        // The wait itself is NOT stated here — retryAfterSeconds (the 4th constructor argument)
+        // is the one place that number lives; retryAfterSuffix (graph-client.ts) is the only
+        // renderer, shared by the CLI and the MCP tool path (0.4.1 review round 2).
+        throw new GraphError(
+          'THROTTLED: member list refresh for mention resolution was throttled; nothing was ' +
+            'resolved. Wait and try again — this does not mean the name does not exist.',
+          429,
+          'MembersRefreshThrottled',
+          caught.retryAfterSeconds,
+        );
+      }
+      throw caught;
+    });
+    cache.set(chatId, fresh);
+    return resolveMentionTargets(names, fresh);
   }
 
   async readMessages(chatId: string, since?: string, limit = 50): Promise<ReadResult> {
@@ -359,9 +431,11 @@ export class GraphTeamsChats implements TeamsChatsPort {
         .map((raw) => toChatMessage(raw, chatId))
         .find((message) => message.id === messageId);
       if (!found) {
+        // Same rule as MembersRefreshThrottled above: the wait itself is not stated in the
+        // message text — retryAfterSeconds is the one place it lives, rendered once by
+        // retryAfterSuffix (0.4.1 review round 2).
         throw new GraphError(
-          `Message ${messageId} could not be fetched (that endpoint is throttled` +
-            `${caught.retryAfterSeconds ? `, retry in ${caught.retryAfterSeconds}s` : ''}) and is not ` +
+          `Message ${messageId} could not be fetched (that endpoint is throttled) and is not ` +
             'among the chat\'s last 50 messages — nothing was posted.',
           429,
           'MessageFetchThrottled',

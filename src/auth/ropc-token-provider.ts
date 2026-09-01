@@ -43,6 +43,7 @@ export class RopcTokenProvider implements TokenProvider {
   private readonly scope: string;
   private readonly tokenEndpoint: string;
   private inFlight: Promise<string> | undefined;
+  private forceReauth = false;
 
   constructor(private readonly options: RopcOptions) {
     this.cache = options.cache ?? new MemoryTokenCache();
@@ -54,15 +55,32 @@ export class RopcTokenProvider implements TokenProvider {
   }
 
   async getAccessToken(): Promise<string> {
-    const cached = this.cache.read();
+    const cached = this.forceReauth ? undefined : this.cache.read();
     if (cached && cached.expiresAt - EXPIRY_SKEW_MS > this.now()) {
       return cached.accessToken;
     }
     // Concurrent tool calls must not each fire their own password grant.
-    this.inFlight ??= this.acquire(cached?.refreshToken).finally(() => {
-      this.inFlight = undefined;
-    });
+    this.inFlight ??= this.acquire(cached?.refreshToken)
+      // forceReauth clears ONLY on a successful re-mint (0.4.1 review round 1, runtime-verified):
+      // clearing it in a .finally() meant a FAILED forced re-mint silently reverted to serving
+      // the still-locally-valid cached token on the very next call — the exact dead-token-forever
+      // bug invalidate() exists to break out of. A rejection leaves forceReauth set, so the next
+      // getAccessToken() tries ROPC again instead of quietly trusting the cache.
+      .then((token) => {
+        this.forceReauth = false;
+        return token;
+      })
+      .finally(() => {
+        this.inFlight = undefined;
+      });
     return this.inFlight;
+  }
+
+  /** See TokenProvider.invalidate's doc comment. Dropping the cached token here (rather than just
+   *  the refresh token) means the forced re-auth is a full password grant — "re-run ROPC" — not
+   *  a refresh_token exchange against a possibly equally-dead refresh token. */
+  invalidate(): void {
+    this.forceReauth = true;
   }
 
   private async acquire(refreshToken: string | undefined): Promise<string> {

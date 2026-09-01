@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { ChatAllowlist } from './allowlist.js';
+import { GraphError } from './graph/graph-client.js';
 import { buildServer } from './server.js';
 import { applyWatermark, toChatMessage } from './messages.js';
 import type {
@@ -829,5 +830,48 @@ describe('poll_chats', () => {
 
     expect(Object.keys(payload.messagesByChat)).toEqual([PILOT]);
     expect(payload.failures.map((failure) => failure.chatId)).toEqual([WATCHED]);
+  });
+});
+
+describe('guard() — every MCP tool failure renders Retry-After the same way the CLI does (0.4.1 review round 2)', () => {
+  // Round 1 fixed the CLI's error text but never touched guard() (server.ts), which only ever
+  // read `error.name`/`error.message` — an agent driving the MCP server got a throttle refusal
+  // with NO wait time at all, a regression vs main (main's embedded-in-message wording at least
+  // named a number, however duplicated). retryAfterSuffix (graph-client.ts) is now the one place
+  // both guard() and the CLI's formatCliError render this from, so this test exercises the MCP
+  // tool path specifically, not the CLI.
+  it('a Graph 429 with a named Retry-After: the MCP tool result names it, agent-readable', async () => {
+    chats.sendMessage = async () => {
+      throw new GraphError('Too many requests', 429, 'TooManyRequests', 23);
+    };
+
+    const result = await call(client, 'send_chat_message', { chatId: PILOT, text: 'Hi' });
+
+    expect(result.isError).toBe(true);
+    expect(result.text).toMatch(/throttled, retry after 23s/);
+  });
+
+  it('a Graph 429 with NO named Retry-After: no invented number in the MCP tool result', async () => {
+    chats.sendMessage = async () => {
+      throw new GraphError('Too many requests', 429, 'TooManyRequests');
+    };
+
+    const result = await call(client, 'send_chat_message', { chatId: PILOT, text: 'Hi' });
+
+    expect(result.isError).toBe(true);
+    expect(result.text).not.toMatch(/throttled, retry after/);
+    expect(result.text).toMatch(/Too many requests/);
+  });
+
+  it('a non-429 failure carries no throttle phrasing at all', async () => {
+    chats.sendMessage = async () => {
+      throw new Error('network unreachable');
+    };
+
+    const result = await call(client, 'send_chat_message', { chatId: PILOT, text: 'Hi' });
+
+    expect(result.isError).toBe(true);
+    expect(result.text).not.toMatch(/throttled, retry after/);
+    expect(result.text).toMatch(/network unreachable/);
   });
 });
