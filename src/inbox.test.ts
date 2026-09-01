@@ -395,3 +395,104 @@ describe('inbox poller — the clean verdict counts only the chats actually aske
     expect(asked).toHaveLength(2);
   });
 });
+
+describe('inbox poller — stuck-auth self-healing (0.4.1, live-diagnosed: only a process restart recovered)', () => {
+  let dir: string; let inboxPath: string; let statePath: string;
+  beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'inbox-authstuck-')); inboxPath = join(dir, 'inbox.jsonl'); statePath = join(dir, 'inbox-state.json'); });
+  afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  function authError(): Error {
+    return Object.assign(new Error('token expired'), { status: 401 });
+  }
+
+  it('N consecutive auth-shaped poll failures force a token re-mint exactly once', async () => {
+    let onAuthStuckCalls = 0;
+    const readMessages = () => Promise.reject(authError());
+    const p = new InboxPoller({
+      chats: { readMessages },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+      authFailureThreshold: 3,
+      onAuthStuck: () => {
+        onAuthStuckCalls += 1;
+      },
+    });
+
+    await p.pollOnce();
+    expect(onAuthStuckCalls).toBe(0);
+    await p.pollOnce();
+    expect(onAuthStuckCalls).toBe(0);
+    await p.pollOnce(); // the 3rd consecutive auth-shaped failure
+    expect(onAuthStuckCalls).toBe(1);
+  });
+
+  it('a successful poll resets the streak — three failures, one success, two more failures never fires', async () => {
+    let alive = false;
+    let onAuthStuckCalls = 0;
+    const store = chatStore({});
+    const readMessages = (chatId: string, since?: string) =>
+      alive ? store.readMessages(chatId, since) : Promise.reject(authError());
+    const p = new InboxPoller({
+      chats: { readMessages },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+      authFailureThreshold: 3,
+      onAuthStuck: () => {
+        onAuthStuckCalls += 1;
+      },
+    });
+
+    await p.pollOnce();
+    await p.pollOnce();
+    alive = true;
+    await p.pollOnce(); // recovers — resets the streak
+    alive = false;
+    await p.pollOnce();
+    await p.pollOnce();
+
+    expect(onAuthStuckCalls).toBe(0);
+  });
+
+  it('a non-auth-shaped failure (plain network error, no status) never triggers a forced re-mint', async () => {
+    let onAuthStuckCalls = 0;
+    const readMessages = () => Promise.reject(new Error('fetch failed'));
+    const p = new InboxPoller({
+      chats: { readMessages },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+      authFailureThreshold: 3,
+      onAuthStuck: () => {
+        onAuthStuckCalls += 1;
+      },
+    });
+
+    await p.pollOnce();
+    await p.pollOnce();
+    await p.pollOnce();
+    await p.pollOnce();
+
+    expect(onAuthStuckCalls).toBe(0);
+  });
+
+  it('a poller with no onAuthStuck configured never throws, even past the threshold', async () => {
+    const readMessages = () => Promise.reject(authError());
+    const p = new InboxPoller({
+      chats: { readMessages },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+      authFailureThreshold: 2,
+    });
+
+    await expect(p.pollOnce()).resolves.toBe(false);
+    await expect(p.pollOnce()).resolves.toBe(false);
+    await expect(p.pollOnce()).resolves.toBe(false);
+  });
+});

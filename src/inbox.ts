@@ -33,6 +33,35 @@ export interface InboxPollerDeps {
   nowFn?: () => number;
   maxBackoffMs?: number;
   log?: (line: string) => void;
+  /**
+   * Called once a poll cycle ends with an auth-shaped failure (401, or a message naming
+   * invalid_grant/an AADSTS code/token expiry) for the `authFailureThreshold`th CONSECUTIVE time
+   * — see the 0.4.1 doc comment on trackAuthHealth for the live-diagnosed stuck-auth mode this
+   * exists to break out of. Typically wired to the token provider's own `invalidate()`.
+   */
+  onAuthStuck?: () => void;
+  /** Consecutive auth-shaped poll failures before onAuthStuck fires. Default 3. */
+  authFailureThreshold?: number;
+}
+
+/**
+ * Auth-shaped: the kind of failure a dead-but-not-yet-locally-expired cached token produces.
+ * Matched broadly on purpose — a 401 status, this server's own AuthenticationError, or Entra's
+ * usual vocabulary (invalid_grant, an AADSTS code, "token" + "expir…") — because the actual shape
+ * Graph answers with when a token goes bad server-side was not pinned down from code inspection
+ * alone; see trackAuthHealth's doc comment for what IS known and what remains a hypothesis.
+ */
+function isAuthShaped(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  if ((error as { status?: number }).status === 401) {
+    return true;
+  }
+  if (error.name === 'AuthenticationError') {
+    return true;
+  }
+  return /invalid_grant|AADSTS\d+|token[^a-z]{0,10}expir/i.test(error.message);
 }
 
 interface ChatState {
@@ -51,6 +80,9 @@ export const DEFAULT_POLL_MS = 30_000;
 /** A chat that answers 403 (not a member) is re-tried this often instead of every cycle. */
 export const PARK_FORBIDDEN_CHAT_MS = 10 * 60_000;
 export const DEFAULT_MAX_BACKOFF_MS = 600_000;
+/** Twice was already enough to be worth fixing (0.4.1's live diagnosis); one more than that
+ *  guards against firing on an ordinary transient blip that would have cleared on its own. */
+export const DEFAULT_AUTH_FAILURE_THRESHOLD = 3;
 
 export class InboxPoller {
   private readonly pollMs: number;
@@ -63,6 +95,9 @@ export class InboxPoller {
   private lastErrorSignature: string | undefined;
   private readonly parked = new Map<string, number>();
   private readonly now: () => number;
+  private readonly onAuthStuck: (() => void) | undefined;
+  private readonly authFailureThreshold: number;
+  private authFailureStreak = 0;
 
   constructor(private readonly deps: InboxPollerDeps) {
     this.pollMs = deps.pollMs ?? DEFAULT_POLL_MS;
@@ -70,6 +105,8 @@ export class InboxPoller {
     this.log = deps.log ?? (() => {});
     this.backoffMs = this.pollMs;
     this.now = deps.nowFn ?? (() => Date.now());
+    this.onAuthStuck = deps.onAuthStuck;
+    this.authFailureThreshold = deps.authFailureThreshold ?? DEFAULT_AUTH_FAILURE_THRESHOLD;
   }
 
   /**
@@ -122,6 +159,7 @@ export class InboxPoller {
 
       let throttled = false;
       let attempted = 0;
+      let authShapedFailure = false;
       for (const entry of this.deps.allowlist.entries()) {
         if (throttled) {
           break; // one 429 ends the cycle — every further request would feed the penalty window
@@ -187,6 +225,9 @@ export class InboxPoller {
           } else if (status === 403) {
             this.parked.set(entry.id, this.now() + PARK_FORBIDDEN_CHAT_MS);
           }
+          if (isAuthShaped(error)) {
+            authShapedFailure = true;
+          }
         }
       }
 
@@ -201,13 +242,48 @@ export class InboxPoller {
         // thing that ends a throttle. A single dead chat still doesn't slow the healthy ones —
         // but the denominator is the chats this cycle actually ASKED: with the 403 chats
         // parked, "one of three failed" must not hide "the only chat asked failed" (auth death).
-        return !throttled && failures.length < attempted;
+        const clean = !throttled && failures.length < attempted;
+        this.trackAuthHealth(clean, authShapedFailure);
+        return clean;
       }
       this.lastErrorSignature = undefined;
+      this.trackAuthHealth(true, false);
       return true;
     } catch (error) {
       await this.reportFailure(error instanceof Error ? error.message : String(error));
+      this.trackAuthHealth(false, isAuthShaped(error));
       return false;
+    }
+  }
+
+  /**
+   * Live-diagnosed stuck-auth mode (0.4.1): repeated "fetch failed"-shaped polls while Graph
+   * itself was reachable, recovered only by a process restart. Code inspection could not
+   * conclusively pin the root cause down to one line — RopcTokenProvider trusts its cached
+   * token purely by local clock (getAccessToken never learns that a LIVE 401 just happened), so
+   * a token that goes bad server-side without the local expiry ever catching up would explain
+   * it, but nothing here proves that is what actually happened live. This is deliberately the
+   * defensive fallback the 0.4.1 brief allows for exactly that situation: N consecutive
+   * auth-shaped poll failures force a token re-mint (dropping the cached token, re-running ROPC)
+   * rather than waiting on a human to notice and restart the process. A single success resets
+   * the streak; a non-auth-shaped failure neither advances nor resets it, so one unrelated blip
+   * between two real auth failures does not erase progress toward the threshold.
+   */
+  private trackAuthHealth(clean: boolean, authShaped: boolean): void {
+    if (clean) {
+      this.authFailureStreak = 0;
+      return;
+    }
+    if (!authShaped) {
+      return;
+    }
+    this.authFailureStreak += 1;
+    if (this.authFailureStreak >= this.authFailureThreshold) {
+      this.authFailureStreak = 0;
+      this.log(
+        `inbox poller: ${this.authFailureThreshold} consecutive auth-shaped poll failures — forcing token re-mint`,
+      );
+      this.onAuthStuck?.();
     }
   }
 
