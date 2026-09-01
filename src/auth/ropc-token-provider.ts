@@ -60,10 +60,19 @@ export class RopcTokenProvider implements TokenProvider {
       return cached.accessToken;
     }
     // Concurrent tool calls must not each fire their own password grant.
-    this.inFlight ??= this.acquire(cached?.refreshToken).finally(() => {
-      this.inFlight = undefined;
-      this.forceReauth = false;
-    });
+    this.inFlight ??= this.acquire(cached?.refreshToken)
+      // forceReauth clears ONLY on a successful re-mint (0.4.1 review round 1, runtime-verified):
+      // clearing it in a .finally() meant a FAILED forced re-mint silently reverted to serving
+      // the still-locally-valid cached token on the very next call — the exact dead-token-forever
+      // bug invalidate() exists to break out of. A rejection leaves forceReauth set, so the next
+      // getAccessToken() tries ROPC again instead of quietly trusting the cache.
+      .then((token) => {
+        this.forceReauth = false;
+        return token;
+      })
+      .finally(() => {
+        this.inFlight = undefined;
+      });
     return this.inFlight;
   }
 

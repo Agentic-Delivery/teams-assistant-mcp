@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -270,7 +270,7 @@ describe('inbox poller', () => {
     expect((await inboxLines()).map((line) => line['id'])).toEqual(['a', 'c']);
   });
 
-  it('writes the state sidecar atomically — no partially-written file survives a write (0.4.1)', async () => {
+  it('leaves no tmp file behind after a successful poll', async () => {
     const store = chatStore({});
     await settle(store);
     store.add(CHAT, message({ id: 'a' }));
@@ -281,6 +281,38 @@ describe('inbox poller', () => {
 
     expect(entries.filter((name) => name.includes('.tmp-'))).toEqual([]);
     expect(entries).toContain('inbox-state.json');
+  });
+
+  // MAJOR 4 (review round 1): the test above only proves no leftover tmp file — that passes
+  // identically whether saveState writes via temp+rename OR writes the destination directly
+  // (mutation-verified: deleting the rename and writing straight to statePath left it green).
+  // Injecting the write primitives is what makes "the destination is reached ONLY via rename" an
+  // honest, mutation-proof observable.
+  it('the state sidecar is reached ONLY via rename, never a direct write (atomicity, 0.4.1)', async () => {
+    const directWrites: string[] = [];
+    const renames: Array<{ from: string; to: string }> = [];
+    const store = chatStore({});
+    const p = new InboxPoller({
+      chats: store,
+      allowlist: new ChatAllowlist([{ id: CHAT, label: CHAT, canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+      writeFileFn: (async (target: Parameters<typeof writeFile>[0], ...rest: unknown[]) => {
+        directWrites.push(String(target));
+        return (writeFile as (...args: unknown[]) => Promise<void>)(target, ...rest);
+      }) as typeof writeFile,
+      renameFn: (async (from: Parameters<typeof rename>[0], to: Parameters<typeof rename>[1]) => {
+        renames.push({ from: String(from), to: String(to) });
+        return rename(from, to);
+      }) as typeof rename,
+    });
+
+    await p.pollOnce();
+
+    expect(directWrites).toHaveLength(1);
+    expect(directWrites[0]).not.toBe(statePath); // never written to the real destination directly
+    expect(renames).toEqual([{ from: directWrites[0], to: statePath }]);
   });
 });
 
@@ -457,7 +489,17 @@ describe('inbox poller — stuck-auth self-healing (0.4.1, live-diagnosed: only 
     expect(onAuthStuckCalls).toBe(0);
   });
 
-  it('a non-auth-shaped failure (plain network error, no status) never triggers a forced re-mint', async () => {
+  // MAJOR 5 (review round 1, evidence from the orchestrator's incident logs): the live symptom
+  // was literally `inbox poll failed: <chat>: fetch failed`, repeatedly, with NO status code
+  // visible in the log, while Graph answered 200 to parallel curl probes — recovered only by a
+  // process restart. A detector that only fires on 401/invalid_grant/AADSTS/token-expiry text
+  // would never have fired on the real incident. This is now a LAST-RESORT tier: N consecutive
+  // poll failures of ANY shape also force a re-mint — a spurious re-mint during a genuine network
+  // outage is cheap and harmless (the very next successful getAccessToken() call just does one
+  // extra password grant instead of reusing a cache); staying stuck is not. This test used to
+  // assert the OPPOSITE (never fires) — that assertion was locking the incident's exact shape out
+  // of the detector.
+  it('N consecutive failures of ANY shape (no status, no auth vocabulary) — the last-resort tier still forces a re-mint', async () => {
     let onAuthStuckCalls = 0;
     const readMessages = () => Promise.reject(new Error('fetch failed'));
     const p = new InboxPoller({
@@ -473,11 +515,11 @@ describe('inbox poller — stuck-auth self-healing (0.4.1, live-diagnosed: only 
     });
 
     await p.pollOnce();
-    await p.pollOnce();
-    await p.pollOnce();
-    await p.pollOnce();
-
     expect(onAuthStuckCalls).toBe(0);
+    await p.pollOnce();
+    expect(onAuthStuckCalls).toBe(0);
+    await p.pollOnce(); // 3rd consecutive failure, shapeless — the last-resort tier
+    expect(onAuthStuckCalls).toBe(1);
   });
 
   it('a poller with no onAuthStuck configured never throws, even past the threshold', async () => {
@@ -494,5 +536,85 @@ describe('inbox poller — stuck-auth self-healing (0.4.1, live-diagnosed: only 
     await expect(p.pollOnce()).resolves.toBe(false);
     await expect(p.pollOnce()).resolves.toBe(false);
     await expect(p.pollOnce()).resolves.toBe(false);
+  });
+
+  // MAJOR 3 (review round 1): resetting the streak the instant onAuthStuck is CALLED claims an
+  // outcome (recovery) the code cannot actually know yet — invalidate() only flags the token for
+  // re-auth; the real HTTP re-mint happens on the NEXT getAccessToken() call, whose result shows
+  // up as THIS poller's next poll. The streak must not reset until a poll actually comes back
+  // clean, and firing must not repeat on every single poll once past the threshold.
+  it('the remedy fires exactly once per failing streak — not once per poll past the threshold — and only resets on an actual clean poll', async () => {
+    let alive = false;
+    let onAuthStuckCalls = 0;
+    const store = chatStore({});
+    const readMessages = (chatId: string, since?: string) =>
+      alive ? store.readMessages(chatId, since) : Promise.reject(authError());
+    const p = new InboxPoller({
+      chats: { readMessages },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+      authFailureThreshold: 3,
+      onAuthStuck: () => {
+        onAuthStuckCalls += 1;
+      },
+    });
+
+    await p.pollOnce(); // 1
+    await p.pollOnce(); // 2
+    await p.pollOnce(); // 3 — fires
+    expect(onAuthStuckCalls).toBe(1);
+    // Keep failing well past a second threshold's worth with NO recovery in between. A design
+    // that reset the streak the instant it fires would count another 3 straight to 6 and fire
+    // AGAIN here — this is exactly the case that distinguishes "reset on fire" from "reset only
+    // on an actual clean poll".
+    await p.pollOnce(); // 4
+    await p.pollOnce(); // 5
+    await p.pollOnce(); // 6 — would be a 2nd trigger under "reset on fire"
+    await p.pollOnce(); // 7
+    expect(onAuthStuckCalls).toBe(1); // still just once — no clean poll has happened yet
+
+    alive = true;
+    await p.pollOnce(); // recovers — THIS is what may reset the streak, not the earlier firing
+    alive = false;
+    await p.pollOnce(); // 1 of a NEW streak
+    await p.pollOnce(); // 2
+    expect(onAuthStuckCalls).toBe(1);
+    await p.pollOnce(); // 3 of the new streak — fires again
+    expect(onAuthStuckCalls).toBe(2);
+  });
+
+  // MAJOR 3 / MINOR (log fires, injected dep): the log line must describe what is actually known
+  // at each point — a request was made, the remedy has not yet cleared it, or it recovered — not
+  // a single "forcing…" claim asserted once and never revisited.
+  it('the log line reports outcome, not just intent: requested, then still-failing, then recovered', async () => {
+    let alive = false;
+    const store = chatStore({});
+    const readMessages = (chatId: string, since?: string) =>
+      alive ? store.readMessages(chatId, since) : Promise.reject(authError());
+    const lines: string[] = [];
+    const p = new InboxPoller({
+      chats: { readMessages },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+      authFailureThreshold: 3,
+      onAuthStuck: () => {},
+      log: (line) => lines.push(line),
+    });
+
+    await p.pollOnce();
+    await p.pollOnce();
+    await p.pollOnce(); // fires
+    expect(lines.some((l) => /requested a forced token re-authentication/.test(l))).toBe(true);
+
+    await p.pollOnce(); // still failing — the remedy has not visibly worked yet
+    expect(lines.some((l) => /still failing after a forced token re-authentication/.test(l))).toBe(true);
+
+    alive = true;
+    await p.pollOnce();
+    expect(lines.some((l) => /recovered after a forced token re-authentication/.test(l))).toBe(true);
   });
 });
