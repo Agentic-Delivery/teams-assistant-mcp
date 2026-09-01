@@ -100,6 +100,34 @@ describe('config loading', () => {
   });
 });
 
+describe('member cache config (0.4.1)', () => {
+  it('places the members cache next to the token cache, defaulting the TTL to 24 hours', () => {
+    const path = withConfigFile({ allowedChats: [{ id: '19:a@thread.v2' }] });
+    const tokenCache = join(tmpdir(), 'some-instance-dir', '.token-cache.json');
+
+    const config = loadConfig({ ...CREDS, TEAMS_MCP_CONFIG: path, TEAMS_MCP_TOKEN_CACHE: tokenCache });
+
+    expect(config.membersCachePath).toBe(join(tmpdir(), 'some-instance-dir', 'members-cache.json'));
+    expect(config.membersTtlMs).toBe(24 * 60 * 60 * 1000);
+  });
+
+  it('TEAMS_MCP_MEMBERS_TTL_SECONDS overrides the default TTL', () => {
+    const path = withConfigFile({ allowedChats: [{ id: '19:a@thread.v2' }] });
+
+    const config = loadConfig({ ...CREDS, TEAMS_MCP_CONFIG: path, TEAMS_MCP_MEMBERS_TTL_SECONDS: '60' });
+
+    expect(config.membersTtlMs).toBe(60_000);
+  });
+
+  it('ignores a non-numeric or non-positive override rather than crashing the whole server on it', () => {
+    const path = withConfigFile({ allowedChats: [{ id: '19:a@thread.v2' }] });
+
+    const config = loadConfig({ ...CREDS, TEAMS_MCP_CONFIG: path, TEAMS_MCP_MEMBERS_TTL_SECONDS: 'nope' });
+
+    expect(config.membersTtlMs).toBe(24 * 60 * 60 * 1000);
+  });
+});
+
 describe('token cache on disk', () => {
   it('writes the cache readable only by the owner', () => {
     const path = join(mkdtempSync(join(tmpdir(), 'teams-mcp-cache-')), 'nested', '.token-cache.json');
