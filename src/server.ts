@@ -479,8 +479,9 @@ export function buildServer(deps: ServerDeps): McpServer {
         'member read access on it, then shares it into an allowlisted chat with canPost ' +
         'enabled, as a normal Teams file attachment. Real people see this immediately and it ' +
         'cannot be unsent through this server. Can fail BEFORE any upload if the chat\'s member ' +
-        'list cannot be resolved, or if any other member has no Microsoft account id on record ' +
-        '(nobody would be able to open the file for them) — and can fail AFTER a successful ' +
+        'list cannot be resolved, if any other member has no Microsoft account id on record ' +
+        '(nobody would be able to open the file for them), or if the assistant\'s own account ' +
+        'id cannot be looked up — and can fail AFTER a successful ' +
         'upload if the permission grant itself does not go through, in which case the file is ' +
         'left orphaned in the assistant\'s OneDrive rather than posted where recipients could ' +
         'not open it.',
