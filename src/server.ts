@@ -1,9 +1,9 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { basename, extname, join, resolve } from 'node:path';
-import { tmpdir } from 'node:os';
+import { readFile } from 'node:fs/promises';
+import { basename, extname } from 'node:path';
 import { z } from 'zod';
 import type { ChatAllowlist } from './allowlist.js';
+import { defaultDownloadDir, sanitizeFileName, writeDownload } from './downloads.js';
 import { retryAfterSuffix } from './graph/graph-client.js';
 import type { ChatMessage, MentionTarget, PinnedMessage, TeamsChatsPort } from './graph/teams-chats.js';
 
@@ -80,10 +80,10 @@ async function resolveMentions(
 
 export function buildServer(deps: ServerDeps): McpServer {
   const { chats, allowlist } = deps;
-  const downloadDir = deps.downloadDir ?? join(tmpdir(), 'teams-assistant-mcp');
+  const downloadDir = deps.downloadDir ?? defaultDownloadDir();
 
   const server = new McpServer(
-    { name: 'teams-assistant-mcp', version: '0.4.2' },
+    { name: 'teams-assistant-mcp', version: '0.5.0' },
     {
       instructions:
         `Reads and posts in a fixed set of Microsoft Teams group chats as the account ` +
@@ -519,7 +519,8 @@ export function buildServer(deps: ServerDeps): McpServer {
       description:
         'Downloads an attachment from a message in an allowlisted chat and writes it to a local ' +
         'file, returning the path. Omit attachmentId to take the first downloadable attachment on the message (a quoted reply quote card is skipped). ' +
-        'Images pasted into a message show up as attachments named inline-image-1, inline-image-2, …',
+        'Images pasted into a message show up as attachments named inline-image-1, inline-image-2, … ' +
+        'To grab everything a message carries in one call, use download_chat_attachments instead.',
       inputSchema: {
         chatId: z.string().describe('Graph chat id, must be on the allowlist'),
         messageId: z.string().describe('Message id from read_chat_messages'),
@@ -531,17 +532,101 @@ export function buildServer(deps: ServerDeps): McpServer {
       guard(async () => {
         allowlist.assertReadable(chatId);
         const attachment = await chats.getAttachment(chatId, messageId, attachmentId);
-        await mkdir(downloadDir, { recursive: true });
-        // basename strips any path the sender put in the file name; the download must not be
-        // able to escape downloadDir.
-        const path = resolve(join(downloadDir, `${messageId}-${basename(attachment.name)}`));
-        await writeFile(path, attachment.bytes);
+        // The sender-controlled name is sanitized BEFORE the messageId prefix goes on — a name
+        // like "../../escape.pdf" must lose its path components without also eating the prefix
+        // (basename of the combined string would). writeDownload then guarantees the write stays
+        // in downloadDir and never overwrites — a colliding name gets a -1/-2/… suffix instead.
+        const path = await writeDownload(
+          downloadDir,
+          `${messageId}-${sanitizeFileName(attachment.name)}`,
+          attachment.bytes,
+        );
         return ok({
           path,
           name: attachment.name,
           contentType: attachment.contentType,
           bytes: attachment.bytes.byteLength,
         });
+      }),
+  );
+
+  server.registerTool(
+    'list_chat_attachments',
+    {
+      title: 'List a message\'s attachments without downloading',
+      description:
+        'Lists the attachments on one message in an allowlisted chat — id, name, contentType and ' +
+        'whether each is downloadable — without transferring any file content. A quoted-reply ' +
+        'quote card shows up with downloadable: false; images pasted into the message body ' +
+        'appear as inline-image-1, inline-image-2, … Use this to see what a message carries ' +
+        'before deciding what to download.',
+      inputSchema: {
+        chatId: z.string().describe('Graph chat id, must be on the allowlist'),
+        messageId: z.string().describe('Message id from read_chat_messages'),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    ({ chatId, messageId }) =>
+      guard(async () => {
+        allowlist.assertReadable(chatId);
+        const attachments = await chats.listAttachments(chatId, messageId);
+        return ok({
+          chatId,
+          messageId,
+          count: attachments.length,
+          attachments: attachments.map((attachment) => ({
+            id: attachment.id,
+            ...(attachment.name ? { name: attachment.name } : {}),
+            ...(attachment.contentType ? { contentType: attachment.contentType } : {}),
+            downloadable: attachment.contentType !== 'messageReference',
+          })),
+        });
+      }),
+  );
+
+  server.registerTool(
+    'download_chat_attachments',
+    {
+      title: 'Download all attachments of a Teams message',
+      description:
+        'Downloads every downloadable attachment on one message in an allowlisted chat (shared ' +
+        'files and pasted inline images; a quoted-reply quote card is skipped) and writes each ' +
+        'to a local file, returning the absolute paths with name, contentType and size. ' +
+        'nameFilter narrows to attachments whose name contains it (case-insensitive); matching ' +
+        'nothing is an error naming what the message does carry, never an empty success. File ' +
+        'names are sanitized and never overwrite an existing file — a collision gets a -1/-2/… ' +
+        'suffix.',
+      inputSchema: {
+        chatId: z.string().describe('Graph chat id, must be on the allowlist'),
+        messageId: z.string().describe('Message id from read_chat_messages'),
+        nameFilter: z
+          .string()
+          .optional()
+          .describe('Only attachments whose name contains this, case-insensitive'),
+        outputDir: z
+          .string()
+          .optional()
+          .describe('Where to write the files; defaults to the configured download directory'),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    ({ chatId, messageId, nameFilter, outputDir }) =>
+      guard(async () => {
+        allowlist.assertReadable(chatId);
+        const payloads = await chats.getAttachments(chatId, messageId, nameFilter);
+        const dir = outputDir ?? downloadDir;
+        const files = [];
+        for (const payload of payloads) {
+          // Same pre-prefix sanitization as get_chat_attachment above.
+          const path = await writeDownload(dir, `${messageId}-${sanitizeFileName(payload.name)}`, payload.bytes);
+          files.push({
+            path,
+            name: payload.name,
+            contentType: payload.contentType,
+            bytes: payload.bytes.byteLength,
+          });
+        }
+        return ok({ chatId, messageId, count: files.length, files });
       }),
   );
 
