@@ -23,6 +23,15 @@ describe.skip('live Graph (awaiting a Teams-licensed account)', () => {
   it.todo('returns nothing on a second read with the previous watermark');
   it.todo('posts a message that appears in Teams under the assistant display name');
   it.todo('downloads a file attachment shared in the pilot chat');
+  // Partial live evidence already exists for this one too: on 2026-09-02, against a real
+  // EPF011-delegated token and OneDrive for Business, POST /me/drive/items/{id}/invite with
+  // {"recipients":[{"objectId":"<aad-user-id>"}],"requireSignIn":true,"sendInvitation":false,
+  // "roles":["read"]} answered 200, a subsequent GET .../permissions listed read grants with
+  // grantedToV2.user for all six invited AAD users, and a human recipient confirmed the Teams
+  // file card opened (see KNOWN-ISSUES.md's "send_chat_file" entry for the full snapshot). Still
+  // worth a proper live test end-to-end through send_chat_file itself, against a throwaway chat,
+  // rather than resting on that one manual capture.
+  it.todo('send_chat_file grants every other chat member read access and their file card opens in Teams');
   // Partial live evidence already exists for this one: on 2026-08-24 an ad-hoc script sent raw
   // unicode glyphs (👍) as reactionType against this exact endpoint shape and the reactions
   // rendered in Teams. Still worth a proper live test: the documented vocabulary historically
