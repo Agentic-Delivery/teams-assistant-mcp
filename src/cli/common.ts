@@ -1,3 +1,5 @@
+import { readFile } from 'node:fs/promises';
+import { basename } from 'node:path';
 import { buildChats } from '../build-chats.js';
 import { ChatNotAllowedError, type ChatAllowlist } from '../allowlist.js';
 import { loadConfig } from '../config.js';
@@ -7,13 +9,22 @@ import type { MentionTarget, PinnedMessage } from '../graph/teams-chats.js';
 
 /**
  * Shared plumbing for the standalone CLIs (teams-post, teams-reply, teams-edit, teams-react,
- * teams-read).
+ * teams-read, teams-send-file).
  *
  * The output contract is the whole point, learned the hard way on 2026-08-24 when a caller
  * grepped for a success token the old ad-hoc script never printed and re-posted a broadcast
  * ten extra times: SUCCESS is exactly one JSON line on stdout and exit 0 — nothing else ever
  * reaches stdout. Failure is prose on stderr and a non-zero exit (2 usage, 3 allowlist,
  * 1 everything else). Callers branch on the exit code, never on output text.
+ *
+ * ONE exception, documented here rather than only in README/SETUP (2026-09-02 re-review MINOR —
+ * a contract stated once in the code it governs, not just in the docs describing it): teams-
+ * send-file, given several paths, STREAMS one such JSON success line per file as EACH one lands,
+ * rather than buffering until the whole batch finishes — see doSendFile's own doc comment below
+ * for why (a later file's failure must never swallow the visible proof that earlier files in the
+ * same invocation already landed). The per-line shape and the exit-code rule are otherwise
+ * unchanged: each line is still exactly one JSON object, and the run still ends in exactly one
+ * exit code.
  */
 export interface CliContext {
   chats: ReliableTeamsChats;
@@ -59,6 +70,41 @@ export function parseSendFlags(args: readonly string[]): { html: boolean; mentio
     }
   }
   return { html, mentions, rest };
+}
+
+/**
+ * Parses teams-send-file's trailing argv: an optional `--caption <text>` (anywhere among the
+ * positionals, same flag-anywhere convention as --mention above) and one or more positional file
+ * paths, in order. Any OTHER argument starting with `--` is refused (2026-09-02 review MINOR:
+ * aligned with teams-reply's doctrine of refusing a stray `--html`/unrecognised leftover instead
+ * of silently accepting it) — a typo'd flag must fail loudly, not get quietly uploaded as a
+ * literal filename.
+ */
+export function parseSendFileFlags(args: readonly string[]): { caption?: string; paths: string[] } {
+  let caption: string | undefined;
+  const paths: string[] = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i] as string;
+    if (arg === '--caption') {
+      const value = args[i + 1];
+      // Same reasoning as --mention's identical guard above: a missing or flag-like value fails
+      // loudly here instead of silently uploading "--caption" (or nothing) as a caption/path.
+      if (value === undefined || value.startsWith('--')) {
+        usage(
+          value === undefined
+            ? '--caption needs a value'
+            : `--caption needs a value, got "${value}" which looks like a flag`,
+        );
+      }
+      caption = value;
+      i += 1;
+    } else if (arg.startsWith('--')) {
+      usage(`teams-send-file: unrecognised flag ${arg}`);
+    } else {
+      paths.push(arg);
+    }
+  }
+  return { ...(caption !== undefined ? { caption } : {}), paths };
 }
 
 /** Resolves --mention names against the chat's member list, or [] when none were given — same
@@ -128,6 +174,52 @@ export async function doReply(
   return { action: 'reply', id: sent.id, inReplyTo: replyToMessageId, chat: entry.label };
 }
 
+/** One send-file success payload — the shape `onSent` (doSendFile below) delivers, and
+ *  `writeLine` (below) turns into one JSON stdout line. */
+export interface SendFileResult {
+  action: 'send-file';
+  id: string;
+  chat: string;
+  name: string;
+  bytes: number;
+}
+
+/**
+ * teams-send-file's per-path plumbing. One `chats.sendFile` call per path, in order; `caption`
+ * (from --caption) is applied to the FIRST file only — a caption on every card in a multi-file
+ * send would repeat the same text under each one, which is never what a caller wants when they
+ * pass several paths in one invocation. The allowlist gate runs BEFORE any file is read from
+ * disk, same ordering as doPost/doReply/doEdit above: a chat without canPost is refused without
+ * even touching the filesystem.
+ *
+ * STREAMS via `onSent` rather than collecting a return array (2026-09-02 review MAJOR): a
+ * multi-file send that fails partway through used to discard the JSON lines for files already
+ * posted — exit 1, empty stdout, file 1 irreversibly in the chat, and a caller with no way to
+ * tell it had already landed re-runs the whole batch and duplicates it (the exact 2026-08-24
+ * incident class the CLI output contract exists to prevent). `onSent` is awaited for EACH file
+ * before moving to the next, so — wired to `writeLine` by the real CLI — every earlier success is
+ * already flushed to stdout by the time a later file's failure propagates out of this function.
+ */
+export async function doSendFile(
+  { chats, allowlist }: CliContext,
+  chatId: string,
+  paths: readonly string[],
+  caption: string | undefined,
+  onSent: (payload: SendFileResult) => void | Promise<void>,
+): Promise<void> {
+  const entry = allowlist.assertPostable(chatId);
+  for (const [index, filePath] of paths.entries()) {
+    const buffer = await readFile(filePath);
+    const name = basename(filePath);
+    const sent = await chats.sendFile(
+      chatId,
+      { bytes: new Uint8Array(buffer), name },
+      index === 0 ? caption : undefined,
+    );
+    await onSent({ action: 'send-file', id: sent.id, chat: entry.label, name, bytes: buffer.byteLength });
+  }
+}
+
 /**
  * teams-pin's confirm-before-claiming-success check — same reasoning as pin_chat_message in
  * server.ts: Graph reporting the pinMessage POST as a success is not proof the pin landed, only
@@ -166,6 +258,20 @@ export function readStdin(): Promise<string> {
  *  bigger than the 64 KiB pipe buffer would otherwise be truncated mid-JSON with exit 0. */
 export function succeed(payload: Record<string, unknown>): void {
   process.stdout.write(`${JSON.stringify({ ok: true, ...payload })}\n`, () => process.exit(0));
+}
+
+/**
+ * teams-send-file's per-file streaming primitive: writes ONE JSON success line and resolves only
+ * once it is fully drained — same 64 KiB pipe-truncation guard as succeed() above, but awaitable
+ * so a caller (doSendFile, via its `onSent` parameter) can write several lines in a row, each
+ * confirmed landed on stdout before either sending the next file or letting a later failure
+ * propagate. Does NOT itself exit — teams-send-file only exits once every file in the batch has
+ * been streamed this way (see send-file.ts).
+ */
+export function writeLine<T extends object>(payload: T): Promise<void> {
+  return new Promise((resolve) => {
+    process.stdout.write(`${JSON.stringify({ ok: true, ...payload })}\n`, () => resolve());
+  });
 }
 
 export function usage(text: string): never {

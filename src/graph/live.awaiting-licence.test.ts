@@ -23,6 +23,21 @@ describe.skip('live Graph (awaiting a Teams-licensed account)', () => {
   it.todo('returns nothing on a second read with the previous watermark');
   it.todo('posts a message that appears in Teams under the assistant display name');
   it.todo('downloads a file attachment shared in the pilot chat');
+  // Partial live evidence already exists for this one too, from TWO manual captures (both
+  // 2026-09-02, EPF011-delegated token, OneDrive for Business — see KNOWN-ISSUES.md's
+  // "send_chat_file" entry for both full snapshots): (1) POST /me/drive/items/{id}/invite with
+  // {"recipients":[{"objectId":"<aad-user-id>"}],"requireSignIn":true,"sendInvitation":false,
+  // "roles":["read"]} answered 200, a subsequent GET .../permissions listed read grants with
+  // grantedToV2.user for all six invited AAD users, and a human recipient confirmed the Teams
+  // file card opened; (2) a re-grant on the same file, this time including the OWNER as a
+  // recipient, showed the /invite response BODY ITSELF (not just the later GET) carries
+  // grantedToV2.user.id per recipient, and that an owner-as-recipient IS echoed with its own
+  // grant entry rather than silently dropped. Not yet captured live: the grantedToIdentitiesV2
+  // variant sendFile's grant check also accepts defensively (documented Graph behaviour for some
+  // permission kinds, never observed in either capture above). Still worth a proper live test
+  // end-to-end through send_chat_file itself, against a throwaway chat, rather than resting on
+  // manual captures.
+  it.todo('send_chat_file grants every other chat member read access and their file card opens in Teams');
   // Partial live evidence already exists for this one: on 2026-08-24 an ad-hoc script sent raw
   // unicode glyphs (👍) as reactionType against this exact endpoint shape and the reactions
   // rendered in Teams. Still worth a proper live test: the documented vocabulary historically

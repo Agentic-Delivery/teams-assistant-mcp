@@ -10,7 +10,21 @@ const stubToken: TokenProvider = { kind: 'stub', getAccessToken: async () => 'th
 // production silently fall back to the throttled /members endpoint with no test noticing). None
 // of the behaviour in THIS file touches mention resolution, so every construction below wires a
 // trivial no-op double — the member-cache behaviour itself is covered in teams-chats.test.ts.
+// (sendFile is the one method here that DOES read this cache, for its 0.4.2 permission grant —
+// its own tests below wire a warmed double instead; see warmMembersCache.)
 const noMembersCache: MembersCachePort = { get: () => undefined, set: () => {} };
+
+/** A pre-warmed double for the two sendFile tests below — sendFile now reads the member cache
+ *  (0.4.2, to grant chat members read access on the uploaded item) the same way resolveMentions
+ *  always has; these two tests are otherwise entirely about the upload/eTag mechanics, so this
+ *  just needs to be a stable, non-empty roster with one other AAD id to invite. */
+function warmMembersCache(): MembersCachePort {
+  const members = [
+    { id: 'self-aad-id', displayName: 'Assistant (AI)' },
+    { id: 'aad-bob', displayName: 'Bob Brown' },
+  ];
+  return { get: () => members, set: () => {} };
+}
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -195,9 +209,10 @@ describe('teams chats over graph', () => {
     ]);
   });
 
-  it('shares a file by uploading to OneDrive and attaching the driveItem by its eTag GUID', async () => {
+  it('shares a file by uploading to OneDrive and attaching the driveItem by its eTag GUID (and grants the other chat member access first — 0.4.2)', async () => {
     const fetchFn = vi
       .fn()
+      .mockResolvedValueOnce(json({ id: 'self-aad-id' })) // /me self-id lookup, so it can be excluded from the grant
       .mockResolvedValueOnce(
         json({
           id: 'ITEM-ID',
@@ -206,12 +221,16 @@ describe('teams chats over graph', () => {
           webUrl: 'https://contoso-my.sharepoint.com/personal/x/Documents/ai-test/notes.txt',
         }),
       )
+      // /invite: a real grant for the one invited recipient (aad-bob) — an empty value array
+      // would be a 200-but-nothing-granted response, which sendFile now refuses (2026-09-02
+      // review MAJOR: HTTP success alone used to be trusted as proof of a grant).
+      .mockResolvedValueOnce(json({ value: [{ grantedToV2: { user: { id: 'aad-bob' } } }] }))
       .mockResolvedValueOnce(
         json({ id: 'sent', createdDateTime: '2026-08-19T10:00:00Z', body: { content: 'file' } }),
       );
     const chats = new GraphTeamsChats(
       new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
-      { membersCache: noMembersCache, uploadDir: 'ai-test' });
+      { membersCache: warmMembersCache(), uploadDir: 'ai-test' });
 
     await chats.sendFile(
       '19:a@thread.v2',
@@ -219,13 +238,23 @@ describe('teams chats over graph', () => {
       'here',
     );
 
-    const [uploadUrl, uploadInit] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
+    const [uploadUrl, uploadInit] = fetchFn.mock.calls[1] as unknown as [string, RequestInit];
     expect(uploadUrl).toBe(
       'https://graph.microsoft.com/v1.0/me/drive/root:/ai-test/notes.txt:/content',
     );
     expect(uploadInit.method).toBe('PUT');
 
-    const [, messageInit] = fetchFn.mock.calls[1] as unknown as [string, RequestInit];
+    const [inviteUrl, inviteInit] = fetchFn.mock.calls[2] as unknown as [string, RequestInit];
+    expect(inviteUrl).toBe('https://graph.microsoft.com/v1.0/me/drive/items/ITEM-ID/invite');
+    expect(JSON.parse(inviteInit.body as string)).toEqual({
+      // self-aad-id is excluded — it already owns the item as the uploader.
+      recipients: [{ objectId: 'aad-bob' }],
+      requireSignIn: true,
+      sendInvitation: false,
+      roles: ['read'],
+    });
+
+    const [, messageInit] = fetchFn.mock.calls[3] as unknown as [string, RequestInit];
     const body = JSON.parse(messageInit.body as string) as {
       body: { content: string };
       attachments: Array<Record<string, string>>;
@@ -327,13 +356,14 @@ describe('teams chats over graph', () => {
   it('refuses to share a file when OneDrive returns no usable eTag', async () => {
     const fetchFn = vi.fn(async () => json({ id: 'ITEM-ID', name: 'notes.txt' }));
     const chats = new GraphTeamsChats(
-      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
+      { membersCache: warmMembersCache() });
 
     await expect(
       chats.sendFile('19:a@thread.v2', { bytes: new Uint8Array([1]), name: 'notes.txt' }),
     ).rejects.toThrow(/eTag/);
-    // The message post never happened.
-    expect(fetchFn).toHaveBeenCalledTimes(1);
+    // The self-id lookup and the upload happened; neither /invite nor the message post did.
+    expect(fetchFn).toHaveBeenCalledTimes(2);
   });
 
   it('falls back to the member list when a group chat has no topic', async () => {
