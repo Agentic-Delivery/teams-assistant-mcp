@@ -37,6 +37,7 @@ function portWith(overrides: Partial<TeamsChatsPort>): TeamsChatsPort {
     editMessage: reject,
     editHtmlMessage: reject,
     deleteMessage: reject,
+    undoDeleteMessage: reject,
     setReaction: reject,
     getAttachment: reject,
     pinMessage: reject,
@@ -209,7 +210,7 @@ describe('reliable sends — readback before any retry', () => {
     await chats.deleteMessage('19:a@thread.v2', 'm1');
 
     expect(inner.editMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1', 'new', []);
-    expect(inner.deleteMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1');
+    expect(inner.deleteMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1', undefined);
   });
 });
 

@@ -1,7 +1,7 @@
 {
   "name": "teams-assistant-mcp",
   "private": true,
-  "version": "0.5.0",
+  "version": "0.6.0",
   "type": "module",
   "description": "Stdio MCP server that lets a Claude Code agent read and post in a fixed allowlist of Microsoft Teams group chats.",
   "license": "Elastic-2.0",
@@ -17,6 +17,7 @@
     "teams-react": "dist/cli/react.js",
     "teams-read": "dist/cli/read.js",
     "teams-attachments": "dist/cli/attachments.js",
+    "teams-delete": "dist/cli/delete.js",
     "teams-edit": "dist/cli/edit.js",
     "teams-pin": "dist/cli/pin.js",
     "teams-unpin": "dist/cli/unpin.js",
