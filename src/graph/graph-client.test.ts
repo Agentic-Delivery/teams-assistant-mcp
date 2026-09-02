@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { GraphClient, GraphError } from './graph-client.js';
 import type { MembersCachePort } from './teams-chats.js';
-import { GraphTeamsChats } from './teams-chats.js';
+import { GraphTeamsChats, shareIdFor } from './teams-chats.js';
 import type { TokenProvider } from '../auth/token-provider.js';
 
 const stubToken: TokenProvider = { kind: 'stub', getAccessToken: async () => 'the-token' };
@@ -1093,5 +1093,154 @@ describe('teams chats — a quoted reply with no file says so honestly', () => {
 
     await expect(chats.getAttachment('19:a@thread.v2', 'm-3')).rejects.toThrow(/only a quoted-message card/);
     expect(fetchFn.mock.calls.some(([url]) => String(url).includes('/hostedContents/'))).toBe(false);
+  });
+});
+
+describe('shareIdFor — the /shares facade id must be byte-exact URL-safe base64 (0.5.0)', () => {
+  it('strips padding and swaps the two URL-hostile alphabet characters', () => {
+    // Chosen inputs whose standard base64 is known to carry each hazard:
+    expect(shareIdFor('>>>')).toBe('u!Pj4-'); // 'Pj4+' — the '+' must become '-'
+    expect(shareIdFor('???')).toBe('u!Pz8_'); // 'Pz8/' — the '/' must become '_'
+    expect(shareIdFor('ab')).toBe('u!YWI'); // 'YWI=' — the '=' padding must go entirely
+  });
+
+  it('round-trips a realistic SharePoint URL with spaces and non-ASCII characters', () => {
+    const url =
+      'https://contoso-my.sharepoint.com/personal/j_x/Documents/ai-test/Försäljningsplan Q3 (2).xlsx';
+    const id = shareIdFor(url);
+
+    expect(id.startsWith('u!')).toBe(true);
+    expect(id).not.toMatch(/[=+/]/);
+    const restored = Buffer.from(
+      id.slice(2).replace(/-/g, '+').replace(/_/g, '/'),
+      'base64',
+    ).toString('utf8');
+    expect(restored).toBe(url);
+  });
+});
+
+describe('graph client — binary downloads retry throttles like every other read (0.5.0)', () => {
+  it('retries a 429 getBinary after the named Retry-After, then hands over the bytes', async () => {
+    // Attachment downloads share the mailbox throttle budget with the inbox poller, so this is
+    // the GET that meets 429s in real use — it used to be the one GET with no retry at all.
+    const waits: number[] = [];
+    let now = 0;
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'throttled' } }), {
+          status: 429,
+          headers: { 'retry-after': '7', 'content-type': 'application/json' },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { 'content-type': 'application/pdf' } }),
+      );
+    const client = new GraphClient({
+      tokenProvider: stubToken,
+      fetchFn: fetchFn as never,
+      sleepFn: async (ms) => { waits.push(ms); now += ms; },
+      nowFn: () => now,
+    });
+
+    const result = await client.getBinary('/shares/u!abc/driveItem/content');
+
+    expect([...result.bytes]).toEqual([1, 2, 3]);
+    expect(result.contentType).toBe('application/pdf');
+    expect(waits).toEqual([7000]);
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('teams chats — a 403 on the SharePoint download names the missing permission (0.5.0)', () => {
+  it('says which file, what the token lacks, and that a custom app registration may need admin consent', async () => {
+    const msg = { id: 'm-4', createdDateTime: '2026-08-25T07:48:25Z', from: { user: { displayName: 'Celine', id: 'u1' } }, body: { contentType: 'html', content: 'plan attached' },
+      attachments: [{ id: 'file-1', contentType: 'reference', name: 'plan.xlsx', contentUrl: 'https://tenant-my.sharepoint.com/personal/x/Documents/plan.xlsx' }] };
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.includes('/shares/')) {
+        return json({ error: { code: 'accessDenied', message: 'Access denied' } }, 403);
+      }
+      return json(msg);
+    });
+    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }), { membersCache: noMembersCache });
+
+    const error = (await chats.getAttachment('19:a@thread.v2', 'm-4').catch((c: unknown) => c)) as GraphError;
+
+    expect(error).toBeInstanceOf(GraphError);
+    expect(error.status).toBe(403);
+    expect(error.message).toContain('plan.xlsx');
+    expect(error.message).toContain('Files.Read.All');
+    expect(error.message).toContain('admin consent');
+    expect(error.message).toContain('Access denied'); // Graph's own words survive the rewrap
+  });
+
+  it('leaves the licence 403 alone — that one has its own name and its own fix', async () => {
+    const msg = { id: 'm-5', createdDateTime: '2026-08-25T07:48:25Z', from: { user: { displayName: 'Celine', id: 'u1' } }, body: { contentType: 'html', content: 'plan attached' },
+      attachments: [{ id: 'file-1', contentType: 'reference', name: 'plan.xlsx', contentUrl: 'https://tenant-my.sharepoint.com/personal/x/Documents/plan.xlsx' }] };
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.includes('/shares/')) {
+        return json({ error: { code: 'UnknownError', message: 'Failed to get license information for the user' } }, 403);
+      }
+      return json(msg);
+    });
+    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }), { membersCache: noMembersCache });
+
+    const error = (await chats.getAttachment('19:a@thread.v2', 'm-5').catch((c: unknown) => c)) as GraphError;
+
+    expect(error.isLicenceProblem).toBe(true);
+    expect(error.message).not.toContain('Files.Read.All');
+  });
+});
+
+describe('teams chats — getAttachments downloads a whole message in one pass (0.5.0)', () => {
+  const msg = { id: 'm-6', createdDateTime: '2026-08-25T07:48:25Z', from: { user: { displayName: 'Celine', id: 'u1' } },
+    body: { contentType: 'html', content: 'both files <img src="https://g/chats/c/messages/m-6/hostedContents/hc-9/$value">' },
+    attachments: [
+      { id: 'quote-1', contentType: 'messageReference', name: null, contentUrl: null },
+      { id: 'file-1', contentType: 'reference', name: 'plan.xlsx', contentUrl: 'https://tenant-my.sharepoint.com/personal/x/Documents/plan.xlsx' },
+      { id: 'file-2', contentType: 'reference', name: 'Logo.png', contentUrl: 'https://tenant-my.sharepoint.com/personal/x/Documents/Logo.png' },
+    ] };
+
+  function fetchForMessage() {
+    return vi.fn(async (url: string) => {
+      if (url.includes('/shares/')) return new Response(new Uint8Array([7]), { status: 200, headers: { 'content-type': 'application/octet-stream' } });
+      if (url.includes('/hostedContents/')) return new Response(new Uint8Array([8, 8]), { status: 200, headers: { 'content-type': 'image/png' } });
+      return json(msg);
+    });
+  }
+
+  it('fetches the message ONCE, skips the quote card, and downloads files and pasted images alike', async () => {
+    const fetchFn = fetchForMessage();
+    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }), { membersCache: noMembersCache });
+
+    const payloads = await chats.getAttachments('19:a@thread.v2', 'm-6');
+
+    expect(payloads.map((p) => p.name)).toEqual(['plan.xlsx', 'Logo.png', 'inline-image-1']);
+    const messageFetches = fetchFn.mock.calls.filter(([url]) => String(url).endsWith('/messages/m-6'));
+    expect(messageFetches).toHaveLength(1); // one message fetch, not one per attachment
+  });
+
+  it('nameFilter narrows case-insensitively', async () => {
+    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchForMessage() as never, sleepFn: async () => {}, nowFn: () => 0 }), { membersCache: noMembersCache });
+
+    const payloads = await chats.getAttachments('19:a@thread.v2', 'm-6', 'logo');
+
+    expect(payloads.map((p) => p.name)).toEqual(['Logo.png']);
+  });
+
+  it('a filter matching nothing names what the message DOES carry', async () => {
+    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchForMessage() as never, sleepFn: async () => {}, nowFn: () => 0 }), { membersCache: noMembersCache });
+
+    await expect(chats.getAttachments('19:a@thread.v2', 'm-6', 'budget')).rejects.toThrow(/plan\.xlsx.*Logo\.png/);
+  });
+
+  it('listAttachments hands over the metadata, quote card included, without downloading a byte', async () => {
+    const fetchFn = fetchForMessage();
+    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }), { membersCache: noMembersCache });
+
+    const refs = await chats.listAttachments('19:a@thread.v2', 'm-6');
+
+    expect(refs.map((ref) => ref.id)).toEqual(['quote-1', 'file-1', 'file-2', 'hc-9']);
+    expect(fetchFn.mock.calls.some(([url]) => String(url).includes('/shares/') || String(url).includes('/hostedContents/'))).toBe(false);
   });
 });

@@ -208,19 +208,21 @@ export class GraphClient {
     );
   }
 
-  async get<T>(path: string, options: { readRetries?: number } = {}): Promise<T> {
-    // Reads are idempotent, so a throttled or briefly unavailable GET may be retried after the
-    // wait the server names (capped — an aggressive Retry-After must not park the caller for
-    // minutes), falling back to a short exponential pause. A caller holding a cheaper fallback
-    // (a list scan instead of a throttled single fetch) passes readRetries: 0 and takes it now.
-    const readRetries = options.readRetries ?? this.readRetries;
+  /**
+   * The shared read loop behind get() and getBinary(). Reads are idempotent, so a throttled or
+   * briefly unavailable GET may be retried after the wait the server names (capped — an
+   * aggressive Retry-After must not park the caller for minutes), falling back to a short
+   * exponential pause. A caller holding a cheaper fallback (a list scan instead of a throttled
+   * single fetch) passes readRetries: 0 and takes it now. Pulled out of get() when getBinary
+   * gained retries (0.5.0): attachment downloads share the mailbox's Graph budget with the inbox
+   * poller and were the calls hitting raw 429s in practice, yet the binary path was the one GET
+   * without the retry-after-the-named-wait behaviour every JSON read already had.
+   */
+  private async getResponse(path: string, readRetries: number): Promise<Response> {
     for (let attempt = 0; ; attempt += 1) {
       const response = await this.authorized(path, { method: 'GET' });
       if (response.ok) {
-        if (response.status === 204) {
-          return undefined as T;
-        }
-        return (await response.json()) as T;
+        return response;
       }
       if (attempt >= readRetries || !RETRYABLE_READ_STATUSES.has(response.status)) {
         await this.fail(response);
@@ -238,6 +240,14 @@ export class GraphClient {
       await response.body?.cancel().catch(() => undefined);
       await this.sleepFn(waitMs);
     }
+  }
+
+  async get<T>(path: string, options: { readRetries?: number } = {}): Promise<T> {
+    const response = await this.getResponse(path, options.readRetries ?? this.readRetries);
+    if (response.status === 204) {
+      return undefined as T;
+    }
+    return (await response.json()) as T;
   }
 
   async post<T>(path: string, body: unknown): Promise<T> {
@@ -325,11 +335,14 @@ export class GraphClient {
     return (await response.json()) as T;
   }
 
-  async getBinary(path: string): Promise<{ bytes: Uint8Array; contentType: string }> {
-    const response = await this.authorized(path, { method: 'GET' });
-    if (!response.ok) {
-      await this.fail(response);
-    }
+  /** Binary GET (attachment downloads, hosted content). Same retry behaviour as get() — the
+   *  loop is shared, see getResponse — because these are exactly the reads that compete with
+   *  the inbox poller for the per-mailbox throttle budget and so meet 429s in real use. */
+  async getBinary(
+    path: string,
+    options: { readRetries?: number } = {},
+  ): Promise<{ bytes: Uint8Array; contentType: string }> {
+    const response = await this.getResponse(path, options.readRetries ?? this.readRetries);
     return {
       bytes: new Uint8Array(await response.arrayBuffer()),
       contentType: response.headers.get('content-type') ?? 'application/octet-stream',
