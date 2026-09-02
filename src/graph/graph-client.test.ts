@@ -221,7 +221,10 @@ describe('teams chats over graph', () => {
           webUrl: 'https://contoso-my.sharepoint.com/personal/x/Documents/ai-test/notes.txt',
         }),
       )
-      .mockResolvedValueOnce(json({ value: [] })) // /invite
+      // /invite: a real grant for the one invited recipient (aad-bob) — an empty value array
+      // would be a 200-but-nothing-granted response, which sendFile now refuses (2026-09-02
+      // review MAJOR: HTTP success alone used to be trusted as proof of a grant).
+      .mockResolvedValueOnce(json({ value: [{ grantedToV2: { user: { id: 'aad-bob' } } }] }))
       .mockResolvedValueOnce(
         json({ id: 'sent', createdDateTime: '2026-08-19T10:00:00Z', body: { content: 'file' } }),
       );
