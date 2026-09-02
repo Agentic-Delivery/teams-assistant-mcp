@@ -15,23 +15,79 @@ uploaded item (that same `/invite` call) BEFORE posting the chat message, resolv
 same cache-backed member roster resolveMentions already uses — never a direct call to the
 throttled `/chats/{id}/members` endpoint on the send path (see README's "@mentions" section for
 why that endpoint is avoided on sends). The assistant's own id is excluded from the grant when it
-can be determined (it already owns the item as uploader). An unresolvable/empty roster, or ANY
-other real member with no AAD id Graph reported (even in a mixed roster where some other members
-ARE resolvable — no partial grants), now fails the send loudly BEFORE the upload; a failed
-`/invite` call, or an `/invite` that answers HTTP success but whose own response shows no grant
-actually landed for a recipient, fails loudly AFTER the upload (which is then left orphaned in
-OneDrive — unavoidable, since the invite needs the uploaded item's id) and BEFORE the chat message
-post. See `GraphTeamsChats.sendFile`'s own doc comment (`src/graph/teams-chats.ts`) for the full
-failure contract; a card the recipients cannot open is refused rather than ever posted.
+can be determined (it already owns the item as uploader); when it CANNOT be determined (a `/me`
+outage, a transient failure — see the second wire-shape anchor below), the send refuses BEFORE the
+upload rather than falling back to an "invite everyone including self" default that would have
+orphaned an upload per attempt for the whole outage. An unresolvable/empty roster, or ANY other
+real member with no AAD id Graph reported (even in a mixed roster where some other members ARE
+resolvable — no partial grants), also fails the send loudly BEFORE the upload; a failed `/invite`
+call, or an `/invite` that answers HTTP success but whose own response shows no grant actually
+landed for a recipient, fails loudly AFTER the upload (which is then left orphaned in OneDrive —
+unavoidable, since the invite needs the uploaded item's id) and BEFORE the chat message post. See
+`GraphTeamsChats.sendFile`'s own doc comment (`src/graph/teams-chats.ts`) for the full failure
+contract; a card the recipients cannot open is refused rather than ever posted.
 
-**Wire-shape anchor (live verification, 2026-09-02, EPF011 delegated token, OneDrive for
-Business)** — the exact contract the code above and its tests are pinned to, captured verbatim
-(GUIDs generalized): request `POST /me/drive/items/{id}/invite` body
+**Wire-shape anchor 1 — the GET readback (live verification, 2026-09-02, EPF011 delegated token,
+OneDrive for Business)** — the exact contract the code above and its tests are pinned to, captured
+verbatim (GUIDs generalized): request `POST /me/drive/items/{id}/invite` body
 `{"recipients":[{"objectId":"<aad-user-id>"}],"requireSignIn":true,"sendInvitation":false,"roles":["read"]}`
 → `200`; a subsequent `GET .../permissions` listed read grants with `grantedToV2.user` for all six
 invited AAD users, and a human recipient confirmed the Teams file card opened. `grantedToV2.user.id`
 is the field `sendFile`'s post-invite grant check (above) reads as the source of truth, rather than
 trusting the `200` alone.
+
+**Wire-shape anchor 2 — the POST response itself (live verification, 2026-09-02, EPF011 delegated
+token, OneDrive for Business, re-grant on the same test file)** — anchors the grant check against
+the `/invite` response BODY directly, not just the follow-up GET above. Request body
+`{"recipients":[{"objectId":"<johan-aad-id>"},{"objectId":"<epf011-owner-aad-id>"}],"requireSignIn":true,"sendInvitation":false,"roles":["read"]}`
+(note: the OWNER included as a recipient, to settle whether an owner-as-recipient is silently
+dropped) → `200` with (GUIDs generalized):
+```json
+{
+  "@odata.context": ".../$metadata#Collection(microsoft.graph.permission)",
+  "value": [
+    {
+      "id": "...",
+      "roles": ["read"],
+      "grantedToV2": {
+        "user": {
+          "@odata.type": "#microsoft.graph.sharePointIdentity",
+          "displayName": "...",
+          "email": "...",
+          "id": "<johan-aad-id>"
+        }
+      },
+      "grantedTo": { "user": { "...": "same id" } }
+    },
+    {
+      "id": "...",
+      "roles": ["read"],
+      "grantedToV2": {
+        "user": {
+          "@odata.type": "#microsoft.graph.sharePointIdentity",
+          "displayName": "...",
+          "email": "...",
+          "id": "<epf011-owner-aad-id>"
+        }
+      },
+      "grantedTo": { "...": "same shape" }
+    }
+  ]
+}
+```
+Two facts this settles: (a) the `POST` response itself — not only the later GET — carries
+`grantedToV2.user.id` per recipient, which is what `sendFile`'s post-invite check reads directly
+off the `/invite` call's own return value; (b) an owner included as a recipient IS echoed with its
+own grant entry, not silently dropped — the worst-case "owner-not-echoed" shape a defensive review
+raised turned out not to match live behaviour, though the code still refuses loudly rather than
+assume that in general (see the failure contract above).
+
+`grantedToIdentitiesV2[].user.id` (an array, sibling to `grantedToV2` on the same permission entry)
+is a documented Graph variant some permission kinds use instead — several recipients' grants folded
+under ONE permission resource rather than one `grantedToV2` entry each. Not captured in the two live
+snapshots above (both used one recipient per permission entry), but `sendFile`'s grant check accepts
+it as an equivalent echo defensively, so that shape alone degrades to acceptance rather than a false
+outage if a future capture shows Graph choosing it.
 
 ## Inbox poller: two server instances race on the same inbox (found 2026-08-21)
 

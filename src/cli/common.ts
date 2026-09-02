@@ -16,6 +16,15 @@ import type { MentionTarget, PinnedMessage } from '../graph/teams-chats.js';
  * ten extra times: SUCCESS is exactly one JSON line on stdout and exit 0 — nothing else ever
  * reaches stdout. Failure is prose on stderr and a non-zero exit (2 usage, 3 allowlist,
  * 1 everything else). Callers branch on the exit code, never on output text.
+ *
+ * ONE exception, documented here rather than only in README/SETUP (2026-09-02 re-review MINOR —
+ * a contract stated once in the code it governs, not just in the docs describing it): teams-
+ * send-file, given several paths, STREAMS one such JSON success line per file as EACH one lands,
+ * rather than buffering until the whole batch finishes — see doSendFile's own doc comment below
+ * for why (a later file's failure must never swallow the visible proof that earlier files in the
+ * same invocation already landed). The per-line shape and the exit-code rule are otherwise
+ * unchanged: each line is still exactly one JSON object, and the run still ends in exactly one
+ * exit code.
  */
 export interface CliContext {
   chats: ReliableTeamsChats;
