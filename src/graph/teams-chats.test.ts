@@ -217,3 +217,227 @@ describe('buildChats — the composition actually wires the members cache (0.4.1
     }
   });
 });
+
+describe('GraphTeamsChats.sendFile — grants chat members read access on the uploaded item (bug fix 0.4.2, live-verified 2026-09-02: dead "can\'t be viewed" cards, only fixed by a manual /invite)', () => {
+  let dir: string;
+  let path: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'teams-chats-sendfile-'));
+    path = join(dir, 'members-cache.json');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function subject(fetchFn: typeof fetch, cache: MembersCache) {
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn });
+    return new GraphTeamsChats(graph, { membersCache: cache });
+  }
+
+  const uploadResponse = () =>
+    json({
+      id: 'drive-item-1',
+      eTag: '"{ABCDEF12-3456-7890-ABCD-EF1234567890},1"',
+      webUrl: 'https://contoso.sharepoint.com/personal/assistant/report.pdf',
+      name: 'report.pdf',
+    });
+
+  function selfIdResponse() {
+    return json({ id: 'aad-self' });
+  }
+
+  it('SCENARIO a: issues the /invite with the exact body contract, and does it BEFORE the chat message post', async () => {
+    const cache = new MembersCache({ path });
+    cache.set(CHAT, [
+      { id: 'aad-self', displayName: 'Assistant (AI)' },
+      { id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+      { id: 'aad-johan', displayName: 'Spännare, Johan' },
+    ]);
+    const callOrder: string[] = [];
+    let inviteBody: unknown;
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) {
+        return selfIdResponse();
+      }
+      if (u.includes('/root:') && method === 'PUT') {
+        callOrder.push('upload');
+        return uploadResponse();
+      }
+      if (u.includes('/drive/items/drive-item-1/invite')) {
+        callOrder.push('invite');
+        inviteBody = JSON.parse(String(init?.body));
+        return json({ value: [] });
+      }
+      if (u.includes('/messages') && method === 'POST') {
+        callOrder.push('message');
+        return json({
+          id: 'msg-1',
+          chatId: CHAT,
+          createdDateTime: '2026-09-02T10:00:00Z',
+          body: { contentType: 'html', content: '' },
+        });
+      }
+      throw new Error(`unexpected call in this test: ${method} ${u}`);
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    const sent = await chats.sendFile(CHAT, { bytes: new Uint8Array([1, 2, 3]), name: 'report.pdf' });
+
+    expect(callOrder).toEqual(['upload', 'invite', 'message']);
+    expect(inviteBody).toEqual({
+      // Self excluded: it already owns the item — see resolveSelfId's doc comment.
+      recipients: [{ objectId: 'aad-shiv' }, { objectId: 'aad-johan' }],
+      requireSignIn: true,
+      sendInvitation: false,
+      roles: ['read'],
+    });
+    expect(sent.id).toBe('msg-1');
+  });
+
+  it('SCENARIO b: an /invite failure fails the send loudly — no chat message is ever posted (no dead card)', async () => {
+    const cache = new MembersCache({ path });
+    cache.set(CHAT, [
+      { id: 'aad-self', displayName: 'Assistant (AI)' },
+      { id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+    ]);
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) return selfIdResponse();
+      if (u.includes('/root:') && method === 'PUT') return uploadResponse();
+      if (u.includes('/invite')) {
+        return json({ error: { code: 'AccessDenied', message: 'insufficient privileges' } }, 403);
+      }
+      if (u.includes('/messages') && method === 'POST') {
+        // Deliberately no "grant"/"permission"/"invite" wording here — if the code under test
+        // still reaches this branch pre-fix, the assertion below must fail on a REAL mismatch,
+        // not accidentally pass because this guard's own wording happened to match the regex.
+        throw new Error('TEST-ONLY GUARD: sendFile must not reach the chat message post on this path');
+      }
+      throw new Error(`unexpected call in this test: ${method} ${u}`);
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    await expect(
+      chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' }),
+    ).rejects.toThrow(/grant|permission|invite/i);
+  });
+
+  it('SCENARIO c: an empty/unresolvable member roster fails BEFORE the upload — no orphaned OneDrive item', async () => {
+    const cache = new MembersCache({ path }); // never warmed -> triggers a refresh
+    const fetchFn = vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes('/members')) {
+        return json({ value: [] }); // Graph genuinely reports nobody
+      }
+      throw new Error(`unexpected call — upload/invite/message must never be reached: ${u}`);
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    await expect(
+      chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' }),
+    ).rejects.toThrow(/member|roster|resolve/i);
+  });
+
+  it('a throttled member-list refresh fails the send loudly, naming the throttle — no upload attempted', async () => {
+    const cache = new MembersCache({ path });
+    const fetchFn = vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes('/members')) {
+        return json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
+          // >60s: past GraphClient's MAX_RETRY_SLEEP_MS, so it fails fast locally instead of
+          // actually sleeping out a real 30s wait during the test run (same reasoning as the
+          // resolveMentions 429 test above, which uses 62 for the identical reason).
+          'retry-after': '62',
+        });
+      }
+      throw new Error(`unexpected call — upload must never be reached: ${u}`);
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    const error = await chats
+      .sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(GraphError);
+    expect((error as GraphError).status).toBe(429);
+    expect((error as GraphError).retryAfterSeconds).toBe(62);
+  });
+
+  // Violating-double: Graph (an external system) reports a real chat member with NO AAD id —
+  // the exact shape resolveMentions already treats as "cannot mention them"; sendFile must treat
+  // it as "cannot grant them access", not silently post a card only the assistant itself can open.
+  it('other real members present but NONE has an AAD id on record — fails loudly BEFORE upload rather than post a card they cannot open', async () => {
+    const cache = new MembersCache({ path });
+    cache.set(CHAT, [
+      { id: 'aad-self', displayName: 'Assistant (AI)' },
+      { displayName: 'No Id Person' }, // Graph reported no id for this member
+    ]);
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) return selfIdResponse();
+      throw new Error(`unexpected call — upload must never be reached: ${method} ${u}`);
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    await expect(
+      chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' }),
+    ).rejects.toThrow(/AAD id|grant/i);
+  });
+
+  it('a chat with no OTHER members (assistant-only roster) skips the invite entirely and still sends', async () => {
+    const cache = new MembersCache({ path });
+    cache.set(CHAT, [{ id: 'aad-self', displayName: 'Assistant (AI)' }]);
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) return selfIdResponse();
+      if (u.includes('/root:') && method === 'PUT') return uploadResponse();
+      if (u.includes('/invite')) throw new Error('must never invite when there is nobody else to grant to');
+      if (u.includes('/messages') && method === 'POST') {
+        return json({
+          id: 'msg-solo',
+          chatId: CHAT,
+          createdDateTime: '2026-09-02T10:00:00Z',
+          body: { contentType: 'html', content: '' },
+        });
+      }
+      throw new Error(`unexpected call in this test: ${method} ${u}`);
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    const sent = await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
+
+    expect(sent.id).toBe('msg-solo');
+  });
+});
+
+describe('GraphTeamsChats.sendImage — SCENARIO d: hosted content, no OneDrive item, no grant applies here', () => {
+  it('never touches OneDrive or /invite — only the plain message-with-hostedContents POST', async () => {
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/messages') && method === 'POST') {
+        return json({
+          id: 'img-1',
+          chatId: CHAT,
+          createdDateTime: '2026-09-02T10:00:00Z',
+          body: { contentType: 'html', content: '' },
+        });
+      }
+      throw new Error(`unexpected call in this test (sendImage must not touch OneDrive/invite): ${method} ${u}`);
+    });
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch });
+    const cache = new MembersCache({ path: join(await mkdtemp(join(tmpdir(), 'teams-chats-sendimage-')), 'm.json') });
+    const chats = new GraphTeamsChats(graph, { membersCache: cache });
+
+    const sent = await chats.sendImage(CHAT, { bytes: new Uint8Array([1, 2, 3]), contentType: 'image/png' });
+
+    expect(sent.id).toBe('img-1');
+  });
+});

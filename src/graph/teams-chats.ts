@@ -185,6 +185,8 @@ function toPinnedMessage(entry: GraphPinnedMessage): PinnedMessage | undefined {
 export class GraphTeamsChats implements TeamsChatsPort {
   private readonly uploadDir: string;
   private readonly membersCache: MembersCachePort;
+  /** Memoized by resolveSelfId — see its doc comment. */
+  private selfIdPromise: Promise<string | undefined> | undefined;
 
   constructor(
     private readonly graph: GraphClient,
@@ -290,6 +292,59 @@ export class GraphTeamsChats implements TeamsChatsPort {
     return resolveMentionTargets(names, fresh);
   }
 
+  /**
+   * The chat's current member roster for sendFile's permission grant — the SAME cache-first,
+   * refresh-once-on-miss path resolveMentions uses (see its doc comment for the full rationale):
+   * a cache hit costs zero Graph calls, a miss refreshes ONCE via membersOf and persists it. Never
+   * calls `/chats/{id}/members` directly on the send path — that endpoint shares a Graph throttle
+   * budget across every process signed in with the same client id, and the 0.4.1 incident that
+   * starved mention resolution on it applies identically to a file share.
+   *
+   * Deliberately does NOT treat "empty" as "nobody to invite": an empty roster — whether the
+   * cache never had one, or a fresh call to Graph itself reports nobody — is read as "we do not
+   * reliably know who is in this chat" and left for sendFile to fail loudly on, never silently
+   * skipped as if the file were being shared into an empty room.
+   */
+  private async membersForInvite(chatId: string): Promise<ChatMember[]> {
+    const cached = this.membersCache.get(chatId);
+    if (cached && cached.length > 0) {
+      return cached;
+    }
+    const fresh = await this.membersOf(chatId).catch((caught: unknown) => {
+      if (caught instanceof GraphError && caught.status === 429) {
+        // Same rule as resolveMentions's own refresh: the wait itself is never stated in the
+        // message text — retryAfterSeconds/retryAfterSuffix is the one place it lives.
+        throw new GraphError(
+          'THROTTLED: the member list refresh needed to grant file access was throttled; ' +
+            'nothing was uploaded.',
+          429,
+          'MembersRefreshThrottled',
+          caught.retryAfterSeconds,
+        );
+      }
+      throw caught;
+    });
+    this.membersCache.set(chatId, fresh);
+    return fresh;
+  }
+
+  /**
+   * The assistant's own AAD id, resolved once per instance and memoized — used only so sendFile
+   * can exclude the assistant from its own permission grant (it already owns the uploaded item as
+   * the uploader; granting itself `read` on top would be harmless but noisy, not wrong). This is
+   * deliberately best-effort: a failure here does NOT fail the send — the worst case is one
+   * redundant self-grant, which is exactly the "harmless but noisy" case this comment names, never
+   * a dead card for anyone else. Not memoized as a shared/static value: each GraphTeamsChats
+   * instance resolves it against its own signed-in account.
+   */
+  private async resolveSelfId(): Promise<string | undefined> {
+    this.selfIdPromise ??= this.graph
+      .get<{ id?: string }>('/me?$select=id')
+      .then((me) => me.id)
+      .catch(() => undefined);
+    return this.selfIdPromise;
+  }
+
   async readMessages(chatId: string, since?: string, limit = 50): Promise<ReadResult> {
     const raw = await this.graph.getAll<unknown>(
       `/chats/${encodeURIComponent(chatId)}/messages?$top=${Math.min(limit, 50)}`,
@@ -362,7 +417,53 @@ export class GraphTeamsChats implements TeamsChatsPort {
     return toChatMessage(created, chatId);
   }
 
+  /**
+   * Uploads `file` to the account's OneDrive and shares it into the chat as a reference
+   * attachment.
+   *
+   * BUG FIXED (0.4.2, live-verified 2026-09-02): the upload alone leaves the driveItem readable
+   * by nobody but the assistant — every chat member's card answered "can't be viewed or
+   * downloaded" until a human ran a manual `POST /me/drive/items/{id}/invite` by hand. This method
+   * now grants each OTHER chat member read access on the uploaded item (that same invite call,
+   * `requireSignIn: true`, `sendInvitation: false`, `roles: ['read']`) BEFORE the chat message is
+   * posted — Teams' own native upload does this implicitly; we have to do it explicitly. The
+   * roster comes from membersForInvite, the SAME cache-backed path resolveMentions uses — never a
+   * direct call to the throttled `/chats/{id}/members` endpoint on the send path (see that
+   * method's doc comment for why: the 0.4.1 mention-429 incident is the same shared throttle
+   * budget). The assistant's own id is excluded when resolveSelfId can determine it — it already
+   * owns the item as the uploader, so granting itself `read` on top would be harmless but noisy;
+   * see resolveSelfId's doc comment for what happens when that lookup itself fails.
+   *
+   * Failure contract — no dead cards, ever:
+   *  - an unresolvable or empty member roster (cache empty/expired AND the refresh fails or comes
+   *    back empty), or a non-empty roster of other members none of whom has an AAD id Graph can
+   *    grant to, throws BEFORE the OneDrive upload — nothing is wasted;
+   *  - a successful upload followed by a FAILED `/invite` call throws AFTER the upload (which
+   *    cannot be undone from here, so the uploaded item is left orphaned in OneDrive) and BEFORE
+   *    the chat message post — a loud, diagnosable failure is preferred over a card recipients
+   *    cannot open;
+   *  - a chat whose only member is the assistant itself (no OTHER member at all) skips the invite
+   *    call entirely and sends normally — there is nobody who could see a dead card.
+   */
   async sendFile(chatId: string, file: OutboundFile, text?: string): Promise<ChatMessage> {
+    const members = await this.membersForInvite(chatId);
+    if (members.length === 0) {
+      throw new Error(
+        `Cannot share ${file.name} into chat ${chatId}: the chat's member list resolved to ` +
+          'empty, so no recipient permission grant could be attempted. Nothing was uploaded.',
+      );
+    }
+    const selfId = await this.resolveSelfId();
+    const others = members.filter((member) => member.id !== selfId);
+    const recipientIds = others.flatMap((member) => (member.id ? [member.id] : []));
+    if (others.length > 0 && recipientIds.length === 0) {
+      throw new Error(
+        `Cannot share ${file.name} into chat ${chatId}: none of this chat's ${others.length} ` +
+          'other member(s) has an AAD id Graph reported, so no read permission could be granted ' +
+          'to anyone. Nothing was uploaded.',
+      );
+    }
+
     // A chat cannot host a real file; it has to live in the sender's OneDrive first, and the
     // message then carries a reference attachment pointing at it.
     const folder = this.uploadDir.split('/').map(encodeURIComponent).join('/');
@@ -373,13 +474,32 @@ export class GraphTeamsChats implements TeamsChatsPort {
     );
 
     // The attachment id must be the GUID inside the driveItem's eTag ("{GUID},n") — the
-    // driveItem id itself is a different identifier and Teams rejects it.
+    // driveItem id itself is a different identifier and Teams rejects it as the attachment id
+    // (it IS, however, the right id for the /invite call below).
     const guid = /\{([0-9a-fA-F-]+)\}/.exec(item.eTag ?? '')?.[1];
-    if (!guid || !item.webUrl) {
+    if (!guid || !item.webUrl || !item.id) {
       throw new Error(
-        `OneDrive upload of ${file.name} returned no usable eTag/webUrl; ` +
-          'cannot build the reference attachment.',
+        `OneDrive upload of ${file.name} returned no usable id/eTag/webUrl; cannot build the ` +
+          'reference attachment or grant access.',
       );
+    }
+
+    if (recipientIds.length > 0) {
+      try {
+        await this.graph.post(`/me/drive/items/${encodeURIComponent(item.id)}/invite`, {
+          recipients: recipientIds.map((id) => ({ objectId: id })),
+          requireSignIn: true,
+          sendInvitation: false,
+          roles: ['read'],
+        });
+      } catch (caught) {
+        throw new Error(
+          `Uploaded ${file.name} to OneDrive but could not grant chat members read access on it ` +
+            `(${caught instanceof Error ? caught.message : String(caught)}) — nothing was posted ` +
+            'to the chat, since a card the recipients cannot open is worse than none at all. The ' +
+            `uploaded item (id ${item.id}) is orphaned in OneDrive and was not cleaned up.`,
+        );
+      }
     }
 
     const created = await this.graph.post<unknown>(
