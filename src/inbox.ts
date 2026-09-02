@@ -2,6 +2,7 @@ import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises
 import { dirname } from 'node:path';
 import type { ChatAllowlist } from './allowlist.js';
 import type { TeamsChatsPort } from './graph/teams-chats.js';
+import { readYield } from './inbox-yield.js';
 
 /**
  * Background inbox poller. Runs inside the MCP server process and appends every new message from
@@ -28,6 +29,12 @@ export interface InboxPollerDeps {
   self: () => Promise<SignedInAccount>;
   inboxPath: string;
   statePath: string;
+  /**
+   * Where ad-hoc Graph readers ask this poller to go quiet — see inbox-yield.ts for the
+   * measured starvation (2026-09-02) that makes the coordination necessary. Optional: without
+   * it the poller never yields, which is the pre-0.5.0 behaviour.
+   */
+  yieldPath?: string;
   pollMs?: number;
   /** Injectable clock for the 403 park; defaults to Date.now. */
   nowFn?: () => number;
@@ -113,6 +120,8 @@ export class InboxPoller {
   /** True once onAuthStuck has fired for the CURRENT failing streak — prevents firing again on
    *  every subsequent poll while still failing; see trackAuthHealth's doc comment. */
   private authRemedyFired = false;
+  /** The `until` of the yield last logged, so one yield episode logs once, not once per cycle. */
+  private yieldLoggedUntil: number | undefined;
   private readonly writeFileFn: typeof writeFile;
   private readonly renameFn: typeof rename;
 
@@ -167,6 +176,28 @@ export class InboxPoller {
    */
   async pollOnce(): Promise<boolean> {
     try {
+      // Quota yield: an attachment download (or any ad-hoc reader) holding the yield file gets
+      // the mailbox's Graph budget to itself — this poller polling on regardless is exactly what
+      // starved such readers for 20+ minutes on 2026-09-02 (continuous 429, retry-after 62, on
+      // every attempt while the poller ran). A skipped cycle counts as CLEAN: the poller is
+      // being polite, not failing, so the backoff must not double. Checked once per cycle; the
+      // yield's own deadline (capped in readYield) bounds how long a crashed reader can silence
+      // the inbox.
+      if (this.deps.yieldPath) {
+        const standing = await readYield(this.deps.yieldPath, this.now());
+        if (standing) {
+          if (this.yieldLoggedUntil !== standing.until) {
+            this.yieldLoggedUntil = standing.until;
+            const remainS = Math.ceil((standing.until - this.now()) / 1000);
+            this.log(
+              `inbox poller: yielding the Graph read quota to ${standing.reason} ` +
+                `(pid ${standing.pid}, up to ${remainS}s more)`,
+            );
+          }
+          return true;
+        }
+        this.yieldLoggedUntil = undefined;
+      }
       await mkdir(dirname(this.deps.inboxPath), { recursive: true });
       this.state ??= await this.loadState();
       // Without knowing who "self" is, delivered messages could include the assistant's own

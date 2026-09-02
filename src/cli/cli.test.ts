@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -11,11 +11,15 @@ import type { TeamsChatsPort } from '../graph/teams-chats.js';
 import type { ChatMessage, ReadResult } from '../messages.js';
 import { loadConfig } from '../config.js';
 import {
+  doDownloadAttachments,
   doEdit,
+  doListAttachments,
   doPin,
   doPost,
+  doRead,
   doReply,
   doSendFile,
+  parseAttachmentFlags,
   parseSendFileFlags,
   parseSendFlags,
   run,
@@ -260,6 +264,8 @@ describe('teams-post / teams-edit — the --html routing decision (in-process, n
       deleteMessage: reject,
       setReaction: reject,
       getAttachment: reject,
+      listAttachments: reject,
+      getAttachments: reject,
       pinMessage: reject,
       unpinMessage: reject,
       listPinnedMessages: reject,
@@ -437,6 +443,8 @@ describe('doPin — confirms the target message actually landed before claiming 
       deleteMessage: reject,
       setReaction: reject,
       getAttachment: reject,
+      listAttachments: reject,
+      getAttachments: reject,
       pinMessage: reject,
       unpinMessage: reject,
       listPinnedMessages: reject,
@@ -493,6 +501,8 @@ describe('doSendFile — one sendFile call per positional path, --caption applie
       deleteMessage: reject,
       setReaction: reject,
       getAttachment: reject,
+      listAttachments: reject,
+      getAttachments: reject,
       pinMessage: reject,
       unpinMessage: reject,
       listPinnedMessages: reject,
@@ -943,6 +953,8 @@ describe('run() — Retry-After discipline on the send path (0.4.1)', () => {
         deleteMessage: () => Promise.reject(new Error('n/a')),
         setReaction: () => Promise.reject(new Error('n/a')),
         getAttachment: () => Promise.reject(new Error('n/a')),
+        listAttachments: () => Promise.reject(new Error('n/a')),
+        getAttachments: () => Promise.reject(new Error('n/a')),
         pinMessage: () => Promise.reject(new Error('n/a')),
         unpinMessage: () => Promise.reject(new Error('n/a')),
         listPinnedMessages: () => Promise.reject(new Error('n/a')),
@@ -956,5 +968,287 @@ describe('run() — Retry-After discipline on the send path (0.4.1)', () => {
     });
 
     expect(text()).toMatch(/throttled, retry after 9s/);
+  });
+});
+
+describe('teams-attachments — flag parsing (valid shapes in-process; refusals are subprocess tests below)', () => {
+  it('defaults to download-everything mode with no flags', () => {
+    expect(parseAttachmentFlags([])).toEqual({ list: false });
+  });
+
+  it('--list flips to metadata-only mode', () => {
+    expect(parseAttachmentFlags(['--list'])).toEqual({ list: true });
+  });
+
+  it('--name and --out take their values wherever they appear', () => {
+    expect(parseAttachmentFlags(['--out', '/data/dl', '--name', 'plan'])).toEqual({
+      list: false,
+      name: 'plan',
+      out: '/data/dl',
+    });
+  });
+});
+
+describe('teams-attachments — the do* routing (in-process, fake port, real tmpdir writes)', () => {
+  function fakeAttachmentPort(overrides: Partial<TeamsChatsPort>): TeamsChatsPort {
+    const reject = () => Promise.reject(new Error('not part of this test'));
+    return {
+      listChats: reject,
+      readMessages: async () => ({ messages: [] }) as unknown as ReadResult,
+      resolveMentions: reject,
+      sendMessage: reject,
+      sendHtmlMessage: reject,
+      sendImage: reject,
+      sendFile: reject,
+      replyToMessage: reject,
+      editMessage: reject,
+      editHtmlMessage: reject,
+      deleteMessage: reject,
+      setReaction: reject,
+      getAttachment: reject,
+      listAttachments: reject,
+      getAttachments: reject,
+      pinMessage: reject,
+      unpinMessage: reject,
+      listPinnedMessages: reject,
+      ...overrides,
+    } as TeamsChatsPort;
+  }
+
+  // canPost false on purpose: downloading needs a READABLE chat, nothing more.
+  const allowlist = new ChatAllowlist([{ id: '19:r@thread.v2', label: 'watched chat', canPost: false }]);
+
+  function reliable(overrides: Partial<TeamsChatsPort>): ReliableTeamsChats {
+    return new ReliableTeamsChats(fakeAttachmentPort(overrides), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+  }
+
+  it('doDownloadAttachments writes each payload with a sanitized, message-prefixed name and reports the paths', async () => {
+    const getAttachments = vi.fn(async () => [
+      { bytes: new Uint8Array([1]), contentType: 'application/pdf', name: '../../plan.pdf' },
+      { bytes: new Uint8Array([2, 2]), contentType: 'image/png', name: 'logo.png' },
+    ]);
+    const out = mkdtempSync(join(tmpdir(), 'teams-attachments-test-'));
+
+    const result = await doDownloadAttachments(
+      { chats: reliable({ getAttachments }), allowlist },
+      '19:r@thread.v2',
+      'msg-7',
+      { out },
+    );
+
+    expect(getAttachments).toHaveBeenCalledWith('19:r@thread.v2', 'msg-7', undefined);
+    expect(result.action).toBe('attachments');
+    expect(result.chat).toBe('watched chat');
+    expect(result.count).toBe(2);
+    // The hostile ../../ is gone, the messageId prefix survives, and the files really exist.
+    expect(result.files.map((file) => file.path)).toEqual([
+      join(out, 'msg-7-plan.pdf'),
+      join(out, 'msg-7-logo.png'),
+    ]);
+    expect([...readFileSync(result.files[0]!.path)]).toEqual([1]);
+    expect([...readFileSync(result.files[1]!.path)]).toEqual([2, 2]);
+  });
+
+  it('doDownloadAttachments never overwrites: the same message downloaded twice suffixes the second copy', async () => {
+    const getAttachments = vi.fn(async () => [
+      { bytes: new Uint8Array([9]), contentType: 'application/pdf', name: 'plan.pdf' },
+    ]);
+    const out = mkdtempSync(join(tmpdir(), 'teams-attachments-test-'));
+    const context = { chats: reliable({ getAttachments }), allowlist };
+
+    const first = await doDownloadAttachments(context, '19:r@thread.v2', 'msg-7', { out });
+    const second = await doDownloadAttachments(context, '19:r@thread.v2', 'msg-7', { out });
+
+    expect(first.files[0]!.path).toBe(join(out, 'msg-7-plan.pdf'));
+    expect(second.files[0]!.path).toBe(join(out, 'msg-7-plan-1.pdf'));
+  });
+
+  it('doDownloadAttachments forwards --name as the port-level filter', async () => {
+    const getAttachments = vi.fn(async () => [
+      { bytes: new Uint8Array([1]), contentType: 'image/png', name: 'logo.png' },
+    ]);
+    const out = mkdtempSync(join(tmpdir(), 'teams-attachments-test-'));
+
+    await doDownloadAttachments(
+      { chats: reliable({ getAttachments }), allowlist },
+      '19:r@thread.v2',
+      'msg-7',
+      { name: 'logo', out },
+    );
+
+    expect(getAttachments).toHaveBeenCalledWith('19:r@thread.v2', 'msg-7', 'logo');
+  });
+
+  it('doListAttachments returns metadata with downloadable flags and downloads nothing', async () => {
+    const listAttachments = vi.fn(async () => [
+      { id: 'quote-1', contentType: 'messageReference', content: '{}' },
+      { id: 'file-1', name: 'plan.pdf', contentType: 'reference', contentUrl: 'https://x/p' },
+    ]);
+
+    const result = await doListAttachments(
+      { chats: reliable({ listAttachments }), allowlist },
+      '19:r@thread.v2',
+      'msg-7',
+    );
+
+    expect(result).toEqual({
+      action: 'attachments-list',
+      chat: 'watched chat',
+      messageId: 'msg-7',
+      count: 2,
+      attachments: [
+        { id: 'quote-1', contentType: 'messageReference', downloadable: false },
+        { id: 'file-1', name: 'plan.pdf', contentType: 'reference', downloadable: true },
+      ],
+    });
+  });
+
+  it('both refuse a chat outside the allowlist before any port call', async () => {
+    const getAttachments = vi.fn();
+    const listAttachments = vi.fn();
+    const context = { chats: reliable({ getAttachments, listAttachments }), allowlist };
+
+    await expect(doDownloadAttachments(context, '19:other@thread.v2', 'msg-7')).rejects.toThrow();
+    await expect(doListAttachments(context, '19:other@thread.v2', 'msg-7')).rejects.toThrow();
+    expect(getAttachments).not.toHaveBeenCalled();
+    expect(listAttachments).not.toHaveBeenCalled();
+  });
+});
+
+describe('teams-read — attachment metadata in the output (0.5.0: a file used to be invisible here)', () => {
+  const allowlist = new ChatAllowlist([{ id: '19:r@thread.v2', label: 'watched chat', canPost: false }]);
+
+  it('doRead includes id/name/contentType when a message carries attachments, and omits the field when not', async () => {
+    const messages: ChatMessage[] = [
+      { id: 'm1', chatId: '19:r@thread.v2', createdDateTime: '2026-09-02T08:00:00Z', from: 'Celine', text: 'plain', isDeleted: false, attachments: [] },
+      { id: 'm2', chatId: '19:r@thread.v2', createdDateTime: '2026-09-02T08:01:00Z', from: 'Celine', text: 'file attached', isDeleted: false,
+        attachments: [{ id: 'att-1', name: 'plan.xlsx', contentType: 'reference', contentUrl: 'https://x/p' }] },
+    ];
+    const readMessages = vi.fn(async () => ({ messages }) as ReadResult);
+    const chats = new ReliableTeamsChats(
+      {
+        readMessages,
+      } as unknown as TeamsChatsPort,
+      { selfDisplayName: 'Assistant', sleepFn: async () => {} },
+    );
+
+    const result = await doRead({ chats, allowlist }, '19:r@thread.v2', { limit: 5 });
+
+    expect(readMessages).toHaveBeenCalledWith('19:r@thread.v2', undefined, 5);
+    expect(result.messages[0]).not.toHaveProperty('attachments');
+    // Metadata only — never contentUrl, never bytes.
+    expect(result.messages[1]?.attachments).toEqual([
+      { id: 'att-1', name: 'plan.xlsx', contentType: 'reference' },
+    ]);
+  });
+});
+
+describe('teams-attachments — usage refusals (subprocess: the argv contract, exit 2/3)', () => {
+  it('missing ids: exit 2 with usage', async () => {
+    const result = await runCli('attachments.ts', ['19:readonly@thread.v2'], fixtureEnv());
+
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain('usage: teams-attachments');
+    expect(result.stdout).toBe('');
+  });
+
+  it('an unrecognised flag: exit 2, refused loudly rather than silently ignored', async () => {
+    const result = await runCli('attachments.ts', ['19:readonly@thread.v2', 'msg-1', '--nmae', 'x'], fixtureEnv());
+
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain('--nmae');
+  });
+
+  it('--list mixed with --name/--out: exit 2 — the combination has no meaning', async () => {
+    const result = await runCli('attachments.ts', ['19:readonly@thread.v2', 'msg-1', '--list', '--name', 'x'], fixtureEnv());
+
+    expect(result.code).toBe(2);
+  });
+
+  it('--name without a value: exit 2 naming the flag', async () => {
+    const result = await runCli('attachments.ts', ['19:readonly@thread.v2', 'msg-1', '--name'], fixtureEnv());
+
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain('--name');
+  });
+
+  it('a chat outside the allowlist: exit 3 before any network call', async () => {
+    const result = await runCli('attachments.ts', ['19:never-heard-of@thread.v2', 'msg-1'], fixtureEnv());
+
+    expect(result.code).toBe(3);
+    expect(result.stdout).toBe('');
+  });
+});
+
+describe('teams-attachments — the quota yield (0.5.0: a running daemon starved ad-hoc reads, measured 2026-09-02)', () => {
+  const allowlist = new ChatAllowlist([{ id: '19:r@thread.v2', label: 'watched chat', canPost: false }]);
+
+  function reliableWith(overrides: Partial<TeamsChatsPort>): ReliableTeamsChats {
+    return new ReliableTeamsChats(overrides as TeamsChatsPort, {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+  }
+
+  it('doDownloadAttachments holds the yield file across the Graph work and releases it after', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'teams-attachments-yield-'));
+    const yieldPath = join(dir, 'inbox-yield.json');
+    let stoodDuringRead = false;
+    const getAttachments = vi.fn(async () => {
+      stoodDuringRead = existsSync(yieldPath);
+      return [{ bytes: new Uint8Array([1]), contentType: 'application/pdf', name: 'plan.pdf' }];
+    });
+
+    await doDownloadAttachments(
+      { chats: reliableWith({ getAttachments }), allowlist },
+      '19:r@thread.v2',
+      'msg-7',
+      { out: dir, yieldPath },
+    );
+
+    expect(stoodDuringRead).toBe(true); // the poller sees this and sits the cycle out
+    expect(existsSync(yieldPath)).toBe(false); // released the moment the Graph work is done
+  });
+
+  it('a failed download releases the yield too — a dead CLI must not silence the inbox until the deadline', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'teams-attachments-yield-'));
+    const yieldPath = join(dir, 'inbox-yield.json');
+    const getAttachments = vi.fn(async () => {
+      throw new GraphError('throttled', 429, 'TooManyRequests', 62);
+    });
+
+    await expect(
+      doDownloadAttachments(
+        { chats: reliableWith({ getAttachments }), allowlist },
+        '19:r@thread.v2',
+        'msg-7',
+        { out: dir, yieldPath },
+      ),
+    ).rejects.toThrow('throttled');
+
+    expect(existsSync(yieldPath)).toBe(false);
+  });
+
+  it('doListAttachments yields the same way', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'teams-attachments-yield-'));
+    const yieldPath = join(dir, 'inbox-yield.json');
+    let stoodDuringRead = false;
+    const listAttachments = vi.fn(async () => {
+      stoodDuringRead = existsSync(yieldPath);
+      return [];
+    });
+
+    await doListAttachments(
+      { chats: reliableWith({ listAttachments }), allowlist },
+      '19:r@thread.v2',
+      'msg-7',
+      { yieldPath },
+    );
+
+    expect(stoodDuringRead).toBe(true);
+    expect(existsSync(yieldPath)).toBe(false);
   });
 });

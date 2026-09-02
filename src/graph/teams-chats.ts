@@ -8,7 +8,14 @@ import {
   type MentionTarget,
 } from './mentions.js';
 import { textToHtml } from '../formatting.js';
-import { type ChatMessage, type ReadResult, applyWatermark, htmlToText, toChatMessage } from '../messages.js';
+import {
+  type ChatAttachmentRef,
+  type ChatMessage,
+  type ReadResult,
+  applyWatermark,
+  htmlToText,
+  toChatMessage,
+} from '../messages.js';
 
 export interface ChatSummary {
   id: string;
@@ -87,6 +94,22 @@ export interface TeamsChatsPort {
   setReaction(chatId: string, messageId: string, reactionType: string): Promise<void>;
   getAttachment(chatId: string, messageId: string, attachmentId?: string): Promise<AttachmentPayload>;
   /**
+   * The attachment metadata of one message — name, contentType, id — WITHOUT downloading
+   * anything. Includes the quoted-reply card (contentType "messageReference") when there is
+   * one, so a caller sees the message the way Graph reports it; the download methods are the
+   * ones that skip the card.
+   */
+  listAttachments(chatId: string, messageId: string): Promise<ChatAttachmentRef[]>;
+  /**
+   * Downloads EVERY downloadable attachment on one message (quoted-reply cards are never
+   * downloadable), optionally narrowed by a case-insensitive substring match on the attachment
+   * name. The message is fetched once, not once per attachment — the single-message endpoint
+   * has its own throttle budget and per-attachment refetching is how a three-file message
+   * becomes four throttled calls. Zero matches is an error naming why (no attachments at all,
+   * only a quote card, or a filter that matched nothing), never a silent empty success.
+   */
+  getAttachments(chatId: string, messageId: string, nameFilter?: string): Promise<AttachmentPayload[]>;
+  /**
    * Pins a message, replacing whatever was pinned before it: Graph reports success on a SECOND
    * pin while silently dropping the first — a chat effectively holds exactly one pin (verified
    * live 2026-08-25). Returns the pinned-list state AFTER the call so callers can see what
@@ -104,8 +127,12 @@ export type { ChatMember, MentionTarget };
  * A file shared into a chat lives in SharePoint/OneDrive and its contentUrl wants browser
  * cookies, not a Graph bearer token — fetching it directly answers 401. The /shares facade
  * resolves the same URL into a driveItem that the Graph token *can* download.
+ *
+ * Exported for its tests: the encoding must be byte-exact (padding stripped, `+` → `-`,
+ * `/` → `_`) or Graph answers an unhelpful 400/404, and a mistake here is far easier to read
+ * off the string itself than through a mocked download.
  */
-function shareIdFor(url: string): string {
+export function shareIdFor(url: string): string {
   const base64 = Buffer.from(url, 'utf8').toString('base64');
   return `u!${base64.replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_')}`;
 }
@@ -811,9 +838,61 @@ export class GraphTeamsChats implements TeamsChatsPort {
       );
     }
 
-    // Two shapes exist. A pasted image is hosted content on the message itself; a shared file
-    // is a driveItem in SharePoint/OneDrive whose contentUrl must be resolved through the
-    // /shares facade — see shareIdFor.
+    return this.downloadAttachment(chatId, messageId, attachment);
+  }
+
+  async listAttachments(chatId: string, messageId: string): Promise<ChatAttachmentRef[]> {
+    // fetchMessage's throttle fallback (list scan on a 429) applies here too — a metadata
+    // listing must not be more fragile than the download it usually precedes.
+    return (await this.fetchMessage(chatId, messageId)).attachments;
+  }
+
+  async getAttachments(
+    chatId: string,
+    messageId: string,
+    nameFilter?: string,
+  ): Promise<AttachmentPayload[]> {
+    const parsed = await this.fetchMessage(chatId, messageId);
+    const downloadable = parsed.attachments.filter(
+      (candidate) => candidate.contentType !== 'messageReference',
+    );
+    const wanted = nameFilter
+      ? downloadable.filter((candidate) =>
+          (candidate.name ?? '').toLowerCase().includes(nameFilter.toLowerCase()),
+        )
+      : downloadable;
+
+    if (wanted.length === 0) {
+      throw new Error(
+        parsed.attachments.length === 0
+          ? `Message ${messageId} has no attachments.`
+          : downloadable.length === 0
+            ? `Message ${messageId} has no downloadable attachment — only a quoted-message card.`
+            : `Message ${messageId} has no attachment whose name contains "${nameFilter}" — ` +
+              `it has: ${downloadable.map((candidate) => candidate.name ?? candidate.id).join(', ')}.`,
+      );
+    }
+
+    // Sequential on purpose: these downloads all land on the same throttle families (see the
+    // gate doc in graph-client.ts), and firing them in parallel is how one message's worth of
+    // files turns a shared per-mailbox budget into a closed gate for everyone.
+    const payloads: AttachmentPayload[] = [];
+    for (const attachment of wanted) {
+      payloads.push(await this.downloadAttachment(chatId, messageId, attachment));
+    }
+    return payloads;
+  }
+
+  /**
+   * One attachment's bytes. Two shapes exist. A pasted image is hosted content on the message
+   * itself; a shared file is a driveItem in SharePoint/OneDrive whose contentUrl must be
+   * resolved through the /shares facade — see shareIdFor.
+   */
+  private async downloadAttachment(
+    chatId: string,
+    messageId: string,
+    attachment: ChatAttachmentRef,
+  ): Promise<AttachmentPayload> {
     if (!attachment.contentUrl) {
       const hosted = await this.graph.getBinary(
         `/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}` +
@@ -822,9 +901,33 @@ export class GraphTeamsChats implements TeamsChatsPort {
       return { ...hosted, name: attachment.name ?? `${attachment.id}.bin` };
     }
 
-    const downloaded = await this.graph.getBinary(
-      `/shares/${shareIdFor(attachment.contentUrl)}/driveItem/content`,
-    );
+    let downloaded: { bytes: Uint8Array; contentType: string };
+    try {
+      downloaded = await this.graph.getBinary(
+        `/shares/${shareIdFor(attachment.contentUrl)}/driveItem/content`,
+      );
+    } catch (caught) {
+      // A 403 here is a permission story, not a code bug, and the caller deserves the whole
+      // story in one message: with the default setup (a Microsoft first-party client id and the
+      // `.default` scope) this download works out of the box — live-verified 2026-09-02. The
+      // 403 shows up when TEAMS_MCP_CLIENT_ID points at a custom app registration whose token
+      // never asked for (or was never consented) the file-read permission.
+      if (caught instanceof GraphError && caught.status === 403 && !caught.isLicenceProblem) {
+        throw new GraphError(
+          `SharePoint refused the download of "${attachment.name ?? attachment.id}" (403` +
+            `${caught.code ? ` ${caught.code}` : ''}): the signed-in token cannot read the shared ` +
+            'file. With the default Microsoft first-party client id this works without any ' +
+            'setup; if TEAMS_MCP_CLIENT_ID is a custom app registration, that registration ' +
+            'needs the delegated Files.Read.All (or Sites.Read.All) Graph permission, and ' +
+            'granting it may require admin consent. Graph said: ' +
+            caught.message,
+          caught.status,
+          caught.code,
+          caught.retryAfterSeconds,
+        );
+      }
+      throw caught;
+    }
     // attachment.contentType is usually the literal "reference", not a media type; the download
     // response knows better.
     const declared = attachment.contentType?.includes('/') ? attachment.contentType : undefined;
@@ -886,4 +989,4 @@ export class GraphTeamsChats implements TeamsChatsPort {
   }
 }
 
-export type { ChatMessage, ReadResult };
+export type { ChatAttachmentRef, ChatMessage, ReadResult };

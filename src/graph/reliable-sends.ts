@@ -8,7 +8,7 @@ import type {
   PinnedMessage,
   TeamsChatsPort,
 } from './teams-chats.js';
-import { htmlToText, type ChatMessage, type ReadResult } from '../messages.js';
+import { htmlToText, type ChatAttachmentRef, type ChatMessage, type ReadResult } from '../messages.js';
 
 export interface ReliableSendOptions {
   /**
@@ -242,6 +242,14 @@ export class ReliableTeamsChats implements TeamsChatsPort {
     attachmentId?: string,
   ): Promise<AttachmentPayload> {
     return this.inner.getAttachment(chatId, messageId, attachmentId);
+  }
+
+  listAttachments(chatId: string, messageId: string): Promise<ChatAttachmentRef[]> {
+    return this.inner.listAttachments(chatId, messageId);
+  }
+
+  getAttachments(chatId: string, messageId: string, nameFilter?: string): Promise<AttachmentPayload[]> {
+    return this.inner.getAttachments(chatId, messageId, nameFilter);
   }
 
   pinMessage(chatId: string, messageId: string): Promise<PinnedMessage[]> {

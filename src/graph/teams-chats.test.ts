@@ -118,7 +118,10 @@ describe('GraphTeamsChats.resolveMentions — member cache (0.4.1, live-diagnose
     const cache = new MembersCache({ path }); // empty — refresh is unavoidable
     const { fetchFn, calls } = countingMembersFetch(() =>
       json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
-        'retry-after': '62',
+        // Past GraphClient's MAX_RETRY_SLEEP_MS (90s since 0.5.0 — the live-measured window is
+        // 62s and must now be SLEPT, not refused), so this fails fast locally instead of
+        // actually sleeping during the test run.
+        'retry-after': '100',
       }),
     );
     const chats = subject(fetchFn as unknown as typeof fetch, cache);
@@ -131,7 +134,7 @@ describe('GraphTeamsChats.resolveMentions — member cache (0.4.1, live-diagnose
     // 0.4.1 review round 2: retryAfterSeconds is the ONE place the wait lives — the message text
     // itself must NOT also state it (retryAfterSuffix, shared by the CLI and guard(), is the
     // sole renderer, so it is never stated twice on the surfaces that actually show it to someone).
-    expect((error as GraphError).retryAfterSeconds).toBe(62);
+    expect((error as GraphError).retryAfterSeconds).toBe(100);
     expect((error as GraphError).message).not.toMatch(/retry after|\d+s/);
     // 2026-09-02 re-review MINOR: the refreshMembers extraction (shared with membersForInvite)
     // dropped this exact reassurance clause once already — pinned here so it cannot regress a
@@ -480,10 +483,10 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
       const u = String(url);
       if (u.includes('/members')) {
         return json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
-          // >60s: past GraphClient's MAX_RETRY_SLEEP_MS, so it fails fast locally instead of
-          // actually sleeping out a real 30s wait during the test run (same reasoning as the
-          // resolveMentions 429 test above, which uses 62 for the identical reason).
-          'retry-after': '62',
+          // Past GraphClient's MAX_RETRY_SLEEP_MS (90s since 0.5.0: the live-measured 62s
+          // window is now slept, not refused), so it fails fast locally instead of actually
+          // sleeping during the test run (same reasoning as the resolveMentions 429 test above).
+          'retry-after': '100',
         });
       }
       throw new Error(`unexpected call — upload must never be reached: ${u}`);
@@ -496,7 +499,7 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
 
     expect(error).toBeInstanceOf(GraphError);
     expect((error as GraphError).status).toBe(429);
-    expect((error as GraphError).retryAfterSeconds).toBe(62);
+    expect((error as GraphError).retryAfterSeconds).toBe(100);
   });
 
   // Violating-double: Graph (an external system) reports a real chat member with NO AAD id —

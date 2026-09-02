@@ -116,7 +116,13 @@ directory, so a relative path resolves against the wrong repo.
 gitignored here; leave the variable unset and the default lands in the agent's working directory
 instead, i.e. inside your project.
 
-**`TEAMS_MCP_DOWNLOAD_DIR`** — where `get_chat_attachment` writes files. Defaults to a directory
+**`TEAMS_INBOX_POLL_SECONDS`** — inbox poll interval, default 30. The poller is the main
+consumer of the account's per-mailbox Graph read budget; raise this if the same account also
+serves ad-hoc reads and attachment downloads (README "Downloading attachments" has the
+measured story).
+
+**`TEAMS_MCP_DOWNLOAD_DIR`** — where attachment downloads land (`get_chat_attachment`,
+`download_chat_attachments`, `teams-attachments`). Defaults to a directory
 under the OS tmpdir, which may be cleaned between sessions.
 
 **`TEAMS_MCP_UPLOAD_DIR`** — OneDrive folder (under the account's drive root) where
@@ -271,7 +277,7 @@ read-only because their entry says `canPost: false`, not because anyone remember
 
 ## 8. Tool reference
 
-The fourteen tools, as registered in `src/server.ts`. All results are JSON text; errors
+The sixteen tools, as registered in `src/server.ts`. All results are JSON text; errors
 (including allowlist refusals) come back as readable text, not transport failures.
 
 | Tool | What it does | Input |
@@ -286,6 +292,8 @@ The fourteen tools, as registered in `src/server.ts`. All results are JSON text;
 | `send_chat_image` | Posts a PNG/JPEG that renders inline | `chatId`, `path?` or `base64?` (exactly one), `mime?` (required with base64), `text?` |
 | `send_chat_file` | Uploads to the account's OneDrive and shares into the chat as a file card, granting every other chat member read access on the uploaded item | `chatId`, `path`, `text?` |
 | `get_chat_attachment` | Downloads one attachment to `TEAMS_MCP_DOWNLOAD_DIR` and returns the path; pasted images appear as `inline-image-N` | `chatId`, `messageId`, `attachmentId?` (default: first) |
+| `list_chat_attachments` | One message's attachment metadata — id, name, contentType, downloadable — nothing transferred | `chatId`, `messageId` |
+| `download_chat_attachments` | Downloads everything downloadable on one message (quote cards skipped); names sanitized, collisions suffixed, never overwrites | `chatId`, `messageId`, `nameFilter?` (case-insensitive substring), `outputDir?` |
 | `poll_chats` | Reads every allowlisted chat in one call, carrying a watermark per chat | `watermarks?` (chatId → ISO watermark), `limit?` |
 | `pin_chat_message` | Pins a message — REPLACES whatever was pinned before it (a chat effectively holds one pin); returns the resulting pinned list | `chatId`, `messageId` |
 | `unpin_chat_message` | Unpins a message; refuses if it is not the one currently pinned | `chatId`, `messageId` |
@@ -305,10 +313,12 @@ when to tag someone versus just naming them.
 
 ## The standalone CLIs
 
-Beside the server, `npm run build` produces eight commands under `dist/cli/` (also exposed as
+Beside the server, `npm run build` produces nine commands under `dist/cli/` (also exposed as
 package bins): `teams-post [--html] [--mention "Name"]...`, `teams-reply [--mention "Name"]...`,
 `teams-edit [--html] [--mention "Name"]...`, `teams-react`, `teams-read`, `teams-pin`,
-`teams-unpin` and `teams-send-file <chatId> <path> [more paths...] [--caption "text"]`. Same env
+`teams-unpin`, `teams-send-file <chatId> <path> [more paths...] [--caption "text"]` and
+`teams-attachments <chatId> <messageId> [--list] [--name <filter>] [--out <dir>]` (download all,
+or `--list` for metadata only — see README's "Downloading attachments"). Same env
 vars, same allowlist, same send-reliability code paths as the server tools. `--html` on
 `teams-post`/`teams-edit` posts stdin as raw HTML verbatim, same contract as `format: 'html'`
 above; `--mention "Name"` (repeatable) works the same as the `mentions` tool parameter.

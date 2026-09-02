@@ -618,3 +618,83 @@ describe('inbox poller — stuck-auth self-healing (0.4.1, live-diagnosed: only 
     expect(lines.some((l) => /recovered after a forced token re-authentication/.test(l))).toBe(true);
   });
 });
+
+describe('inbox poller — the quota yield (0.5.0: the poller starved ad-hoc readers, measured 2026-09-02)', () => {
+  let dir: string;
+  let inboxPath: string;
+  let statePath: string;
+  let yieldPath: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'inbox-yield-poll-test-'));
+    inboxPath = join(dir, 'inbox.jsonl');
+    statePath = join(dir, 'inbox-state.json');
+    yieldPath = join(dir, 'inbox-yield.json');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function yieldingPoller(chats: { readMessages: (chatId: string, since?: string) => Promise<ReturnType<typeof applyWatermark>> }, log: (line: string) => void = () => {}) {
+    return new InboxPoller({
+      chats,
+      allowlist: new ChatAllowlist([{ id: CHAT, label: CHAT, canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+      yieldPath,
+      log,
+    });
+  }
+
+  it('a standing yield skips the whole cycle — not one Graph read — and counts as CLEAN, so backoff never doubles', async () => {
+    let reads = 0;
+    const chats = {
+      readMessages: () => {
+        reads += 1;
+        return Promise.resolve(applyWatermark([]));
+      },
+    };
+    await writeFile(yieldPath, JSON.stringify({ pid: 4321, reason: 'teams-attachments', until: Date.now() + 60_000 }));
+
+    const clean = await yieldingPoller(chats).pollOnce();
+
+    expect(clean).toBe(true); // being polite is not failing: a doubled backoff would outlast the yield
+    expect(reads).toBe(0);
+  });
+
+  it('one yield episode logs once, not once per cycle', async () => {
+    const lines: string[] = [];
+    const chats = { readMessages: () => Promise.resolve(applyWatermark([])) };
+    await writeFile(yieldPath, JSON.stringify({ pid: 4321, reason: 'teams-attachments', until: Date.now() + 60_000 }));
+
+    const poller = yieldingPoller(chats, (line) => lines.push(line));
+    await poller.pollOnce();
+    await poller.pollOnce();
+    await poller.pollOnce();
+
+    const yieldLines = lines.filter((line) => line.includes('yielding the Graph read quota'));
+    expect(yieldLines).toHaveLength(1);
+    expect(yieldLines[0]).toContain('teams-attachments');
+    expect(yieldLines[0]).toContain('4321');
+  });
+
+  it('an expired or absent yield polls normally — a crashed reader cannot silence the inbox past its deadline', async () => {
+    let reads = 0;
+    const chats = {
+      readMessages: () => {
+        reads += 1;
+        return Promise.resolve(applyWatermark([]));
+      },
+    };
+    await writeFile(yieldPath, JSON.stringify({ pid: 4321, reason: 'crashed', until: Date.now() - 1 }));
+
+    await yieldingPoller(chats).pollOnce();
+    expect(reads).toBe(1);
+
+    await rm(yieldPath);
+    await yieldingPoller(chats).pollOnce();
+    expect(reads).toBe(2);
+  });
+});
