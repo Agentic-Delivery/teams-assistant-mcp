@@ -10,6 +10,7 @@ import { buildServer } from './server.js';
 import { applyWatermark, toChatMessage } from './messages.js';
 import type {
   AttachmentPayload,
+  ChatAttachmentRef,
   ChatSummary,
   MentionTarget,
   OutboundFile,
@@ -175,6 +176,41 @@ class FakeTeamsChats implements TeamsChatsPort {
     };
   }
 
+  // The download-tools fixture message: a quote card (never downloadable), a shared file with a
+  // hostile sender-controlled name, and a pasted inline image.
+  attachmentRefs: ChatAttachmentRef[] = [
+    { id: 'quote-1', contentType: 'messageReference', content: '{"messageId":"m0"}' },
+    { id: 'att-1', name: '../../escape.pdf', contentType: 'reference', contentUrl: 'https://x/f.pdf' },
+    { id: 'hc-1', name: 'inline-image-1', contentType: 'image/*' },
+  ];
+
+  async listAttachments(): Promise<ChatAttachmentRef[]> {
+    return this.attachmentRefs;
+  }
+
+  async getAttachments(
+    _chatId: string,
+    messageId: string,
+    nameFilter?: string,
+  ): Promise<AttachmentPayload[]> {
+    const downloadable = this.attachmentRefs.filter(
+      (candidate) => candidate.contentType !== 'messageReference',
+    );
+    const wanted = nameFilter
+      ? downloadable.filter((candidate) =>
+          (candidate.name ?? '').toLowerCase().includes(nameFilter.toLowerCase()),
+        )
+      : downloadable;
+    if (wanted.length === 0) {
+      throw new Error(`Message ${messageId} has no attachment whose name contains "${nameFilter}".`);
+    }
+    return wanted.map((candidate) => ({
+      bytes: new Uint8Array([1, 2, 3]),
+      contentType: candidate.contentType === 'image/*' ? 'image/png' : 'application/pdf',
+      name: candidate.name ?? `${candidate.id}.bin`,
+    }));
+  }
+
   // One pin per chat, replaced on every pin — mirrors the real single-pin-slot Graph behaviour.
   pinned: Record<string, PinnedMessage | undefined> = {};
   // Toggle to simulate Graph accepting the POST but the re-list NOT showing it pinned — the
@@ -242,8 +278,10 @@ describe('tool surface', () => {
 
     expect(tools.map((tool) => tool.name).sort()).toEqual([
       'delete_chat_message',
+      'download_chat_attachments',
       'edit_chat_message',
       'get_chat_attachment',
+      'list_chat_attachments',
       'list_chats',
       'list_pinned_messages',
       'pin_chat_message',
@@ -783,6 +821,110 @@ describe('get_chat_attachment', () => {
 
   it('refuses a chat outside the allowlist', async () => {
     const result = await call(client, 'get_chat_attachment', {
+      chatId: OUTSIDE,
+      messageId: 'm1',
+    });
+
+    expect(result.isError).toBe(true);
+  });
+
+  it('never silently overwrites: a second download of the same attachment gets a suffixed name', async () => {
+    const first = (
+      await call(client, 'get_chat_attachment', { chatId: PILOT, messageId: 'm1' })
+    ).json() as { path: string };
+    const second = (
+      await call(client, 'get_chat_attachment', { chatId: PILOT, messageId: 'm1' })
+    ).json() as { path: string };
+
+    expect(first.path).toBe(join(downloadDir, 'm1-escape.pdf'));
+    expect(second.path).toBe(join(downloadDir, 'm1-escape-1.pdf'));
+    // Both files exist — nothing replaced anything.
+    expect([...readFileSync(first.path)]).toEqual([1, 2, 3]);
+    expect([...readFileSync(second.path)]).toEqual([1, 2, 3]);
+  });
+});
+
+describe('list_chat_attachments', () => {
+  it('reports every attachment with metadata and marks the quote card non-downloadable', async () => {
+    const payload = (
+      await call(client, 'list_chat_attachments', { chatId: PILOT, messageId: 'm1' })
+    ).json() as {
+      count: number;
+      attachments: Array<{ id: string; name?: string; contentType?: string; downloadable: boolean }>;
+    };
+
+    expect(payload.count).toBe(3);
+    expect(payload.attachments).toEqual([
+      { id: 'quote-1', contentType: 'messageReference', downloadable: false },
+      { id: 'att-1', name: '../../escape.pdf', contentType: 'reference', downloadable: true },
+      { id: 'hc-1', name: 'inline-image-1', contentType: 'image/*', downloadable: true },
+    ]);
+  });
+
+  it('refuses a chat outside the allowlist', async () => {
+    const result = await call(client, 'list_chat_attachments', { chatId: OUTSIDE, messageId: 'm1' });
+
+    expect(result.isError).toBe(true);
+  });
+});
+
+describe('download_chat_attachments', () => {
+  it('downloads every downloadable attachment, skipping the quote card, with sanitized names', async () => {
+    const payload = (
+      await call(client, 'download_chat_attachments', { chatId: PILOT, messageId: 'm1' })
+    ).json() as { count: number; files: Array<{ path: string; name: string; bytes: number }> };
+
+    expect(payload.count).toBe(2);
+    expect(payload.files.map((file) => file.path)).toEqual([
+      join(downloadDir, 'm1-escape.pdf'), // hostile ../../ stripped, messageId prefix kept
+      join(downloadDir, 'm1-inline-image-1'),
+    ]);
+    for (const file of payload.files) {
+      expect([...readFileSync(file.path)]).toEqual([1, 2, 3]);
+    }
+  });
+
+  it('narrows to attachments whose name contains nameFilter, case-insensitively', async () => {
+    const payload = (
+      await call(client, 'download_chat_attachments', {
+        chatId: PILOT,
+        messageId: 'm1',
+        nameFilter: 'ESCAPE',
+      })
+    ).json() as { count: number; files: Array<{ name: string }> };
+
+    expect(payload.count).toBe(1);
+    expect(payload.files[0]?.name).toBe('../../escape.pdf');
+  });
+
+  it('a filter matching nothing is an error, not an empty success', async () => {
+    const result = await call(client, 'download_chat_attachments', {
+      chatId: PILOT,
+      messageId: 'm1',
+      nameFilter: 'no-such-file',
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain('no-such-file');
+  });
+
+  it('writes into outputDir when one is given', async () => {
+    const elsewhere = mkdtempSync(join(tmpdir(), 'teams-mcp-out-'));
+    const payload = (
+      await call(client, 'download_chat_attachments', {
+        chatId: PILOT,
+        messageId: 'm1',
+        outputDir: elsewhere,
+      })
+    ).json() as { files: Array<{ path: string }> };
+
+    for (const file of payload.files) {
+      expect(file.path.startsWith(elsewhere)).toBe(true);
+    }
+  });
+
+  it('refuses a chat outside the allowlist', async () => {
+    const result = await call(client, 'download_chat_attachments', {
       chatId: OUTSIDE,
       messageId: 'm1',
     });

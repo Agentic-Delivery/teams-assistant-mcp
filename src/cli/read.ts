@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Usage: teams-read <chatId> [--limit N] [--since ISO]
-// Success: one JSON line {ok, messages: [...]} on stdout — ids, timestamps, sender, text.
-import { buildContext, run, succeed, usage } from './common.js';
+// Success: one JSON line {ok, messages: [...]} on stdout — ids, timestamps, sender, text, and
+// (when a message carries any) attachment metadata. Metadata only: teams-attachments downloads.
+import { buildContext, doRead, run, succeed, usage } from './common.js';
 
 await run(async () => {
   const chatId = process.argv[2];
@@ -14,18 +15,5 @@ await run(async () => {
   if (!Number.isFinite(limit) || limit < 1) usage('--limit must be a positive number');
   if (sinceIndex >= 0 && !since) usage('--since needs an ISO-8601 value');
 
-  const { chats, allowlist } = buildContext();
-  allowlist.assertReadable(chatId);
-  const { messages } = await chats.readMessages(chatId, since, limit);
-  succeed({
-    action: 'read',
-    count: messages.length,
-    messages: messages.map((m) => ({
-      id: m.id,
-      at: m.createdDateTime,
-      from: m.from,
-      deleted: m.isDeleted,
-      text: m.text,
-    })),
-  });
+  succeed(await doRead(buildContext(), chatId, { ...(since !== undefined ? { since } : {}), limit }));
 });
