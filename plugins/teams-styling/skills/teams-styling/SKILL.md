@@ -153,4 +153,8 @@ conduct/profile must carry the mandate — one line is enough:
 > All formatted channel output (tables, reports, status boards, alerts) follows the
 > `teams-styling` skill; agents load it before composing any such message.
 
-Without that line, expect agents to fall back to plain-text walls.
+Without that line, expect agents to fall back to plain-text walls. **Since 0.2.0 the plugin
+ships this mandate itself**: a SessionStart hook injects the reminder into every consumer
+session at start and after each compaction, so the trigger no longer depends on per-project
+wiring — the conduct-line above remains worthwhile as reinforcement for subagents that don't
+inherit session hooks.
