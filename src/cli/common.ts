@@ -7,17 +7,19 @@ import { withQuotaYield } from '../inbox-yield.js';
 import { loadConfig } from '../config.js';
 import { retryAfterSuffix } from '../graph/graph-client.js';
 import type { ReliableTeamsChats } from '../graph/reliable-sends.js';
-import type { MentionTarget, PinnedMessage } from '../graph/teams-chats.js';
+import { MessageOwnershipError, type MentionTarget, type PinnedMessage } from '../graph/teams-chats.js';
 
 /**
  * Shared plumbing for the standalone CLIs (teams-post, teams-reply, teams-edit, teams-react,
- * teams-read, teams-send-file).
+ * teams-read, teams-send-file, teams-attachments, teams-delete).
  *
  * The output contract is the whole point, learned the hard way on 2026-08-24 when a caller
  * grepped for a success token the old ad-hoc script never printed and re-posted a broadcast
  * ten extra times: SUCCESS is exactly one JSON line on stdout and exit 0 — nothing else ever
  * reaches stdout. Failure is prose on stderr and a non-zero exit (2 usage, 3 allowlist,
- * 1 everything else). Callers branch on the exit code, never on output text.
+ * 4 ownership refusal — teams-delete's own-message gate, MessageOwnershipError, FINDING 4 of the
+ * message-withdrawal review — 1 everything else). Callers branch on the exit code, never on
+ * output text.
  *
  * ONE exception, documented here rather than only in README/SETUP (2026-09-02 re-review MINOR —
  * a contract stated once in the code it governs, not just in the docs describing it): teams-
@@ -182,6 +184,48 @@ export function parseAttachmentFlags(args: readonly string[]): { list: boolean; 
     }
   }
   return { list, ...(name !== undefined ? { name } : {}), ...(out !== undefined ? { out } : {}) };
+}
+
+/**
+ * Parses teams-delete's trailing argv: a bare `--undo` (restore instead of delete) and a bare
+ * `--force` (skip the own-message check). No values, no positionals — anything else is refused
+ * loudly, same doctrine as parseAttachmentFlags above.
+ */
+export function parseDeleteFlags(args: readonly string[]): { undo: boolean; force: boolean } {
+  let undo = false;
+  let force = false;
+  for (const arg of args) {
+    if (arg === '--undo') {
+      undo = true;
+    } else if (arg === '--force') {
+      force = true;
+    } else {
+      usage(`teams-delete: unrecognised argument ${arg}`);
+    }
+  }
+  return { undo, force };
+}
+
+/**
+ * teams-delete's routing — same direct-call testability rationale as doPost below: a subprocess
+ * test stops at the allowlist gate either way, so which port method runs (delete or undo) and
+ * whether --force reached it can only be proven by calling this with a fake port. The
+ * own-message check itself lives in the port (GraphTeamsChats.assertOwnMessage), not here, so
+ * the MCP tool and this CLI cannot drift apart on it.
+ */
+export async function doDelete(
+  { chats, allowlist }: CliContext,
+  chatId: string,
+  messageId: string,
+  options: { undo: boolean; force: boolean },
+): Promise<{ action: 'delete' | 'undo-delete'; messageId: string; chat: string }> {
+  const entry = allowlist.assertPostable(chatId);
+  if (options.undo) {
+    await chats.undoDeleteMessage(chatId, messageId, { force: options.force });
+    return { action: 'undo-delete', messageId, chat: entry.label };
+  }
+  await chats.deleteMessage(chatId, messageId, { force: options.force });
+  return { action: 'delete', messageId, chat: entry.label };
 }
 
 /**
@@ -527,6 +571,15 @@ export async function run(main: () => Promise<void>): Promise<void> {
     await main();
   } catch (caught) {
     process.stderr.write(`${formatCliError(caught)}\n`);
-    process.exit(caught instanceof ChatNotAllowedError ? 3 : 1);
+    // FINDING 4 (message-withdrawal review): a MessageOwnershipError — teams-delete's own-message
+    // gate refusing somebody else's (or an unverifiable) message — is its own exit code, distinct
+    // from both the allowlist refusal (3) and the generic 1 catch-all, so a caller can branch on
+    // "the ownership check refused this" without parsing stderr text. A throttled /me during that
+    // same gate is NOT this: it is the package's ordinary 429-shaped GraphError and exits 1, same
+    // as any other Graph failure — see assertOwnMessage's own doc comment (teams-chats.ts) for why
+    // the two are deliberately different exception types.
+    process.exit(
+      caught instanceof ChatNotAllowedError ? 3 : caught instanceof MessageOwnershipError ? 4 : 1,
+    );
   }
 }

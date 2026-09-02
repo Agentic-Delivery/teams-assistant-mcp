@@ -44,6 +44,7 @@ function portWith(overrides: Partial<TeamsChatsPort>): TeamsChatsPort {
     editMessage: reject,
     editHtmlMessage: reject,
     deleteMessage: reject,
+    undoDeleteMessage: reject,
     setReaction: reject,
     getAttachment: reject,
     pinMessage: reject,
@@ -216,7 +217,13 @@ describe('reliable sends — readback before any retry', () => {
     await chats.deleteMessage('19:a@thread.v2', 'm1');
 
     expect(inner.editMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1', 'new', []);
-    expect(inner.deleteMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1');
+    // NIT (d, message-withdrawal review): the third arg's exact shape (undefined vs {}, or
+    // whether it is passed at all) is an implementation detail of the passthrough, not this
+    // test's concern — only that chatId and messageId reach the inner port untouched.
+    expect(inner.deleteMessage).toHaveBeenCalledTimes(1);
+    const [chatId, messageId] = (inner.deleteMessage as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
+    expect(chatId).toBe('19:a@thread.v2');
+    expect(messageId).toBe('m1');
   });
 });
 
@@ -740,7 +747,7 @@ describe('the real assembly — MessageFetchThrottled through the decorator', ()
     const error = (await chats.replyToMessage('19:a@thread.v2', 'old-id', 'hi').catch((c: unknown) => c)) as GraphError;
 
     expect(error.code).toBe('MessageFetchThrottled');
-    expect(error.message).toMatch(/nothing was posted/);
+    expect(error.message).toMatch(/no action was taken/);
     expect(posts).toHaveLength(0);
     expect(sleeps).toEqual([]);
   });

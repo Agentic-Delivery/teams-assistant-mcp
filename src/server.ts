@@ -323,14 +323,24 @@ export function buildServer(deps: ServerDeps): McpServer {
       }),
   );
 
+  // DESIGN DECISION (message-withdrawal review, delegated by the repo owner): the MCP tool
+  // surface does not offer `force` — an agent driving this server never gets to skip the
+  // own-message check on its own say-so. `force` survives only as a CLI-only, human-operated
+  // escape hatch (teams-delete --force, src/cli/delete.ts) behind the allowlist; the port method
+  // (GraphTeamsChats.deleteMessage/undoDeleteMessage) still accepts MessageActionOptions.force
+  // for that one caller. Neither tool below passes it, so the gate always runs here.
+
   server.registerTool(
     'delete_chat_message',
     {
       title: 'Delete a message this account sent',
       description:
-        'Soft-deletes a message in an allowlisted chat - the reversible kind, leaving the ' +
-        '"This message was deleted" stub that Teams can restore. Graph only allows deleting ' +
-        'messages the signed-in account sent itself. There is deliberately no hard delete here.',
+        'Soft-deletes a message in an allowlisted chat — the reversible kind, leaving the ' +
+        '"This message was deleted" stub; undo_delete_chat_message puts it back. Use it to ' +
+        'withdraw something posted in the wrong chat. Own messages only: the message is fetched ' +
+        'and its author compared with this account before anything is sent, and a message ' +
+        'somebody else wrote is refused — this check is authoritative and cannot be skipped from ' +
+        'this tool. There is deliberately no hard delete here.',
       inputSchema: {
         chatId: z.string().describe('Graph chat id, must be allowlisted with canPost: true'),
         messageId: z.string().describe('Id of a message this account sent'),
@@ -342,6 +352,31 @@ export function buildServer(deps: ServerDeps): McpServer {
         allowlist.assertPostable(chatId);
         await chats.deleteMessage(chatId, messageId);
         return ok({ deleted: true, chatId, messageId });
+      }),
+  );
+
+  server.registerTool(
+    'undo_delete_chat_message',
+    {
+      title: 'Restore a message this account deleted',
+      description:
+        'Reverses a soft delete: the "This message was deleted" stub becomes the original ' +
+        'message again, in place. Same ownership rule as delete_chat_message — own messages ' +
+        'only; this check cannot be skipped from this tool.',
+      inputSchema: {
+        chatId: z.string().describe('Graph chat id, must be allowlisted with canPost: true'),
+        messageId: z.string().describe('Id of a soft-deleted message this account sent'),
+      },
+      // destructiveHint: true (NIT b, message-withdrawal review) — restoring somebody else's
+      // deleted message back into a chat is exactly as consequential as deleting one; the own-
+      // message gate is the same, so the annotation should say the same thing.
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
+    },
+    ({ chatId, messageId }) =>
+      guard(async () => {
+        allowlist.assertPostable(chatId);
+        await chats.undoDeleteMessage(chatId, messageId);
+        return ok({ restored: true, chatId, messageId });
       }),
   );
 

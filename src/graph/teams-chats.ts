@@ -54,6 +54,24 @@ export interface OutboundFile {
   contentType?: string;
 }
 
+export interface MessageActionOptions {
+  /** Skip the own-message check — see TeamsChatsPort.deleteMessage. */
+  force?: boolean;
+}
+
+/**
+ * The refusal deleteMessage/undoDeleteMessage raise BEFORE touching Graph when the target was not
+ * written by the signed-in account (or its author could not be verified) and `force` was not
+ * given. Its own class so a caller can tell "you asked for someone else's message" apart from a
+ * Graph failure — and can choose to retry with force if that is really what they meant.
+ */
+export class MessageOwnershipError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'MessageOwnershipError';
+  }
+}
+
 /**
  * sendFile's escape hatches around the default roster-derived permission grant (0.6.0, live
  * 2026-09-08 — see sendFile's own doc comment for the full reasoning). Mutually exclusive; giving
@@ -124,7 +142,25 @@ export interface TeamsChatsPort {
   editMessage(chatId: string, messageId: string, newText: string, mentions?: readonly MentionTarget[]): Promise<void>;
   /** Same verbatim contract as sendHtmlMessage, applied to an edit. */
   editHtmlMessage(chatId: string, messageId: string, html: string, mentions?: readonly MentionTarget[]): Promise<void>;
-  deleteMessage(chatId: string, messageId: string): Promise<void>;
+  /**
+   * Soft-deletes a message — Graph's reversible kind: Teams shows the "This message was deleted"
+   * stub, and undoDeleteMessage puts it back. There is deliberately no hard delete anywhere here.
+   *
+   * Own messages only, unless `force`: the message is fetched first and its author compared with
+   * the signed-in account's own id (case-insensitively — FINDING 6), confirming a cached/override
+   * self id against a live `/me` first when that is where it came from — see assertOwnMessage's
+   * own doc comment for why. A message somebody else wrote is refused with a MessageOwnershipError,
+   * before anything is sent; so is a message whose author cannot be verified because `/me` failed
+   * outright. A THROTTLED `/me` is different from both: it raises the package's 429-shaped
+   * GraphError instead, never a MessageOwnershipError — "could not check right now" is not the
+   * same claim as "this is not your message" (BLOCKING 2, message-withdrawal review). `force: true`
+   * skips the whole check and sends the action as-is — Graph then decides, and its refusal comes
+   * back verbatim (0.7.1). The MCP tool surface no longer offers `force`; it remains a CLI-only,
+   * human-operated escape hatch (teams-delete --force).
+   */
+  deleteMessage(chatId: string, messageId: string, options?: MessageActionOptions): Promise<void>;
+  /** Reverses a soft delete. Same ownership rule and `force` escape as deleteMessage (0.7.1). */
+  undoDeleteMessage(chatId: string, messageId: string, options?: MessageActionOptions): Promise<void>;
   setReaction(chatId: string, messageId: string, reactionType: string): Promise<void>;
   getAttachment(chatId: string, messageId: string, attachmentId?: string): Promise<AttachmentPayload>;
   /**
@@ -189,6 +225,34 @@ export interface SelfIdResolution {
    *  the seed/memo/cache already answered, since none of those ever reach the live call. */
   throttled?: boolean;
   retryAfterSeconds?: number;
+  /**
+   * Which rung of the override -> memo -> persisted-cache -> live chain produced `id` — added
+   * minimally (0.7.1 fix round, message-withdrawal review BLOCKING 1) so a caller that needs to
+   * know can, without every existing consumer having to change: `resolveSelfId`/`sendFile`/the
+   * inbox poller all still read only `.id`/`.throttled` and ignore this field entirely.
+   *
+   * `'override'` and `'cache'` are UNVERIFIED input this process has not itself confirmed against
+   * a live `/me` this run — an operator-set `TEAMS_MCP_SELF_ID` typo or a stale on-disk cache
+   * entry from before the signed-in account changed, same realistic ways a wrong id reaches this
+   * far that `recipientIdsFromRoster`'s own doc comment names for `sendFile`. `'memo'` is a live
+   * result already confirmed earlier THIS process — trusted the same as `'live'` itself. The
+   * delete/undo gate (`assertOwnMessage`) is the one caller that branches on this: acting on an
+   * ownership decision (allow OR refuse) from an unverified `'override'`/`'cache'` id is exactly
+   * the class of bug this field exists to close.
+   *
+   * INVARIANT (post-review fix, message-withdrawal adversarial re-review — the reviewer
+   * reproduced a laundering bug against dist/): `'memo'` is reportable ONLY when the in-memory
+   * value being reported was itself obtained from a live `/me` this process — never merely
+   * because SOME value is warm in memory. A cache-origin memo (the persisted self-id cache warmed
+   * it, e.g. via the inbox poller's own `resolveSelfId()` calls — build-inbox-poller.ts) keeps
+   * reporting `'cache'`, every call, until an actual live call confirms it — see
+   * `GraphTeamsChats.selfIdSource`'s own doc comment for the field that enforces this at the
+   * write site. Getting this wrong is exactly as dangerous as never distinguishing override/cache
+   * from live in the first place: a caller that trusts `'memo'` unconditionally would otherwise
+   * launder an unverified cache value past the gate's own escalation the moment ANY other caller
+   * in the same process (the poller, sendFile) happened to warm it first.
+   */
+  source?: 'override' | 'memo' | 'cache' | 'live';
 }
 
 export type { ChatMember, MentionTarget };
@@ -384,6 +448,28 @@ export class GraphTeamsChats implements TeamsChatsPort {
   /** Memoized by resolveSelfId, but ONLY on success — see its doc comment for why a failed
    *  lookup must NOT stick for the instance's lifetime. */
   private selfId: string | undefined;
+  /**
+   * Which rung actually produced `selfId`'s current value — `'cache'` or `'live'` — tracked
+   * separately from `selfId` itself (post-review fix, message-withdrawal adversarial re-review:
+   * the reviewer reproduced a laundering bug against dist/). `selfId` alone cannot answer this: it
+   * is written by BOTH the persisted-cache rung and the live rung (resolveSelfIdStatus/
+   * resolveSelfIdLiveStatus below), so a memo short-circuit that reported every warm `selfId` as
+   * `source: 'memo'` was, for a cache-origin value, reporting a LIVE-confirmed source for
+   * UNVERIFIED disk input — exactly the class of bug assertOwnMessage's escalation exists to
+   * catch, except the escalation itself never ran because the memo branch hides which rung set
+   * the value. Concretely: the inbox poller calls `resolveSelfId()` every cycle
+   * (build-inbox-poller.ts), which happily warms `selfId` from the persisted cache; the NEXT
+   * delete/undo in that same process then hit the memo branch, reported `'memo'`, and
+   * assertOwnMessage (which escalates only on `'override'`/`'cache'`) trusted it with zero `/me`
+   * calls. This field is what the memo branch now consults instead of assuming: `'live'` means
+   * the memo is exactly what a fresh `resolveSelfIdLiveStatus` last returned and is reported as
+   * `'memo'` (trusted); `'cache'` means it is not, and keeps reporting as `'cache'` — so the gate
+   * keeps escalating on every call — until an actual live call succeeds and flips it. Read ONLY by
+   * the memo branch's `source` computation; every other consumer (`resolveSelfId().id`, the
+   * poller, sendFile) still reads plain `selfId` and is unaffected — same values, same call counts
+   * as before this field existed.
+   */
+  private selfIdSource: 'cache' | 'live' | undefined;
 
   constructor(
     private readonly graph: GraphClient,
@@ -768,16 +854,20 @@ export class GraphTeamsChats implements TeamsChatsPort {
    */
   async resolveSelfIdStatus(): Promise<SelfIdResolution> {
     if (this.selfIdOverride !== undefined) {
-      return { id: this.selfIdOverride };
+      return { id: this.selfIdOverride, source: 'override' };
     }
     if (this.selfId !== undefined) {
-      return { id: this.selfId };
+      // See selfIdSource's own doc comment: a warm selfId is only reportable as the trusted
+      // 'memo' when a live call is what put it there. A cache-origin memo keeps reporting
+      // 'cache' — every call, not just the first — until a live call actually confirms it.
+      return { id: this.selfId, source: this.selfIdSource === 'live' ? 'memo' : 'cache' };
     }
     const cached = this.selfIdCache.read();
     if (cached) {
       this.selfId = cached.id;
+      this.selfIdSource = 'cache';
       this.log('self id served from the persisted cache; /me not called.');
-      return { id: this.selfId };
+      return { id: this.selfId, source: 'cache' };
     }
     return this.resolveSelfIdLiveStatus();
   }
@@ -806,8 +896,9 @@ export class GraphTeamsChats implements TeamsChatsPort {
       const me = await this.graph.get<{ id?: string }>('/me?$select=id', { readRetries: 0 });
       if (me.id) {
         this.selfId = me.id;
+        this.selfIdSource = 'live';
         this.selfIdCache.write({ id: me.id, resolvedAt: Date.now() });
-        return { id: this.selfId };
+        return { id: this.selfId, source: 'live' };
       }
       return {};
     } catch (error) {
@@ -1167,7 +1258,10 @@ export class GraphTeamsChats implements TeamsChatsPort {
         // retryAfterSuffix (0.4.1 review round 2).
         throw new GraphError(
           `Message ${messageId} could not be fetched (that endpoint is throttled) and is not ` +
-            'among the chat\'s last 50 messages — nothing was posted.',
+            // Neutral wording (0.7.1 fix round, NIT c): fetchMessage backs replies, attachment
+            // reads AND the delete/undo ownership gate — "nothing was posted" read wrong for a
+            // delete, which posts nothing to begin with either way.
+            'among the chat\'s last 50 messages — no action was taken.',
           429,
           'MessageFetchThrottled',
           caught.retryAfterSeconds,
@@ -1289,12 +1383,137 @@ export class GraphTeamsChats implements TeamsChatsPort {
     );
   }
 
-  async deleteMessage(chatId: string, messageId: string): Promise<void> {
+  async deleteMessage(chatId: string, messageId: string, options: MessageActionOptions = {}): Promise<void> {
     // The reversible soft delete — the message becomes "This message was deleted" in Teams and
-    // can be restored. Hard delete is deliberately not offered here.
-    await this.graph.postAction(
-      `/me/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}/softDelete`,
-    );
+    // undoDeleteMessage restores it. Hard delete is deliberately not offered here.
+    await this.assertOwnMessage(chatId, messageId, options, 'delete');
+    await this.messageAction(chatId, messageId, 'softDelete');
+  }
+
+  async undoDeleteMessage(chatId: string, messageId: string, options: MessageActionOptions = {}): Promise<void> {
+    // A soft-deleted message still reads back with its author (only the body is emptied), so
+    // the same ownership check applies — restoring somebody else's message into a chat is no
+    // more casual an act than deleting it.
+    await this.assertOwnMessage(chatId, messageId, options, 'restore');
+    await this.messageAction(chatId, messageId, 'undoSoftDelete');
+  }
+
+  /**
+   * The own-message gate behind deleteMessage/undoDeleteMessage. The message is fetched (through
+   * fetchMessage, so the single-message throttle falls back to the list scan the same way a
+   * quoted reply does) and its author id compared with the signed-in account's, case-insensitively
+   * (FINDING 6, review round: Graph does not guarantee two ids naming the same account compare
+   * byte-identical, and a same-account-different-casing id must not silently read as "somebody
+   * else's message"). `force` skips the whole gate, including the fetch: the caller has said
+   * "this one, whoever wrote it", and a throttled single-message family must not stand between
+   * them and a message they need gone.
+   *
+   * Ground-truth verification (BLOCKING 1, review round: message-withdrawal adversarial review).
+   * `resolveSelfIdStatus`'s override and persisted-cache rungs are unverified operator/disk
+   * input — a stale cache entry or a `TEAMS_MCP_SELF_ID` typo that still happens to be GUID-shaped
+   * reaches this gate the exact same way `recipientIdsFromRoster`'s own doc comment already names
+   * for `sendFile`, and here the consequence is worse than a noisy grant: a WRONG-but-real id can
+   * invert the gate outright, either refusing this account's own message or — if the wrong id
+   * happens to equal the actual author's — waving somebody else's message through as "own". So,
+   * mirroring `recipientIdsFromRoster`'s "only a fresh /me is trustworthy enough" re-check: when
+   * the cheap resolution's `source` is `'override'` or `'cache'`, this gate does not act on it
+   * either way (allow OR refuse) until a live `resolveSelfIdLiveStatus()` call confirms it. A
+   * `'memo'` source is a live result already confirmed earlier THIS process and is trusted the
+   * same as a fresh `'live'` one — re-confirming it on every single delete/undo would just spend
+   * the throttle budget for no correctness gain.
+   *
+   * Throttle-shaped failure (BLOCKING 2, same review): a 429 on /me — whether on the FIRST
+   * resolution or on the live re-check above — must not read as "this is not your message". That
+   * would be a caller-visible lie (the author was never actually checked) and, unlike a real
+   * ownership refusal, is worth retrying once Graph stops throttling. So a throttled outcome is
+   * raised as the package's own 429-shaped GraphError (retryAfterSeconds carried structurally, so
+   * retryAfterSuffix — graph-client.ts, the ONE place that number is stated — renders the wait),
+   * never as a MessageOwnershipError: the two are deliberately different exception types so a
+   * caller can tell "we could not check right now" apart from "this is not your message" without
+   * parsing text. A non-throttle failure to resolve self (a live `/me` outage, a 403) still reads
+   * as MessageOwnershipError — that case was already unverifiable before this fix and stays so.
+   */
+  private async assertOwnMessage(
+    chatId: string,
+    messageId: string,
+    options: MessageActionOptions,
+    verb: 'delete' | 'restore',
+  ): Promise<void> {
+    if (options.force) {
+      return;
+    }
+    let status = await this.resolveSelfIdStatus();
+    if (status.id !== undefined && (status.source === 'override' || status.source === 'cache')) {
+      this.log(
+        `self id resolved from ${status.source}, not yet confirmed live this process; ` +
+          `re-resolving live before acting on message ${messageId} (${verb}) rather than trusting it.`,
+      );
+      status = await this.resolveSelfIdLiveStatus();
+    }
+    if (status.throttled) {
+      throw new GraphError(
+        `Could not verify the signed-in account's identity before ${verb === 'delete' ? 'deleting' : 'restoring'} ` +
+          `message ${messageId} in chat ${chatId}: /me is throttled, so the message's author could not be ` +
+          'checked. Nothing was changed — this ownership check is authoritative and does not proceed on an ' +
+          'unverifiable identity; try again once /me is reachable.',
+        429,
+        'MessageOwnershipCheckThrottled',
+        status.retryAfterSeconds,
+      );
+    }
+    const selfId = status.id;
+    if (selfId === undefined) {
+      throw new MessageOwnershipError(
+        `Refusing to ${verb} message ${messageId} in chat ${chatId}: the signed-in account's own id ` +
+          'could not be determined (the /me lookup failed), so the message\'s author could not be ' +
+          'verified as this account. Nothing was changed — this ownership check is authoritative; ' +
+          'try again once /me is reachable.',
+      );
+    }
+    const target = await this.fetchMessage(chatId, messageId);
+    if ((target.fromId ?? '').toLowerCase() !== selfId.toLowerCase()) {
+      throw new MessageOwnershipError(
+        `Refusing to ${verb} message ${messageId} in chat ${chatId}: it was written by ` +
+          `${target.from}${target.fromId ? ` (${target.fromId})` : ''}, not by this account. ` +
+          'Nothing was changed — this ownership check is authoritative.',
+      );
+    }
+  }
+
+  /**
+   * The softDelete/undoSoftDelete actions share one shape: a body-less POST under /me answering
+   * 204, needing the delegated Chat.ReadWrite permission (Graph reference, chatMessage: softDelete
+   * and undoSoftDelete, v1.0). With the shipped setup — a Microsoft first-party client id and the
+   * `.default` scope — the token already carries it. A 403 that is not the licence problem is
+   * therefore almost always a custom TEAMS_MCP_CLIENT_ID whose registration never asked for (or
+   * was never consented) that permission, and the error says so in one message, Graph's own
+   * words kept — same treatment the SharePoint download 403 got in 0.5.0.
+   */
+  private async messageAction(
+    chatId: string,
+    messageId: string,
+    action: 'softDelete' | 'undoSoftDelete',
+  ): Promise<void> {
+    try {
+      await this.graph.postAction(
+        `/me/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}/${action}`,
+      );
+    } catch (caught) {
+      if (caught instanceof GraphError && caught.status === 403 && !caught.isLicenceProblem) {
+        throw new GraphError(
+          `Graph refused ${action} on message ${messageId} (403${caught.code ? ` ${caught.code}` : ''}): ` +
+            'the signed-in token may not delete or restore chat messages. With the default Microsoft ' +
+            'first-party client id this works without any setup; if TEAMS_MCP_CLIENT_ID is a custom app ' +
+            'registration, that registration needs the delegated Chat.ReadWrite Graph permission, and ' +
+            'granting it may require admin consent. Graph said: ' +
+            caught.message,
+          caught.status,
+          caught.code,
+          caught.retryAfterSeconds,
+        );
+      }
+      throw caught;
+    }
   }
 
   async setReaction(chatId: string, messageId: string, reactionType: string): Promise<void> {

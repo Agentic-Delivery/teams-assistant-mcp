@@ -4,14 +4,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { buildChats } from '../build-chats.js';
-import { ChatAllowlist } from '../allowlist.js';
+import { ChatAllowlist, ChatNotAllowedError } from '../allowlist.js';
 import { GraphClient, GraphError } from '../graph/graph-client.js';
 import { MembersCache } from '../graph/members-cache.js';
 import { ReliableTeamsChats } from '../graph/reliable-sends.js';
-import { GraphTeamsChats, type TeamsChatsPort } from '../graph/teams-chats.js';
+import { GraphTeamsChats, MessageOwnershipError, type TeamsChatsPort } from '../graph/teams-chats.js';
 import type { ChatMessage, ReadResult } from '../messages.js';
 import { loadConfig } from '../config.js';
 import {
+  doDelete,
   doDownloadAttachments,
   doEdit,
   doListAttachments,
@@ -21,6 +22,7 @@ import {
   doReply,
   doSendFile,
   parseAttachmentFlags,
+  parseDeleteFlags,
   parseSendFileFlags,
   parseSendFlags,
   run,
@@ -263,6 +265,7 @@ describe('teams-post / teams-edit — the --html routing decision (in-process, n
       editMessage: reject,
       editHtmlMessage: reject,
       deleteMessage: reject,
+      undoDeleteMessage: reject,
       setReaction: reject,
       getAttachment: reject,
       listAttachments: reject,
@@ -513,6 +516,7 @@ describe('doPin — confirms the target message actually landed before claiming 
       editMessage: reject,
       editHtmlMessage: reject,
       deleteMessage: reject,
+      undoDeleteMessage: reject,
       setReaction: reject,
       getAttachment: reject,
       listAttachments: reject,
@@ -572,6 +576,7 @@ describe('doSendFile — one sendFile call per positional path, --caption applie
       editMessage: reject,
       editHtmlMessage: reject,
       deleteMessage: reject,
+      undoDeleteMessage: reject,
       setReaction: reject,
       getAttachment: reject,
       listAttachments: reject,
@@ -1181,6 +1186,7 @@ describe('run() — Retry-After discipline on the send path (0.4.1)', () => {
         editMessage: () => Promise.reject(new Error('n/a')),
         editHtmlMessage: () => Promise.reject(new Error('n/a')),
         deleteMessage: () => Promise.reject(new Error('n/a')),
+        undoDeleteMessage: () => Promise.reject(new Error('n/a')),
         setReaction: () => Promise.reject(new Error('n/a')),
         getAttachment: () => Promise.reject(new Error('n/a')),
         listAttachments: () => Promise.reject(new Error('n/a')),
@@ -1198,6 +1204,58 @@ describe('run() — Retry-After discipline on the send path (0.4.1)', () => {
     });
 
     expect(text()).toMatch(/throttled, retry after 9s/);
+  });
+});
+
+// FINDING 4 (message-withdrawal review): a MessageOwnershipError from teams-delete's own-message
+// gate must exit 4, distinct from ChatNotAllowedError's 3 and the generic 1 everything-else —
+// same in-process run()-with-mocked-exit style as the Retry-After tests above, since reaching
+// this deep into the delete flow needs a real (mocked) Graph call the subprocess exit-code tests
+// (2/3, argv/allowlist only) deliberately never make.
+describe('run() — exit code mapping (FINDING 4: MessageOwnershipError → 4, ChatNotAllowedError stays 3)', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  function captured() {
+    const lines: string[] = [];
+    const write = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    const exit = vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
+    return { write, exit, text: () => lines.join('') };
+  }
+
+  it('a MessageOwnershipError (the ownership gate refusing somebody else\'s message) exits 4', async () => {
+    const { exit, text } = captured();
+
+    await run(async () => {
+      throw new MessageOwnershipError(
+        'Refusing to delete message m1 in chat 19:a@thread.v2: it was written by Alice, not by this account.',
+      );
+    });
+
+    expect(text()).toMatch(/Refusing to delete message m1/);
+    expect(exit).toHaveBeenCalledWith(4);
+  });
+
+  it('a ChatNotAllowedError still exits 3, not 4 — the two refusals stay distinguishable', async () => {
+    const { exit } = captured();
+
+    await run(async () => {
+      throw new ChatNotAllowedError('19:a@thread.v2', 'post');
+    });
+
+    expect(exit).toHaveBeenCalledWith(3);
+  });
+
+  it('every other error still exits 1', async () => {
+    const { exit } = captured();
+
+    await run(async () => {
+      throw new Error('some other failure');
+    });
+
+    expect(exit).toHaveBeenCalledWith(1);
   });
 });
 
@@ -1235,6 +1293,7 @@ describe('teams-attachments — the do* routing (in-process, fake port, real tmp
       editMessage: reject,
       editHtmlMessage: reject,
       deleteMessage: reject,
+      undoDeleteMessage: reject,
       setReaction: reject,
       getAttachment: reject,
       listAttachments: reject,
@@ -1588,5 +1647,145 @@ describe('teams-post / teams-edit --html --mention — the orphaned-mention refu
 
     expect(result).toEqual({ action: 'post', id: 'sent-1', chat: 'chat A' });
     expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('teams-delete — flag parsing (0.7.1)', () => {
+  it('defaults to delete, no force', () => {
+    expect(parseDeleteFlags([])).toEqual({ undo: false, force: false });
+  });
+
+  it('--undo and --force are bare flags, any order', () => {
+    expect(parseDeleteFlags(['--undo'])).toEqual({ undo: true, force: false });
+    expect(parseDeleteFlags(['--force', '--undo'])).toEqual({ undo: true, force: true });
+  });
+});
+
+describe('teams-delete — the do* routing (in-process, fake port, no network)', () => {
+  // Same reasoning as the --html routing block above: the allowlist gate makes a subprocess
+  // blind to WHICH port method ran and whether --force reached it, so doDelete is called
+  // directly with a fake port. The own-message check itself is the port's job — proven in
+  // graph-client.test.ts — which is exactly why this layer only has to prove the forwarding.
+  function fakePort(overrides: Partial<TeamsChatsPort>): TeamsChatsPort {
+    const reject = () => Promise.reject(new Error('not part of this test'));
+    return {
+      listChats: reject,
+      readMessages: async () => ({ messages: [] }) as unknown as ReadResult,
+      resolveMentions: reject,
+      sendMessage: reject,
+      sendHtmlMessage: reject,
+      sendImage: reject,
+      sendFile: reject,
+      replyToMessage: reject,
+      editMessage: reject,
+      editHtmlMessage: reject,
+      deleteMessage: reject,
+      undoDeleteMessage: reject,
+      setReaction: reject,
+      getAttachment: reject,
+      listAttachments: reject,
+      getAttachments: reject,
+      pinMessage: reject,
+      unpinMessage: reject,
+      listPinnedMessages: reject,
+      ...overrides,
+    } as TeamsChatsPort;
+  }
+  const allowlist = new ChatAllowlist([
+    { id: '19:a@thread.v2', label: 'chat A', canPost: true },
+    { id: '19:r@thread.v2', label: 'read-only', canPost: false },
+  ]);
+  function reliable(overrides: Partial<TeamsChatsPort>): ReliableTeamsChats {
+    return new ReliableTeamsChats(fakePort(overrides), { selfDisplayName: 'Assistant', sleepFn: async () => {} });
+  }
+
+  it('default: deleteMessage with force false — never undoDeleteMessage', async () => {
+    const deleteMessage = vi.fn(async () => undefined);
+    const undoDeleteMessage = vi.fn();
+
+    const result = await doDelete({ chats: reliable({ deleteMessage, undoDeleteMessage }), allowlist }, '19:a@thread.v2', 'm1', { undo: false, force: false });
+
+    expect(deleteMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1', { force: false });
+    expect(undoDeleteMessage).not.toHaveBeenCalled();
+    expect(result).toEqual({ action: 'delete', messageId: 'm1', chat: 'chat A' });
+  });
+
+  it('--force reaches the port as force: true', async () => {
+    const deleteMessage = vi.fn(async () => undefined);
+
+    await doDelete({ chats: reliable({ deleteMessage }), allowlist }, '19:a@thread.v2', 'm1', { undo: false, force: true });
+
+    expect(deleteMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1', { force: true });
+  });
+
+  it('--undo: undoDeleteMessage — never deleteMessage — and the action says so', async () => {
+    const deleteMessage = vi.fn();
+    const undoDeleteMessage = vi.fn(async () => undefined);
+
+    const result = await doDelete({ chats: reliable({ deleteMessage, undoDeleteMessage }), allowlist }, '19:a@thread.v2', 'm1', { undo: true, force: false });
+
+    expect(undoDeleteMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1', { force: false });
+    expect(deleteMessage).not.toHaveBeenCalled();
+    expect(result).toEqual({ action: 'undo-delete', messageId: 'm1', chat: 'chat A' });
+  });
+
+  it('the port\'s ownership refusal propagates as itself — the CLI exits 1 with its text, never 0', async () => {
+    const deleteMessage = vi.fn(async () => {
+      throw new MessageOwnershipError('Refusing to delete message m1 in chat 19:a@thread.v2: it was written by Alice');
+    });
+
+    await expect(
+      doDelete({ chats: reliable({ deleteMessage }), allowlist }, '19:a@thread.v2', 'm1', { undo: false, force: false }),
+    ).rejects.toBeInstanceOf(MessageOwnershipError);
+  });
+
+  it('a read-only chat is refused before the port is touched, delete and undo alike', async () => {
+    const deleteMessage = vi.fn();
+    const undoDeleteMessage = vi.fn();
+    const chats = reliable({ deleteMessage, undoDeleteMessage });
+
+    await expect(doDelete({ chats, allowlist }, '19:r@thread.v2', 'm1', { undo: false, force: true })).rejects.toThrow(/19:r@thread.v2/);
+    await expect(doDelete({ chats, allowlist }, '19:r@thread.v2', 'm1', { undo: true, force: true })).rejects.toThrow(/19:r@thread.v2/);
+    expect(deleteMessage).not.toHaveBeenCalled();
+    expect(undoDeleteMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe('teams-delete — exit codes (subprocess: the argv contract)', () => {
+  it('missing arguments: exit 2 with usage, stdout empty', async () => {
+    const result = await runCli('delete.ts', [], {});
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/usage: teams-delete <chatId> <messageId> \[--undo\] \[--force\]/);
+  });
+
+  it('missing messageId: exit 2, stdout empty', async () => {
+    const result = await runCli('delete.ts', ['19:readonly@thread.v2'], {});
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+  });
+
+  it('an unrecognised flag: exit 2, refused loudly rather than silently ignored', async () => {
+    const result = await runCli('delete.ts', ['19:readonly@thread.v2', 'm1', '--hard'], fixtureEnv());
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/--hard/);
+  });
+
+  it('a chat outside the allowlist: exit 3 before any network call', async () => {
+    const result = await runCli('delete.ts', ['19:never-heard-of@thread.v2', 'm1'], fixtureEnv());
+
+    expect(result.code).toBe(3);
+    expect(result.stdout).toBe('');
+  });
+
+  it('an allowlisted chat without canPost: exit 3 — --force does not get past the allowlist', async () => {
+    const result = await runCli('delete.ts', ['19:readonly@thread.v2', 'm1', '--force'], fixtureEnv());
+
+    expect(result.code).toBe(3);
+    expect(result.stdout).toBe('');
   });
 });

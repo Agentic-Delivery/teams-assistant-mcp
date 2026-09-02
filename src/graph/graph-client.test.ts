@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { GraphClient, GraphError } from './graph-client.js';
+import { GraphClient, GraphError, retryAfterSuffix } from './graph-client.js';
 import type { MembersCachePort } from './teams-chats.js';
-import { GraphTeamsChats, shareIdFor } from './teams-chats.js';
+import type { SelfIdCachePort } from './self-id-cache.js';
+import { GraphTeamsChats, MessageOwnershipError, shareIdFor } from './teams-chats.js';
 import type { TokenProvider } from '../auth/token-provider.js';
 
 const stubToken: TokenProvider = { kind: 'stub', getAccessToken: async () => 'the-token' };
@@ -382,18 +383,24 @@ describe('teams chats over graph', () => {
   });
 
   it('soft-deletes a message through the /me softDelete action, with no body', async () => {
-    const fetchFn = vi.fn(async () => new Response(null, { status: 204 }));
+    // Since 0.7.1 the delete checks ownership first (/me, then the message) — the full
+    // ownership behaviour has its own describe block further down; this test keeps its
+    // original job of pinning the wire shape of the action itself.
+    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
+      if (init.method === 'POST') return new Response(null, { status: 204 });
+      if (url.endsWith('/me?$select=id')) return json({ id: 'self-aad-id' });
+      return json({ id: 'm7', createdDateTime: '2026-08-19T08:00:00Z', from: { user: { id: 'self-aad-id', displayName: 'Assistant (AI)' } }, body: { contentType: 'text', content: 'oops' } });
+    });
     const chats = new GraphTeamsChats(
       new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     await chats.deleteMessage('19:a@thread.v2', 'm7');
 
-    const [url, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
-    expect(url).toBe(
+    const post = fetchFn.mock.calls.find(([, init]) => (init as RequestInit).method === 'POST') as unknown as [string, RequestInit];
+    expect(post[0]).toBe(
       'https://graph.microsoft.com/v1.0/me/chats/19%3Aa%40thread.v2/messages/m7/softDelete',
     );
-    expect(init.method).toBe('POST');
-    expect(init.body).toBeUndefined();
+    expect(post[1].body).toBeUndefined();
   });
 
   it('surfaces Graph\'s own refusal when editing someone else\'s message', async () => {
@@ -1490,5 +1497,455 @@ describe('graph client — the live-measured 62 s window is slept, not refused (
 
     expect(await client.get('/chats/x/messages/1')).toEqual({ id: 'fine' });
     expect(waits).toEqual([62_000]);
+  });
+});
+
+describe('teams chats — delete/undo act on this account\'s own messages only (0.7.1: withdrawing a message posted in the wrong chat)', () => {
+  const SELF = 'self-aad-id';
+  const message = (id: string, authorId: string, authorName: string, extra: Record<string, unknown> = {}) => ({
+    id,
+    createdDateTime: '2026-09-02T08:00:00Z',
+    from: { user: { id: authorId, displayName: authorName } },
+    body: { contentType: 'text', content: 'text' },
+    ...extra,
+  });
+
+  /** One fetch stub for the whole block: /me answers SELF, the message endpoint answers whatever
+   *  `target` is (or a 429 when `throttled`), the list answers `recent`, and every POST answers
+   *  `actionStatus` with `actionBody`. Returns the stub so a test can inspect the calls. */
+  function graph(options: {
+    me?: Response;
+    target?: unknown;
+    throttled?: boolean;
+    recent?: unknown[];
+    actionStatus?: number;
+    actionBody?: unknown;
+  }) {
+    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
+      if (init.method === 'POST') {
+        const status = options.actionStatus ?? 204;
+        return status === 204 ? new Response(null, { status }) : json(options.actionBody, status);
+      }
+      if (url.endsWith('/me?$select=id')) return options.me ?? json({ id: SELF });
+      if (/\/messages\/[^/?]+$/.test(url)) {
+        return options.throttled
+          ? new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 't' } }), { status: 429, headers: { 'retry-after': '62', 'content-type': 'application/json' } })
+          : json(options.target);
+      }
+      return json({ value: options.recent ?? [] });
+    });
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }),
+      { membersCache: noMembersCache },
+    );
+    const posts = () => fetchFn.mock.calls.filter(([, init]) => (init as RequestInit).method === 'POST').map(([url]) => String(url));
+    return { chats, fetchFn, posts };
+  }
+
+  it('own message: /me and the message are read, then softDelete is posted', async () => {
+    const { chats, posts } = graph({ target: message('m1', SELF, 'Assistant (AI)') });
+
+    await chats.deleteMessage('19:a@thread.v2', 'm1');
+
+    expect(posts()).toEqual(['https://graph.microsoft.com/v1.0/me/chats/19%3Aa%40thread.v2/messages/m1/softDelete']);
+  });
+
+  it('somebody else\'s message: refused by name, with the author named, and NOTHING posted', async () => {
+    const { chats, posts } = graph({ target: message('m2', 'aad-maja', 'Nordqvist, Maja') });
+
+    const error = (await chats.deleteMessage('19:a@thread.v2', 'm2').catch((c: unknown) => c)) as Error;
+
+    expect(error).toBeInstanceOf(MessageOwnershipError);
+    expect(error.name).toBe('MessageOwnershipError');
+    expect(error.message).toContain('Nordqvist, Maja');
+    expect(error.message).toContain('aad-maja');
+    expect(error.message).toMatch(/Nothing was changed/);
+    // DESIGN DECISION (message-withdrawal review): the MCP tool surface no longer offers force,
+    // so a refusal text reachable from that surface must not advise "pass force" — the check is
+    // authoritative instead. force remains a CLI-only escape hatch (see --force's own tests).
+    expect(error.message).not.toMatch(/force/i);
+    expect(error.message).toMatch(/authoritative/);
+    expect(posts()).toEqual([]);
+  });
+
+  it('force: somebody else\'s message is deleted WITHOUT reading /me or the message first', async () => {
+    const { chats, fetchFn, posts } = graph({ target: message('m2', 'aad-maja', 'Nordqvist, Maja') });
+
+    await chats.deleteMessage('19:a@thread.v2', 'm2', { force: true });
+
+    expect(posts()).toEqual(['https://graph.microsoft.com/v1.0/me/chats/19%3Aa%40thread.v2/messages/m2/softDelete']);
+    // Force skips the whole gate — one request, the action itself. The single-message family
+    // may be throttled when a wrong-chat message needs withdrawing, so the gate must not be in
+    // the way once the caller has taken responsibility.
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('an unverifiable author (/me failed) is refused, not waved through', async () => {
+    const { chats, posts } = graph({
+      me: json({ error: { code: 'Forbidden', message: 'nope' } }, 403),
+      target: message('m1', SELF, 'Assistant (AI)'),
+    });
+
+    const error = (await chats.deleteMessage('19:a@thread.v2', 'm1').catch((c: unknown) => c)) as Error;
+
+    expect(error).toBeInstanceOf(MessageOwnershipError);
+    expect(error.message).toMatch(/could not be determined/);
+    expect(posts()).toEqual([]);
+  });
+
+  it('a system message (no user author at all) is not this account\'s, so it is refused too', async () => {
+    const { chats, posts } = graph({ target: { id: 'sys', createdDateTime: '2026-09-02T08:00:00Z', messageType: 'systemEventMessage', body: { content: '' } } });
+
+    await expect(chats.deleteMessage('19:a@thread.v2', 'sys')).rejects.toBeInstanceOf(MessageOwnershipError);
+    expect(posts()).toEqual([]);
+  });
+
+  it('the ownership read uses fetchMessage, so a throttled single-message family falls back to the list scan', async () => {
+    const { chats, posts } = graph({
+      throttled: true,
+      recent: [message('other', 'aad-maja', 'Nordqvist, Maja'), message('m1', SELF, 'Assistant (AI)')],
+    });
+
+    await chats.deleteMessage('19:a@thread.v2', 'm1');
+
+    expect(posts()).toEqual(['https://graph.microsoft.com/v1.0/me/chats/19%3Aa%40thread.v2/messages/m1/softDelete']);
+  });
+
+  it('a 403 on the action names Chat.ReadWrite and the custom-app-registration cause, Graph\'s words kept', async () => {
+    const { chats } = graph({
+      target: message('m1', SELF, 'Assistant (AI)'),
+      actionStatus: 403,
+      actionBody: { error: { code: 'Forbidden', message: 'Missing scope permissions on the request.' } },
+    });
+
+    const error = (await chats.deleteMessage('19:a@thread.v2', 'm1').catch((c: unknown) => c)) as GraphError;
+
+    expect(error).toBeInstanceOf(GraphError);
+    expect(error.status).toBe(403);
+    expect(error.code).toBe('Forbidden');
+    expect(error.message).toContain('Chat.ReadWrite');
+    expect(error.message).toContain('admin consent');
+    expect(error.message).toContain('TEAMS_MCP_CLIENT_ID');
+    expect(error.message).toContain('Missing scope permissions on the request.');
+  });
+
+  it('the licence 403 is left alone — it has its own name and its own fix', async () => {
+    const { chats } = graph({
+      target: message('m1', SELF, 'Assistant (AI)'),
+      actionStatus: 403,
+      actionBody: { error: { code: 'UnknownError', message: 'Failed to get license information for the user' } },
+    });
+
+    const error = (await chats.deleteMessage('19:a@thread.v2', 'm1').catch((c: unknown) => c)) as GraphError;
+
+    expect(error.isLicenceProblem).toBe(true);
+    expect(error.message).not.toContain('Chat.ReadWrite');
+  });
+
+  it('a non-403 failure on the action passes through untouched, Retry-After included', async () => {
+    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
+      if (init.method === 'POST') return new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'slow down' } }), { status: 429, headers: { 'retry-after': '62', 'content-type': 'application/json' } });
+      if (url.endsWith('/me?$select=id')) return json({ id: SELF });
+      return json(message('m1', SELF, 'Assistant (AI)'));
+    });
+    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }), { membersCache: noMembersCache });
+
+    await expect(chats.deleteMessage('19:a@thread.v2', 'm1')).rejects.toMatchObject({ status: 429, code: 'TooManyRequests', retryAfterSeconds: 62 });
+  });
+
+  it('undo: the same gate, then undoSoftDelete — a deleted message still reads back with its author', async () => {
+    const { chats, posts } = graph({ target: message('m1', SELF, 'Assistant (AI)', { deletedDateTime: '2026-09-02T09:00:00Z', body: { content: '' } }) });
+
+    await chats.undoDeleteMessage('19:a@thread.v2', 'm1');
+
+    expect(posts()).toEqual(['https://graph.microsoft.com/v1.0/me/chats/19%3Aa%40thread.v2/messages/m1/undoSoftDelete']);
+  });
+
+  it('undo: somebody else\'s deleted message is refused the same way, the verb says "restore"', async () => {
+    const { chats, posts } = graph({ target: message('m2', 'aad-maja', 'Nordqvist, Maja', { deletedDateTime: '2026-09-02T09:00:00Z' }) });
+
+    const error = (await chats.undoDeleteMessage('19:a@thread.v2', 'm2').catch((c: unknown) => c)) as Error;
+
+    expect(error).toBeInstanceOf(MessageOwnershipError);
+    expect(error.message).toMatch(/Refusing to restore message m2/);
+    expect(posts()).toEqual([]);
+  });
+
+  it('undo with force posts undoSoftDelete straight away', async () => {
+    const { chats, fetchFn, posts } = graph({});
+
+    await chats.undoDeleteMessage('19:a@thread.v2', 'm2', { force: true });
+
+    expect(posts()).toEqual(['https://graph.microsoft.com/v1.0/me/chats/19%3Aa%40thread.v2/messages/m2/undoSoftDelete']);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('undo: a 403 gets the same Chat.ReadWrite diagnosis, naming undoSoftDelete', async () => {
+    const { chats } = graph({
+      target: message('m1', SELF, 'Assistant (AI)'),
+      actionStatus: 403,
+      actionBody: { error: { code: 'Forbidden', message: 'Missing scope permissions on the request.' } },
+    });
+
+    const error = (await chats.undoDeleteMessage('19:a@thread.v2', 'm1').catch((c: unknown) => c)) as GraphError;
+
+    expect(error.message).toMatch(/refused undoSoftDelete/);
+    expect(error.message).toContain('Chat.ReadWrite');
+  });
+});
+
+// BLOCKING 1/2 (message-withdrawal adversarial review, 0.7.1 fix round): the gate's cheap self-id
+// resolution (override, in-memory memo, persisted cache, live /me — GraphTeamsChats.
+// resolveSelfIdStatus) is not equally trustworthy at every rung. override/cache are unverified
+// operator/disk input; a wrong-but-real value there can invert the gate. These tests build
+// GraphTeamsChats directly (rather than through the shared `graph()` helper above, which always
+// answers /me the same way on every call) so each one controls exactly how many /me calls happen
+// and what they answer.
+describe('teams chats — delete/undo: self-id source discrimination (BLOCKING 1/2)', () => {
+  const SELF = 'self-aad-id';
+  const message = (id: string, authorId: string, authorName: string) => ({
+    id,
+    createdDateTime: '2026-09-02T08:00:00Z',
+    from: { user: { id: authorId, displayName: authorName } },
+    body: { contentType: 'text', content: 'text' },
+  });
+
+  it('a live-confirmed self id already memoized this process (source "memo") acts with ZERO extra /me calls', async () => {
+    let meCalls = 0;
+    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
+      if (init.method === 'POST') return new Response(null, { status: 204 });
+      if (url.endsWith('/me?$select=id')) {
+        meCalls += 1;
+        return json({ id: SELF });
+      }
+      if (/\/messages\/[^/?]+$/.test(url)) return json(message('m1', SELF, 'Assistant (AI)'));
+      return json({ value: [] });
+    });
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }),
+      { membersCache: noMembersCache },
+    );
+
+    await chats.resolveSelfId(); // warms the in-memory memo via one live /me call
+    expect(meCalls).toBe(1);
+
+    await chats.deleteMessage('19:a@thread.v2', 'm1'); // the gate must reuse the memo, not call /me again
+
+    expect(meCalls).toBe(1);
+  });
+
+  it('an override self id is NOT trusted outright — the gate confirms it live before acting, even when the override agrees', async () => {
+    let meCalls = 0;
+    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
+      if (init.method === 'POST') return new Response(null, { status: 204 });
+      if (url.endsWith('/me?$select=id')) {
+        meCalls += 1;
+        return json({ id: SELF });
+      }
+      if (/\/messages\/[^/?]+$/.test(url)) return json(message('m1', SELF, 'Assistant (AI)'));
+      return json({ value: [] });
+    });
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }),
+      { membersCache: noMembersCache, selfIdOverride: SELF },
+    );
+
+    await chats.deleteMessage('19:a@thread.v2', 'm1');
+
+    expect(meCalls).toBe(1); // escalated to a live check despite the override already "agreeing"
+  });
+
+  it('TRIGGERING: a wrong-but-real override equal to the ACTUAL author\'s id does not delete their message — the live self id governs, not the override', async () => {
+    // The exact incident BLOCKING 1 closes: an operator TEAMS_MCP_SELF_ID typo (or a stale cache
+    // entry) that happens to equal somebody ELSE's real AAD id. The naive comparison this gate
+    // used to do (target.fromId === whatever resolveSelfId returned, with no re-check) would read
+    // Maja's own message as "own" and delete it. The live /me — the real signed-in account, SELF,
+    // still different from Maja — is what must govern instead.
+    let meCalls = 0;
+    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
+      if (init.method === 'POST') throw new Error('must never POST — the live re-check must catch this first');
+      if (url.endsWith('/me?$select=id')) {
+        meCalls += 1;
+        return json({ id: SELF });
+      }
+      if (/\/messages\/[^/?]+$/.test(url)) return json(message('m2', 'aad-maja', 'Nordqvist, Maja'));
+      return json({ value: [] });
+    });
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }),
+      { membersCache: noMembersCache, selfIdOverride: 'aad-maja' }, // wrong: Maja's id, not SELF's
+    );
+
+    const error = (await chats.deleteMessage('19:a@thread.v2', 'm2').catch((c: unknown) => c)) as Error;
+
+    expect(error).toBeInstanceOf(MessageOwnershipError);
+    expect(error.message).toContain('Nordqvist, Maja');
+    expect(meCalls).toBe(1); // the live re-check is what caught it, not the override
+  });
+
+  it('a persisted-cache self id is likewise re-verified live before acting (source "cache")', async () => {
+    let meCalls = 0;
+    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
+      if (init.method === 'POST') return new Response(null, { status: 204 });
+      if (url.endsWith('/me?$select=id')) {
+        meCalls += 1;
+        return json({ id: SELF });
+      }
+      if (/\/messages\/[^/?]+$/.test(url)) return json(message('m1', SELF, 'Assistant (AI)'));
+      return json({ value: [] });
+    });
+    const cache: SelfIdCachePort = { read: () => ({ id: SELF, resolvedAt: 0 }), write: () => {} };
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }),
+      { membersCache: noMembersCache, selfIdCache: cache },
+    );
+
+    await chats.deleteMessage('19:a@thread.v2', 'm1');
+
+    expect(meCalls).toBe(1); // escalated to live rather than trusting the cache outright
+  });
+
+  // LAUNDERING FIX (post-review, message-withdrawal adversarial re-review): the reviewer
+  // reproduced this against dist/. Root cause was that `selfId` (the in-memory memo) was written
+  // by BOTH the cache rung and the live rung, and the memo short-circuit in resolveSelfIdStatus
+  // reported every warm `selfId` as `source: 'memo'` regardless of which rung actually set it — so
+  // a cache-origin value, once memoized, was indistinguishable from a live-confirmed one and the
+  // gate's escalation (which only fires on 'override'/'cache') never ran again for it. These two
+  // tests pin the write-site fix (GraphTeamsChats.selfIdSource, teams-chats.ts): the memo branch
+  // now reports 'cache' — not 'memo' — for as long as the value's origin is the persisted cache,
+  // not a live call.
+  it('LAUNDERING FIX 1: a poller-style resolveSelfId() call that warms the memo from the persisted cache does not let a LATER delete skip the live re-check', async () => {
+    // Mirrors build-inbox-poller.ts:75 calling chats.resolveSelfId() every poll cycle — in the
+    // same process, ahead of any delete/undo call.
+    let meCalls = 0;
+    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
+      if (init.method === 'POST') return new Response(null, { status: 204 });
+      if (url.endsWith('/me?$select=id')) {
+        meCalls += 1;
+        return json({ id: SELF });
+      }
+      if (/\/messages\/[^/?]+$/.test(url)) return json(message('m1', SELF, 'Assistant (AI)'));
+      return json({ value: [] });
+    });
+    const cache: SelfIdCachePort = { read: () => ({ id: SELF, resolvedAt: 0 }), write: () => {} };
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }),
+      { membersCache: noMembersCache, selfIdCache: cache },
+    );
+
+    const pollerId = await chats.resolveSelfId(); // poller-style: warms the memo from the cache
+    expect(pollerId).toBe(SELF);
+    expect(meCalls).toBe(0); // the cache rung never touches /me
+
+    await chats.deleteMessage('19:a@thread.v2', 'm1'); // must NOT trust the now-warm memo outright
+
+    expect(meCalls).toBe(1); // escalated to a live check despite the memo already being warm
+  });
+
+  it('LAUNDERING FIX 2: after a non-throttled live failure during escalation, the NEXT delete in the same process still escalates rather than trusting the laundered memo', async () => {
+    let meCalls = 0;
+    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
+      if (init.method === 'POST') return new Response(null, { status: 204 });
+      if (url.endsWith('/me?$select=id')) {
+        meCalls += 1;
+        // First live check (escalating the first delete): a non-throttled failure — an outage or
+        // a 403, deliberately NOT memoized per resolveSelfIdLiveStatus's own doc comment. Second
+        // live check (escalating the second delete): succeeds.
+        return meCalls === 1
+          ? json({ error: { code: 'Forbidden', message: 'nope' } }, 403)
+          : json({ id: SELF });
+      }
+      if (/\/messages\/[^/?]+$/.test(url)) return json(message('m1', SELF, 'Assistant (AI)'));
+      return json({ value: [] });
+    });
+    const cache: SelfIdCachePort = { read: () => ({ id: SELF, resolvedAt: 0 }), write: () => {} };
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }),
+      { membersCache: noMembersCache, selfIdCache: cache },
+    );
+
+    const firstError = (await chats.deleteMessage('19:a@thread.v2', 'm1').catch((c: unknown) => c)) as Error;
+    expect(firstError).toBeInstanceOf(MessageOwnershipError);
+    expect(meCalls).toBe(1); // the cache-warmed value was escalated and the live check failed
+
+    const posts = () =>
+      fetchFn.mock.calls.filter(([, init]) => (init as RequestInit).method === 'POST').map(([url]) => String(url));
+    expect(posts()).toEqual([]); // nothing deleted on the first (refused) attempt
+
+    await chats.deleteMessage('19:a@thread.v2', 'm1'); // the laundering bug would trust the memo here
+
+    expect(meCalls).toBe(2); // escalated AGAIN — the failed live check must not have been memoized as trusted
+    expect(posts()).toEqual(['https://graph.microsoft.com/v1.0/me/chats/19%3Aa%40thread.v2/messages/m1/softDelete']);
+  });
+
+  it('BLOCKING 2 TRIGGERING: a throttled /me during the gate raises the package\'s 429-shaped GraphError, never a MessageOwnershipError, and never mentions force', async () => {
+    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
+      if (init.method === 'POST') throw new Error('must never POST — the gate must refuse before acting');
+      if (url.endsWith('/me?$select=id')) {
+        return new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'slow down' } }), {
+          status: 429,
+          headers: { 'retry-after': '45', 'content-type': 'application/json' },
+        });
+      }
+      throw new Error(`unexpected call: ${url}`);
+    });
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }),
+      { membersCache: noMembersCache },
+    );
+
+    const error = (await chats.deleteMessage('19:a@thread.v2', 'm1').catch((c: unknown) => c)) as GraphError;
+
+    expect(error).toBeInstanceOf(GraphError);
+    expect(error).not.toBeInstanceOf(MessageOwnershipError);
+    expect(error.status).toBe(429);
+    expect(error.retryAfterSeconds).toBe(45);
+    // retryAfterSuffix (graph-client.ts) is the ONE place the wait gets stated — pin that this
+    // error is shaped so it renders through it, same as every other throttle in the package.
+    expect(retryAfterSuffix(error)).toBe(' (throttled, retry after 45s)');
+    expect(error.message.toLowerCase()).not.toContain('force');
+  });
+
+  it('BLOCKING 2, the escalation path: an override that throttles on ITS live re-check also raises the 429-shaped error, not an ownership refusal', async () => {
+    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
+      if (init.method === 'POST') throw new Error('must never POST — the gate must refuse before acting');
+      if (url.endsWith('/me?$select=id')) {
+        return new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'slow down' } }), {
+          status: 429,
+          headers: { 'retry-after': '12', 'content-type': 'application/json' },
+        });
+      }
+      throw new Error(`unexpected call: ${url}`);
+    });
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }),
+      { membersCache: noMembersCache, selfIdOverride: SELF },
+    );
+
+    const error = (await chats.deleteMessage('19:a@thread.v2', 'm1').catch((c: unknown) => c)) as GraphError;
+
+    expect(error).toBeInstanceOf(GraphError);
+    expect(error).not.toBeInstanceOf(MessageOwnershipError);
+    expect(error.status).toBe(429);
+    expect(error.retryAfterSeconds).toBe(12);
+    expect(error.message.toLowerCase()).not.toContain('force');
+  });
+
+  it('FINDING 6: the author-id comparison is case-insensitive — a same-account id differing only in case is still "own"', async () => {
+    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
+      if (init.method === 'POST') return new Response(null, { status: 204 });
+      if (url.endsWith('/me?$select=id')) return json({ id: SELF.toUpperCase() });
+      if (/\/messages\/[^/?]+$/.test(url)) return json(message('m1', SELF.toLowerCase(), 'Assistant (AI)'));
+      return json({ value: [] });
+    });
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }),
+      { membersCache: noMembersCache },
+    );
+
+    await chats.deleteMessage('19:a@thread.v2', 'm1');
+
+    const posts = fetchFn.mock.calls.filter(([, init]) => (init as RequestInit).method === 'POST');
+    expect(posts).toHaveLength(1);
   });
 });

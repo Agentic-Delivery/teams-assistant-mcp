@@ -13,6 +13,7 @@ import type {
   ChatAttachmentRef,
   ChatSummary,
   MentionTarget,
+  MessageActionOptions,
   OutboundFile,
   OutboundImage,
   PinnedMessage,
@@ -20,6 +21,7 @@ import type {
   TeamsChatsPort,
 } from './graph/teams-chats.js';
 import { renderHtmlWithMentions, resolveMentionTargets } from './graph/mentions.js';
+import { MessageOwnershipError } from './graph/teams-chats.js';
 
 const PILOT = '19:pilot@thread.v2';
 const WATCHED = '19:watched@thread.v2';
@@ -122,7 +124,8 @@ class FakeTeamsChats implements TeamsChatsPort {
   readonly htmlReplies: Array<{ chatId: string; replyToMessageId: string; html: string }> = [];
   readonly edits: Array<{ chatId: string; messageId: string; newText: string }> = [];
   readonly htmlEdits: Array<{ chatId: string; messageId: string; html: string }> = [];
-  readonly deletes: Array<{ chatId: string; messageId: string }> = [];
+  readonly deletes: Array<{ chatId: string; messageId: string; force: boolean }> = [];
+  readonly undeletes: Array<{ chatId: string; messageId: string; force: boolean }> = [];
 
   async replyToMessage(
     chatId: string,
@@ -175,8 +178,12 @@ class FakeTeamsChats implements TeamsChatsPort {
     this.sentMentions.push(mentions);
   }
 
-  async deleteMessage(chatId: string, messageId: string) {
-    this.deletes.push({ chatId, messageId });
+  async deleteMessage(chatId: string, messageId: string, options: MessageActionOptions = {}) {
+    this.deletes.push({ chatId, messageId, force: options.force === true });
+  }
+
+  async undoDeleteMessage(chatId: string, messageId: string, options: MessageActionOptions = {}) {
+    this.undeletes.push({ chatId, messageId, force: options.force === true });
   }
 
   readonly sentImages: Array<{ chatId: string; image: OutboundImage; text?: string }> = [];
@@ -347,8 +354,21 @@ describe('tool surface', () => {
       'send_chat_file',
       'send_chat_image',
       'send_chat_message',
+      'undo_delete_chat_message',
       'unpin_chat_message',
     ]);
+  });
+
+  // DESIGN DECISION (message-withdrawal review, delegated by the repo owner): force is a CLI-only
+  // escape hatch (teams-delete --force) now — the MCP schema itself must not name it, so a caller
+  // reading the tool's advertised inputSchema sees no way to ask for it, not just a handler that
+  // happens to ignore it.
+  it('delete_chat_message and undo_delete_chat_message no longer declare a force parameter', async () => {
+    const { tools } = await client.listTools();
+    const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool]));
+
+    expect(Object.keys(byName.delete_chat_message.inputSchema.properties ?? {})).not.toContain('force');
+    expect(Object.keys(byName.undo_delete_chat_message.inputSchema.properties ?? {})).not.toContain('force');
   });
 });
 
@@ -551,11 +571,36 @@ describe('edit_chat_message', () => {
 });
 
 describe('delete_chat_message', () => {
-  it('soft-deletes a message in an allowlisted chat that permits posting', async () => {
+  it('soft-deletes a message in an allowlisted chat that permits posting — own-message check ON, unconditionally', async () => {
     const result = await call(client, 'delete_chat_message', { chatId: PILOT, messageId: 'm1' });
 
     expect(result.isError).toBe(false);
-    expect(chats.deletes).toEqual([{ chatId: PILOT, messageId: 'm1' }]);
+    expect(result.json()).toEqual({ deleted: true, chatId: PILOT, messageId: 'm1' });
+    expect(chats.deletes).toEqual([{ chatId: PILOT, messageId: 'm1', force: false }]);
+  });
+
+  // DESIGN DECISION (message-withdrawal review): the MCP tool surface removed `force` entirely —
+  // an agent can no longer skip the own-message check on its own say-so. The schema itself no
+  // longer names `force` (see the 'tool surface' describe block below); this pins the behavioural
+  // half — even a client that sends the key anyway (an old caller, a hand-built request) gets it
+  // silently dropped by the schema, and the gate still runs exactly as if it had never been sent.
+  it('force is no longer a tool parameter — sending it anyway is ignored and the ownership gate still runs (0.7.1 design decision)', async () => {
+    const result = await call(client, 'delete_chat_message', { chatId: PILOT, messageId: 'm1', force: true });
+
+    expect(result.isError).toBe(false);
+    expect(chats.deletes).toEqual([{ chatId: PILOT, messageId: 'm1', force: false }]);
+  });
+
+  it('the port\'s ownership refusal reaches the caller as a readable error, not a transport failure', async () => {
+    chats.deleteMessage = async (chatId: string, messageId: string) => {
+      throw new MessageOwnershipError(`Refusing to delete message ${messageId} in chat ${chatId}: it was written by Alice`);
+    };
+
+    const result = await call(client, 'delete_chat_message', { chatId: PILOT, messageId: 'm1' });
+
+    expect(result.isError).toBe(true);
+    expect(result.text).toMatch(/MessageOwnershipError: Refusing to delete message m1/);
+    expect(result.text).toMatch(/written by Alice/);
   });
 
   it('refuses a read-only chat', async () => {
@@ -570,6 +615,37 @@ describe('delete_chat_message', () => {
 
     expect(result.isError).toBe(true);
     expect(chats.deletes).toEqual([]);
+  });
+});
+
+describe('undo_delete_chat_message (0.7.1)', () => {
+  it('restores a soft-deleted message in an allowlisted chat that permits posting', async () => {
+    const result = await call(client, 'undo_delete_chat_message', { chatId: PILOT, messageId: 'm1' });
+
+    expect(result.isError).toBe(false);
+    expect(result.json()).toEqual({ restored: true, chatId: PILOT, messageId: 'm1' });
+    expect(chats.undeletes).toEqual([{ chatId: PILOT, messageId: 'm1', force: false }]);
+    expect(chats.deletes).toEqual([]);
+  });
+
+  it('force is no longer a tool parameter — sending it anyway is ignored, same as delete (0.7.1 design decision)', async () => {
+    await call(client, 'undo_delete_chat_message', { chatId: PILOT, messageId: 'm1', force: true });
+
+    expect(chats.undeletes).toEqual([{ chatId: PILOT, messageId: 'm1', force: false }]);
+  });
+
+  it('refuses a read-only chat', async () => {
+    const result = await call(client, 'undo_delete_chat_message', { chatId: WATCHED, messageId: 'w1' });
+
+    expect(result.isError).toBe(true);
+    expect(chats.undeletes).toEqual([]);
+  });
+
+  it('refuses a chat outside the allowlist', async () => {
+    const result = await call(client, 'undo_delete_chat_message', { chatId: OUTSIDE, messageId: 'm1' });
+
+    expect(result.isError).toBe(true);
+    expect(chats.undeletes).toEqual([]);
   });
 });
 
