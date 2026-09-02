@@ -236,9 +236,9 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
     return new GraphTeamsChats(graph, { membersCache: cache });
   }
 
-  const uploadResponse = () =>
+  const uploadResponse = (itemId = 'drive-item-1') =>
     json({
-      id: 'drive-item-1',
+      id: itemId,
       eTag: '"{ABCDEF12-3456-7890-ABCD-EF1234567890},1"',
       webUrl: 'https://contoso.sharepoint.com/personal/assistant/report.pdf',
       name: 'report.pdf',
@@ -248,7 +248,15 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
     return json({ id: 'aad-self' });
   }
 
-  it('SCENARIO a: issues the /invite with the exact body contract, and does it BEFORE the chat message post', async () => {
+  /** A realistic /invite success body: one permission entry per invited AAD user, each carrying
+   *  its grant under grantedToV2.user.id — the exact field the 2026-09-02 live verification
+   *  showed real grants land under (see KNOWN-ISSUES.md's wire-shape snapshot). Real Graph invite
+   *  responses are read for their actual grants, not trusted by HTTP status alone (MAJOR fix). */
+  function grantsFor(objectIds: readonly string[]) {
+    return json({ value: objectIds.map((id) => ({ grantedToV2: { user: { id } } })) });
+  }
+
+  it('issues the /invite with the exact body contract, BEFORE the chat message post, and reads real grants back before trusting it', async () => {
     const cache = new MembersCache({ path });
     cache.set(CHAT, [
       { id: 'aad-self', displayName: 'Assistant (AI)' },
@@ -270,7 +278,7 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
       if (u.includes('/drive/items/drive-item-1/invite')) {
         callOrder.push('invite');
         inviteBody = JSON.parse(String(init?.body));
-        return json({ value: [] });
+        return grantsFor(['aad-shiv', 'aad-johan']);
       }
       if (u.includes('/messages') && method === 'POST') {
         callOrder.push('message');
@@ -298,7 +306,7 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
     expect(sent.id).toBe('msg-1');
   });
 
-  it('SCENARIO b: an /invite failure fails the send loudly — no chat message is ever posted (no dead card)', async () => {
+  it('an /invite failure fails the send loudly — no chat message is ever posted (no dead card)', async () => {
     const cache = new MembersCache({ path });
     cache.set(CHAT, [
       { id: 'aad-self', displayName: 'Assistant (AI)' },
@@ -327,7 +335,67 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
     ).rejects.toThrow(/grant|permission|invite/i);
   });
 
-  it('SCENARIO c: an empty/unresolvable member roster fails BEFORE the upload — no orphaned OneDrive item', async () => {
+  // MAJOR fix (2026-09-02 review): a 200 from /invite is not proof of a grant. Graph's own
+  // invite action can answer HTTP success with an empty (or partial) value array when nothing
+  // was actually granted — the previous fixtures ABOVE encoded exactly this zero-grant body as
+  // the success case, which would have hidden this exact failure mode.
+  it('a 200 /invite response with NO actual grants for the recipients fails loudly — no dead card despite HTTP success', async () => {
+    const cache = new MembersCache({ path });
+    cache.set(CHAT, [
+      { id: 'aad-self', displayName: 'Assistant (AI)' },
+      { id: 'aad-bob', displayName: 'Bob Brown' },
+    ]);
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) return selfIdResponse();
+      if (u.includes('/root:') && method === 'PUT') return uploadResponse();
+      if (u.includes('/invite')) {
+        return json({ value: [] }); // HTTP 200, but nothing was actually granted
+      }
+      if (u.includes('/messages') && method === 'POST') {
+        throw new Error('TEST-ONLY GUARD: sendFile must not reach the chat message post on this path');
+      }
+      throw new Error(`unexpected call in this test: ${method} ${u}`);
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    await expect(
+      chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' }),
+    ).rejects.toThrow(/grant|invite/i);
+  });
+
+  // MAJOR fix (2026-09-02 review): the SAME as the test above, but with a PARTIAL grant — one
+  // of two recipients actually got one, the other did not. Both must be checked; the whole send
+  // must still fail loudly (nobody gets a dead card left unaddressed).
+  it('a 200 /invite response with a PARTIAL grant (one of two recipients missing) fails loudly too', async () => {
+    const cache = new MembersCache({ path });
+    cache.set(CHAT, [
+      { id: 'aad-self', displayName: 'Assistant (AI)' },
+      { id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+      { id: 'aad-johan', displayName: 'Spännare, Johan' },
+    ]);
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) return selfIdResponse();
+      if (u.includes('/root:') && method === 'PUT') return uploadResponse();
+      if (u.includes('/invite')) {
+        return grantsFor(['aad-shiv']); // aad-johan never got a grant
+      }
+      if (u.includes('/messages') && method === 'POST') {
+        throw new Error('TEST-ONLY GUARD: sendFile must not reach the chat message post on this path');
+      }
+      throw new Error(`unexpected call in this test: ${method} ${u}`);
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    await expect(
+      chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' }),
+    ).rejects.toThrow(/grant|invite/i);
+  });
+
+  it('an empty/unresolvable member roster fails BEFORE the upload — no orphaned OneDrive item, and nothing useless is cached', async () => {
     const cache = new MembersCache({ path }); // never warmed -> triggers a refresh
     const fetchFn = vi.fn(async (url: string) => {
       const u = String(url);
@@ -341,6 +409,9 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
     await expect(
       chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' }),
     ).rejects.toThrow(/member|roster|resolve/i);
+    // NIT fix: an empty roster is never worth persisting — the NEXT call should refresh again,
+    // not trust a stale "confirmed empty" that was really "we could not tell".
+    expect(cache.get(CHAT)).toBeUndefined();
   });
 
   it('a throttled member-list refresh fails the send loudly, naming the throttle — no upload attempted', async () => {
@@ -371,7 +442,7 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
   // Violating-double: Graph (an external system) reports a real chat member with NO AAD id —
   // the exact shape resolveMentions already treats as "cannot mention them"; sendFile must treat
   // it as "cannot grant them access", not silently post a card only the assistant itself can open.
-  it('other real members present but NONE has an AAD id on record — fails loudly BEFORE upload rather than post a card they cannot open', async () => {
+  it('the only OTHER member present has no AAD id on record — fails loudly BEFORE upload rather than post a card they cannot open', async () => {
     const cache = new MembersCache({ path });
     cache.set(CHAT, [
       { id: 'aad-self', displayName: 'Assistant (AI)' },
@@ -388,6 +459,112 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
     await expect(
       chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' }),
     ).rejects.toThrow(/AAD id|grant/i);
+  });
+
+  // MAJOR fix (2026-09-02 review): a MIXED roster — one other member IS resolvable, one is NOT —
+  // used to silently grant only the resolvable one and post anyway, leaving the unresolvable
+  // member with a dead card. Now the whole send fails loudly instead, consistent with the
+  // no-dead-cards contract (there is no partial grant this method will quietly accept).
+  it('a MIXED roster (one other member resolvable, one not) fails loudly rather than silently granting only the resolvable one', async () => {
+    const cache = new MembersCache({ path });
+    cache.set(CHAT, [
+      { id: 'aad-self', displayName: 'Assistant (AI)' },
+      { id: 'aad-bob', displayName: 'Bob Brown' }, // resolvable
+      { displayName: 'No Id Person' }, // NOT resolvable
+    ]);
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) return selfIdResponse();
+      throw new Error(`unexpected call — upload/invite must never be reached: ${method} ${u}`);
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    await expect(
+      chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' }),
+    ).rejects.toThrow(/AAD id|grant/i);
+  });
+
+  // BLOCKER fix (2026-09-02 review, live-probed): resolveSelfId() previously memoized a FAILURE
+  // (undefined) just like a real id, and `member.id !== selfId` with selfId === undefined is
+  // TRUE for every member who has an id and FALSE for every member who does NOT — i.e. it kept
+  // the real assistant "as an other" and silently treated the id-less member as if THEY were
+  // self, dropping them out of the exclusion set and out of the "who is unresolvable" check
+  // entirely. Reproduced verbatim: roster [{id:'aad-self'}, {displayName:'No Id Person'}] with
+  // /me answering 403 used to invite the assistant, post the message, and leave the id-less real
+  // member with a dead card. It must now fail loudly instead, before ever reaching the upload.
+  it('BLOCKER regression: a failed self-id lookup must not disguise an id-less real member as "self"', async () => {
+    const cache = new MembersCache({ path });
+    cache.set(CHAT, [
+      { id: 'aad-self', displayName: 'Assistant (AI)' },
+      { displayName: 'No Id Person' }, // Graph reported no id for this REAL member
+    ]);
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) {
+        return json({ error: { code: 'Forbidden', message: 'insufficient privileges' } }, 403);
+      }
+      throw new Error(`unexpected call — upload/invite/message must never be reached: ${method} ${u}`);
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    await expect(
+      chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' }),
+    ).rejects.toThrow(/AAD id|grant/i);
+  });
+
+  // BLOCKER fix, second half: a failed self-id lookup is NOT memoized for the process/instance
+  // lifetime — the next sendFile call on the SAME GraphTeamsChats retries it. First call: /me
+  // fails, self is undetermined, so BOTH the real self and the other member get invited (the
+  // documented "harmless but noisy" outcome). Second call: /me now succeeds, and self is
+  // properly excluded from the grant this time.
+  it('a failed self-id lookup is retried on the NEXT sendFile call, not stuck forever', async () => {
+    const cache = new MembersCache({ path });
+    cache.set(CHAT, [
+      { id: 'aad-self', displayName: 'Assistant (AI)' },
+      { id: 'aad-bob', displayName: 'Bob Brown' },
+    ]);
+    let meCalls = 0;
+    const invitedObjectIds: string[][] = [];
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) {
+        meCalls += 1;
+        return meCalls === 1
+          ? json({ error: { code: 'Forbidden', message: 'insufficient privileges' } }, 403)
+          : selfIdResponse();
+      }
+      if (u.includes('/root:') && method === 'PUT') {
+        return uploadResponse(`drive-item-${meCalls}`);
+      }
+      if (u.includes('/invite')) {
+        const body = JSON.parse(String(init?.body)) as { recipients: Array<{ objectId: string }> };
+        const objectIds = body.recipients.map((recipient) => recipient.objectId);
+        invitedObjectIds.push(objectIds);
+        return grantsFor(objectIds);
+      }
+      if (u.includes('/messages') && method === 'POST') {
+        return json({
+          id: `msg-${meCalls}`,
+          chatId: CHAT,
+          createdDateTime: '2026-09-02T10:00:00Z',
+          body: { contentType: 'html', content: '' },
+        });
+      }
+      throw new Error(`unexpected call in this test: ${method} ${u}`);
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
+    await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
+
+    // First call: self undetermined -> both the real self and the other member are invited.
+    expect(invitedObjectIds[0]).toEqual(expect.arrayContaining(['aad-self', 'aad-bob']));
+    expect(invitedObjectIds[0]).toHaveLength(2);
+    // Second call: self resolved -> only the other member is invited.
+    expect(invitedObjectIds[1]).toEqual(['aad-bob']);
   });
 
   it('a chat with no OTHER members (assistant-only roster) skips the invite entirely and still sends', async () => {
@@ -417,7 +594,7 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
   });
 });
 
-describe('GraphTeamsChats.sendImage — SCENARIO d: hosted content, no OneDrive item, no grant applies here', () => {
+describe('GraphTeamsChats.sendImage — hosted content, no OneDrive item, no grant applies here', () => {
   it('never touches OneDrive or /invite — only the plain message-with-hostedContents POST', async () => {
     const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
       const u = String(url);
