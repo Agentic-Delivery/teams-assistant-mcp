@@ -66,15 +66,16 @@ export function parseSendFlags(args: readonly string[]): { html: boolean; mentio
 /**
  * Parses teams-send-file's trailing argv: an optional `--caption <text>` (anywhere among the
  * positionals, same flag-anywhere convention as --mention above) and one or more positional file
- * paths, in order. Unlike parseSendFlags there is no `rest` — every non-flag argument here IS a
- * path, so a stray typo'd flag would otherwise be silently uploaded as a literal filename; letting
- * every non-`--caption` argument through as a path is deliberate, not an oversight.
+ * paths, in order. Any OTHER argument starting with `--` is refused (2026-09-02 review MINOR:
+ * aligned with teams-reply's doctrine of refusing a stray `--html`/unrecognised leftover instead
+ * of silently accepting it) — a typo'd flag must fail loudly, not get quietly uploaded as a
+ * literal filename.
  */
 export function parseSendFileFlags(args: readonly string[]): { caption?: string; paths: string[] } {
   let caption: string | undefined;
   const paths: string[] = [];
   for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i];
+    const arg = args[i] as string;
     if (arg === '--caption') {
       const value = args[i + 1];
       // Same reasoning as --mention's identical guard above: a missing or flag-like value fails
@@ -88,8 +89,10 @@ export function parseSendFileFlags(args: readonly string[]): { caption?: string;
       }
       caption = value;
       i += 1;
+    } else if (arg.startsWith('--')) {
+      usage(`teams-send-file: unrecognised flag ${arg}`);
     } else {
-      paths.push(arg as string);
+      paths.push(arg);
     }
   }
   return { ...(caption !== undefined ? { caption } : {}), paths };
@@ -162,6 +165,16 @@ export async function doReply(
   return { action: 'reply', id: sent.id, inReplyTo: replyToMessageId, chat: entry.label };
 }
 
+/** One send-file success payload — the shape `onSent` (doSendFile below) delivers, and
+ *  `writeLine` (below) turns into one JSON stdout line. */
+export interface SendFileResult {
+  action: 'send-file';
+  id: string;
+  chat: string;
+  name: string;
+  bytes: number;
+}
+
 /**
  * teams-send-file's per-path plumbing. One `chats.sendFile` call per path, in order; `caption`
  * (from --caption) is applied to the FIRST file only — a caption on every card in a multi-file
@@ -169,15 +182,23 @@ export async function doReply(
  * pass several paths in one invocation. The allowlist gate runs BEFORE any file is read from
  * disk, same ordering as doPost/doReply/doEdit above: a chat without canPost is refused without
  * even touching the filesystem.
+ *
+ * STREAMS via `onSent` rather than collecting a return array (2026-09-02 review MAJOR): a
+ * multi-file send that fails partway through used to discard the JSON lines for files already
+ * posted — exit 1, empty stdout, file 1 irreversibly in the chat, and a caller with no way to
+ * tell it had already landed re-runs the whole batch and duplicates it (the exact 2026-08-24
+ * incident class the CLI output contract exists to prevent). `onSent` is awaited for EACH file
+ * before moving to the next, so — wired to `writeLine` by the real CLI — every earlier success is
+ * already flushed to stdout by the time a later file's failure propagates out of this function.
  */
 export async function doSendFile(
   { chats, allowlist }: CliContext,
   chatId: string,
   paths: readonly string[],
-  caption?: string,
-): Promise<Array<{ action: 'send-file'; id: string; chat: string; name: string; bytes: number }>> {
+  caption: string | undefined,
+  onSent: (payload: SendFileResult) => void | Promise<void>,
+): Promise<void> {
   const entry = allowlist.assertPostable(chatId);
-  const results: Array<{ action: 'send-file'; id: string; chat: string; name: string; bytes: number }> = [];
   for (const [index, filePath] of paths.entries()) {
     const buffer = await readFile(filePath);
     const name = basename(filePath);
@@ -186,9 +207,8 @@ export async function doSendFile(
       { bytes: new Uint8Array(buffer), name },
       index === 0 ? caption : undefined,
     );
-    results.push({ action: 'send-file', id: sent.id, chat: entry.label, name, bytes: buffer.byteLength });
+    await onSent({ action: 'send-file', id: sent.id, chat: entry.label, name, bytes: buffer.byteLength });
   }
-  return results;
 }
 
 /**
@@ -232,16 +252,17 @@ export function succeed(payload: Record<string, unknown>): void {
 }
 
 /**
- * teams-send-file's multi-file variant of succeed(): one JSON line per sent file, same {ok, ...}
- * shape and same drain-before-exit discipline as succeed() above — a single write of every line
- * joined by newlines, exit(0) only once that write's callback fires (see succeed()'s own comment
- * for the 64 KiB pipe-truncation hazard this avoids). An empty `payloads` still writes nothing and
- * exits 0 rather than writing a blank line — callers of this function already guarantee at least
- * one file was sent by the time it is called.
+ * teams-send-file's per-file streaming primitive: writes ONE JSON success line and resolves only
+ * once it is fully drained — same 64 KiB pipe-truncation guard as succeed() above, but awaitable
+ * so a caller (doSendFile, via its `onSent` parameter) can write several lines in a row, each
+ * confirmed landed on stdout before either sending the next file or letting a later failure
+ * propagate. Does NOT itself exit — teams-send-file only exits once every file in the batch has
+ * been streamed this way (see send-file.ts).
  */
-export function succeedMany(payloads: ReadonlyArray<Record<string, unknown>>): void {
-  const lines = payloads.map((payload) => JSON.stringify({ ok: true, ...payload }));
-  process.stdout.write(lines.length > 0 ? `${lines.join('\n')}\n` : '', () => process.exit(0));
+export function writeLine<T extends object>(payload: T): Promise<void> {
+  return new Promise((resolve) => {
+    process.stdout.write(`${JSON.stringify({ ok: true, ...payload })}\n`, () => resolve());
+  });
 }
 
 export function usage(text: string): never {

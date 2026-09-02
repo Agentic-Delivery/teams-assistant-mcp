@@ -198,9 +198,12 @@ is shown above the FIRST file's card only, never repeated on every card.
 Their output contract exists because of a real incident (2026-08-24): an ad-hoc wrapper's
 caller grepped for a success token the wrapper never printed, read eleven successful posts as
 eleven throttles, and re-posted a broadcast ten times. So: success is exactly one JSON line on
-stdout and exit 0 — `teams-send-file` with several paths prints one JSON line PER SENT FILE,
-still followed by a single exit 0; failure is prose on stderr and a non-zero exit (2 usage,
-3 allowlist, 1 anything else). **Branch on the exit code, never on output text.**
+stdout and exit 0; failure is prose on stderr and a non-zero exit (2 usage, 3 allowlist,
+1 anything else). **Branch on the exit code, never on output text.** `teams-send-file` with
+several paths STREAMS one JSON line per sent file as EACH one lands, rather than buffering until
+the whole batch finishes: if a later file fails partway through, the earlier files' lines are
+already on stdout and the exit code is still non-zero — the already-printed lines are proof those
+files landed, so a caller must not blindly re-run the whole batch and re-send them.
 
 ## Send reliability: readback before retry
 

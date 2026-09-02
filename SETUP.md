@@ -313,7 +313,8 @@ vars, same allowlist, same send-reliability code paths as the server tools. `--h
 `teams-post`/`teams-edit` posts stdin as raw HTML verbatim, same contract as `format: 'html'`
 above; `--mention "Name"` (repeatable) works the same as the `mentions` tool parameter.
 `teams-send-file` sends one or more local files (`--caption`, optional, shown on the first file
-only). Success is exactly one JSON line on stdout and exit 0 — `teams-send-file` prints one line
-per sent file, still one exit(0); failure is stderr plus a non-zero exit (2 usage, 3 allowlist,
-1 anything else). Branch on the exit code, never on output text — see README's "The standalone
-CLIs" for the incident that made this a rule.
+only), streaming one JSON line to stdout as EACH file lands rather than buffering until the whole
+batch finishes — see README's "The standalone CLIs" for why a mid-batch failure still needs the
+earlier lines visible. Success is exactly one JSON line on stdout and exit 0; failure is stderr
+plus a non-zero exit (2 usage, 3 allowlist, 1 anything else). Branch on the exit code, never on
+output text — see README's "The standalone CLIs" for the incident that made this a rule.
