@@ -40,7 +40,7 @@ Claude Code  --stdio-->  teams-assistant-mcp  --HTTPS-->  Microsoft Graph  -->  
                           TokenProvider  (ROPC today, swappable)
 ```
 
-The server speaks MCP over stdio and exposes fourteen tools:
+The server speaks MCP over stdio and exposes sixteen tools:
 
 | Tool | What it does |
 |---|---|
@@ -54,6 +54,8 @@ The server speaks MCP over stdio and exposes fourteen tools:
 | `react_to_chat_message` | Puts an emoji reaction on a message — the receipt gesture for "seen, being handled" |
 | `delete_chat_message` | Soft-deletes a message this account sent — the reversible kind; no hard delete offered |
 | `get_chat_attachment` | Downloads one attachment to a local file and returns the path — shared files, and pasted images which appear as `inline-image-N` |
+| `list_chat_attachments` | The attachments on one message — id, name, contentType, downloadable — without transferring any content |
+| `download_chat_attachments` | Downloads everything downloadable on one message in one call, optionally narrowed by a case-insensitive name filter and redirected to a chosen directory — see "Downloading attachments" below |
 | `poll_chats` | Reads every allowlisted chat in one call, carrying a watermark per chat |
 | `pin_chat_message` | Pins a message — see "Pinning" below for the one-pin-per-chat behaviour |
 | `unpin_chat_message` | Unpins a message; refuses if it is not the one currently pinned |
@@ -174,18 +176,78 @@ The recommended consumption pattern: arm a file watcher (Claude Code's `Monitor`
 inotify) on the inbox path at session start and react per line. Do not poll the tools for new
 messages any more.
 
-Two knobs: `TEAMS_INBOX_PATH` moves the inbox (the sidecar follows it), and
-`TEAMS_INBOX_DISABLED=1` switches the poller off entirely for consumers that only post.
+Three knobs: `TEAMS_INBOX_PATH` moves the inbox (the sidecar and the quota-yield file follow
+it), `TEAMS_INBOX_POLL_SECONDS` changes the 30s poll interval (the poller is the main consumer
+of the per-mailbox Graph read budget — see "Downloading attachments" for the measured
+consequences), and `TEAMS_INBOX_DISABLED=1` switches the poller off entirely for consumers that
+only post. The poller also honours the quota-yield file the attachment tools write — while it
+stands, cycles are skipped (logged once per yield, not per cycle) and the backoff does not
+double, so polling resumes at the normal cadence the moment the yield lifts.
+
+## Downloading attachments
+
+Three tools cover the read side of files. `read_chat_messages` (and `teams-read`) show attachment
+metadata on every message that carries any — name, contentType, id — so a reader can SEE there is
+something to fetch; the inbox daemon's per-line `attachments` count is the coarse version of the
+same signal. `list_chat_attachments` gives the same metadata for one message on demand, including
+whether each entry is downloadable (a quoted-reply quote card is not). `download_chat_attachments`
+fetches the message once and downloads everything downloadable on it — shared files and pasted
+inline images alike — optionally narrowed by a case-insensitive name filter; a filter that matches
+nothing is an error naming what the message does carry, never an empty success.
+`get_chat_attachment` remains for grabbing a single attachment by id.
+
+Two download mechanics, both handled: a file shared into a chat lives in SharePoint/OneDrive and
+its `contentUrl` wants browser cookies, so the download goes through Graph's `/shares/u!{id}`
+facade (unpadded URL-safe base64 of the URL — `shareIdFor` in `src/graph/teams-chats.ts`), which
+the Graph bearer token CAN read; an image pasted into a message body is hosted content on the
+message itself and comes from the `hostedContents` endpoint.
+
+Where files land: `TEAMS_MCP_DOWNLOAD_DIR`, else a directory under the OS tmpdir; the download
+tools also take an explicit output directory per call. Names are sender-controlled data and are
+sanitized before writing (path components stripped, reserved and control characters replaced,
+prefixed with the message id), and an existing file is NEVER silently overwritten — a collision
+gets a `-1`/`-2`/… suffix (`src/downloads.ts`).
+
+Permissions: with the shipped setup — a Microsoft first-party client id and the
+`https://graph.microsoft.com/.default` scope — SharePoint downloads work out of the box, no extra
+scope, no app registration, no admin consent (live-verified 2026-09-02 with this package's own
+token). If `TEAMS_MCP_CLIENT_ID` is ever pointed at a custom app registration instead, that
+registration needs the delegated `Files.Read.All` (or `Sites.Read.All`) Graph permission, which
+may require admin consent — and a 403 from the download says exactly that, with Graph's own
+error text preserved.
+
+Throttling — and why retries alone are NOT enough: these reads share the per-mailbox Graph
+budget with the inbox poller, and the poller spends that budget continuously. Measured live
+2026-09-02: with a poller running, ad-hoc single-message GETs answered 429 with `retry-after: 62`
+on every attempt across 20+ minutes of patient backoff — the waiting caller and the poller share
+one budget, and the poller consumes it again the moment each window reopens. So the attachment
+tools COORDINATE instead of just waiting: before touching Graph they write a quota-yield file
+(`inbox-yield.json`, next to the inbox), every inbox poller checks it at the top of each cycle
+and skips polling while it stands, and the file is removed the moment the reads finish — on
+failure too. The yield's own deadline (3 minutes by default, 10 minutes hard cap) bounds how
+long a crashed reader can silence the inbox. This works identically whether the poller runs in
+the same process (the MCP server's own tools) or in another one (the `teams-attachments` CLI
+next to a running daemon); the poller never cares who wrote the file. See `src/inbox-yield.ts`.
+
+On top of the coordination, binary downloads retry a 429/503/504 through the same `GraphClient`
+read loop as every other GET — Retry-After honoured, bounded, gate-aware (see "Send reliability"
+below) — and the retry sleep cap is 90s, deliberately above the 62s window Graph actually names
+on this family (the old round 60s cap sat one second UNDER Microsoft's own number, refusing
+every honest retry by exactly that margin). Multiple attachments on one message download
+sequentially, not in parallel. If ad-hoc reads matter routinely in a deployment, also consider
+slowing the poller itself down: `TEAMS_INBOX_POLL_SECONDS` (default 30) trades inbox latency
+for read-budget headroom.
 
 ## The standalone CLIs
 
-Eight small commands ship beside the server for scripts, cron jobs and background monitors that
+Nine small commands ship beside the server for scripts, cron jobs and background monitors that
 need Teams without a running MCP session: `teams-post <chatId> [--html] [--mention "Name"]...`
 (text on stdin), `teams-reply <chatId> <messageId> [--mention "Name"]...` (text on stdin),
 `teams-edit <chatId> <messageId> [--html] [--mention "Name"]...` (new text on stdin), `teams-react
 <chatId> <messageId> <emoji>`, `teams-read <chatId> [--limit N] [--since ISO]`, `teams-pin
-<chatId> <messageId>`, `teams-unpin <chatId> <messageId>` and `teams-send-file <chatId> <path>
-[more paths...] [--caption "text"]`. Same allowlist, same auth, same
+<chatId> <messageId>`, `teams-unpin <chatId> <messageId>`, `teams-send-file <chatId> <path>
+[more paths...] [--caption "text"]` and `teams-attachments <chatId> <messageId> [--list]
+[--name <filter>] [--out <dir>]`. Same allowlist, same auth, same
 code paths as the server tools — including the send reliability below. `--html` on
 `teams-post`/`teams-edit` posts stdin as raw Teams-subset HTML, verbatim — the caller is
 responsible for entity-escaping their own `<`, `>`, `&`; see the `teams-styling` plugin for the
@@ -193,7 +255,13 @@ verified vocabulary. `--mention
 "Name"` (repeatable) @mentions that person, same resolution and placement rules as the
 `mentions` tool parameter — see "@mentions" above. `teams-send-file` uploads and shares one or
 more files in one call (one `send_chat_file` per path); `--caption` (optional, anywhere in argv)
-is shown above the FIRST file's card only, never repeated on every card.
+is shown above the FIRST file's card only, never repeated on every card. `teams-attachments`
+downloads every downloadable attachment on a message into `--out` (else
+`TEAMS_MCP_DOWNLOAD_DIR`, else a tmpdir) and prints the absolute paths; `--list` prints the
+metadata instead and downloads nothing; `--name` narrows the download by case-insensitive
+substring — see "Downloading attachments" above for the sanitization, collision and permission
+story. `teams-read` includes each message's attachment metadata whenever there is any, so a
+script reading a chat can tell there is something to fetch.
 
 Their output contract exists because of a real incident (2026-08-24): an ad-hoc wrapper's
 caller grepped for a success token the wrapper never printed, read eleven successful posts as
@@ -324,10 +392,11 @@ credential, an account name, or a tenant id, and nothing ever should.
 | `TEAMS_MCP_CLIENT_ID` | no | Defaults to the first-party Teams client id; see SETUP.md for why you usually want the Office one. Also the knob for Graph throttle isolation — see "Throttle budgets are per client id" below |
 | `TEAMS_MCP_TOKEN_CACHE` | no | Defaults to `.token-cache.json` in the working directory. The members cache (see "@mentions" below) lives next to it |
 | `TEAMS_MCP_MEMBERS_TTL_SECONDS` | no | How long a chat's cached member list is trusted before a mention resolution refreshes it. Defaults to 24h (86400) |
-| `TEAMS_MCP_DOWNLOAD_DIR` | no | Where `get_chat_attachment` writes. Defaults to a temp directory |
+| `TEAMS_MCP_DOWNLOAD_DIR` | no | Where attachment downloads land (`get_chat_attachment`, `download_chat_attachments`, `teams-attachments`). Defaults to a temp directory |
 | `TEAMS_MCP_UPLOAD_DIR` | no | OneDrive folder where `send_chat_file` parks uploads. Defaults to `ai-test` |
 | `TEAMS_MCP_DISPLAY_NAME` | no | Overrides the expected display name for the probe |
 | `TEAMS_INBOX_PATH` | no | Where the background inbox JSONL lands. Defaults to `~/.teams-assistant/inbox.jsonl` |
+| `TEAMS_INBOX_POLL_SECONDS` | no | Inbox poll interval, default 30. Raising it frees per-mailbox Graph read budget for ad-hoc reads — see "Downloading attachments" |
 | `TEAMS_INBOX_DISABLED` | no | Set to `1` to not run the background inbox poller at all |
 
 ### Throttle budgets are per client id

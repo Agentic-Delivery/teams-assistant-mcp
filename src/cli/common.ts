@@ -2,6 +2,8 @@ import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
 import { buildChats } from '../build-chats.js';
 import { ChatNotAllowedError, type ChatAllowlist } from '../allowlist.js';
+import { defaultDownloadDir, sanitizeFileName, writeDownload } from '../downloads.js';
+import { withQuotaYield } from '../inbox-yield.js';
 import { loadConfig } from '../config.js';
 import { retryAfterSuffix } from '../graph/graph-client.js';
 import type { ReliableTeamsChats } from '../graph/reliable-sends.js';
@@ -105,6 +107,166 @@ export function parseSendFileFlags(args: readonly string[]): { caption?: string;
     }
   }
   return { ...(caption !== undefined ? { caption } : {}), paths };
+}
+
+/**
+ * Parses teams-attachments' trailing argv: a bare `--list` (metadata only, no download), an
+ * optional `--name <filter>` and an optional `--out <dir>`. Any other `--flag` is refused loudly
+ * — same doctrine as parseSendFileFlags above — and so is a leftover positional, since this CLI
+ * takes none after the chat and message ids.
+ */
+export function parseAttachmentFlags(args: readonly string[]): { list: boolean; name?: string; out?: string } {
+  let list = false;
+  let name: string | undefined;
+  let out: string | undefined;
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i] as string;
+    if (arg === '--list') {
+      list = true;
+    } else if (arg === '--name' || arg === '--out') {
+      const value = args[i + 1];
+      // Same guard as --mention/--caption above: a missing or flag-like value fails loudly
+      // instead of being swallowed as the next flag's name.
+      if (value === undefined || value.startsWith('--')) {
+        usage(
+          value === undefined
+            ? `${arg} needs a value`
+            : `${arg} needs a value, got "${value}" which looks like a flag`,
+        );
+      }
+      if (arg === '--name') {
+        name = value;
+      } else {
+        out = value;
+      }
+      i += 1;
+    } else {
+      usage(`teams-attachments: unrecognised argument ${arg}`);
+    }
+  }
+  return { list, ...(name !== undefined ? { name } : {}), ...(out !== undefined ? { out } : {}) };
+}
+
+/**
+ * teams-read's read-and-map plumbing — same direct-call testability rationale as doPost above,
+ * pulled out of read.ts when the output gained attachment metadata (0.5.0): a message carrying a
+ * file used to be indistinguishable in this output from one without, so no reader of teams-read
+ * ever knew there was anything to download. Attachment metadata (id, name, contentType — never
+ * the bytes) is included exactly when a message has any; the inbox daemon's `attachments` count
+ * (inbox.ts) stays the coarse signal, this is the detailed one.
+ */
+export async function doRead(
+  { chats, allowlist }: CliContext,
+  chatId: string,
+  options: { since?: string; limit?: number } = {},
+): Promise<{
+  action: 'read';
+  count: number;
+  messages: Array<{
+    id: string;
+    at: string;
+    from: string;
+    deleted: boolean;
+    text: string;
+    attachments?: Array<{ id: string; name?: string; contentType?: string }>;
+  }>;
+}> {
+  allowlist.assertReadable(chatId);
+  const { messages } = await chats.readMessages(chatId, options.since, options.limit ?? 20);
+  return {
+    action: 'read',
+    count: messages.length,
+    messages: messages.map((m) => ({
+      id: m.id,
+      at: m.createdDateTime,
+      from: m.from,
+      deleted: m.isDeleted,
+      text: m.text,
+      ...(m.attachments.length > 0
+        ? {
+            attachments: m.attachments.map((a) => ({
+              id: a.id,
+              ...(a.name ? { name: a.name } : {}),
+              ...(a.contentType ? { contentType: a.contentType } : {}),
+            })),
+          }
+        : {}),
+    })),
+  };
+}
+
+/** One downloaded-attachment success entry — what doDownloadAttachments returns per file. */
+export interface DownloadedAttachment {
+  path: string;
+  name: string;
+  contentType: string;
+  bytes: number;
+}
+
+/**
+ * teams-attachments' download plumbing — same direct-call testability rationale as doPost above.
+ * The allowlist gate runs before any Graph call; the port fetches the message ONCE and downloads
+ * every downloadable attachment (optionally narrowed by --name); each file is written through
+ * writeDownload, so names are sanitized and an existing file gets a -1/-2/… suffix rather than
+ * being silently overwritten.
+ */
+export async function doDownloadAttachments(
+  { chats, allowlist }: CliContext,
+  chatId: string,
+  messageId: string,
+  options: { name?: string; out?: string; yieldPath?: string } = {},
+): Promise<{ action: 'attachments'; chat: string; messageId: string; count: number; files: DownloadedAttachment[] }> {
+  const entry = allowlist.assertReadable(chatId);
+  // yieldPath (attachments.ts passes the real one) asks any running inbox poller — usually the
+  // daemon in another process — to go quiet while this CLI spends the shared per-mailbox Graph
+  // read budget; without the yield, the poller starves ad-hoc reads outright (measured
+  // 2026-09-02, see inbox-yield.ts). Only the Graph work is held under it; local file writes
+  // need no quota.
+  const payloads = await withQuotaYield(options.yieldPath, 'teams-attachments', () =>
+    chats.getAttachments(chatId, messageId, options.name),
+  );
+  const dir = options.out ?? defaultDownloadDir();
+  const files: DownloadedAttachment[] = [];
+  for (const payload of payloads) {
+    // Sanitized BEFORE the messageId prefix goes on, same as the server tools: a hostile
+    // "../../x" name must lose its path components without basename() also eating the prefix.
+    const path = await writeDownload(dir, `${messageId}-${sanitizeFileName(payload.name)}`, payload.bytes);
+    files.push({ path, name: payload.name, contentType: payload.contentType, bytes: payload.bytes.byteLength });
+  }
+  return { action: 'attachments', chat: entry.label, messageId, count: files.length, files };
+}
+
+/** teams-attachments --list: the metadata, nothing downloaded. Mirrors list_chat_attachments. */
+export async function doListAttachments(
+  { chats, allowlist }: CliContext,
+  chatId: string,
+  messageId: string,
+  options: { yieldPath?: string } = {},
+): Promise<{
+  action: 'attachments-list';
+  chat: string;
+  messageId: string;
+  count: number;
+  attachments: Array<{ id: string; name?: string; contentType?: string; downloadable: boolean }>;
+}> {
+  const entry = allowlist.assertReadable(chatId);
+  // Same quota yield as doDownloadAttachments above — the metadata read hits the same
+  // throttle-prone family and usually runs right before a download.
+  const attachments = await withQuotaYield(options.yieldPath, 'teams-attachments --list', () =>
+    chats.listAttachments(chatId, messageId),
+  );
+  return {
+    action: 'attachments-list',
+    chat: entry.label,
+    messageId,
+    count: attachments.length,
+    attachments: attachments.map((attachment) => ({
+      id: attachment.id,
+      ...(attachment.name ? { name: attachment.name } : {}),
+      ...(attachment.contentType ? { contentType: attachment.contentType } : {}),
+      downloadable: attachment.contentType !== 'messageReference',
+    })),
+  };
 }
 
 /** Resolves --mention names against the chat's member list, or [] when none were given — same

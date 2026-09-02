@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join } from 'node:path';
 import { buildChats } from './build-chats.js';
 import { loadConfig } from './config.js';
 import { InboxPoller, type SignedInAccount } from './inbox.js';
+import { inboxPathFor, inboxYieldPathFor } from './inbox-yield.js';
 import { buildServer } from './server.js';
 
 async function main(): Promise<void> {
@@ -13,10 +13,16 @@ async function main(): Promise<void> {
   const uploadDir = process.env['TEAMS_MCP_UPLOAD_DIR'];
   const { chats, graph, tokenProvider } = buildChats(config, uploadDir ? { uploadDir } : {});
 
+  // The yield file is passed even when THIS process runs no poller: the download tools write it
+  // to quiet whichever poller shares the mailbox — possibly a daemon in another process — and a
+  // yield file nobody reads costs nothing. See inbox-yield.ts for the measured starvation story.
+  const inboxYieldPath = inboxYieldPathFor(process.env);
+
   const server = buildServer({
     chats,
     allowlist: config.allowlist,
     assistantDisplayName: config.assistantDisplayName,
+    inboxYieldPath,
     ...(process.env['TEAMS_MCP_DOWNLOAD_DIR']
       ? { downloadDir: process.env['TEAMS_MCP_DOWNLOAD_DIR'] }
       : {}),
@@ -36,16 +42,22 @@ async function main(): Promise<void> {
     process.stderr.write('inbox poller off (TEAMS_INBOX_DISABLED)\n');
     return;
   }
-  const inboxPath = resolve(
-    process.env['TEAMS_INBOX_PATH']?.trim() || join(homedir(), '.teams-assistant', 'inbox.jsonl'),
-  );
+  const inboxPath = inboxPathFor(process.env);
+  // The 30s default across N allowlisted chats consumes a real share of the per-mailbox Graph
+  // read budget (measured 2026-09-02 — see inbox-yield.ts). This knob lets a deployment that
+  // also does ad-hoc reads slow the poller down; garbage or non-positive values fall back to
+  // the default, same posture as every other best-effort env knob.
+  const pollSeconds = Number(process.env['TEAMS_INBOX_POLL_SECONDS']);
   const poller = new InboxPoller({
     chats,
     allowlist: config.allowlist,
     self: () => graph.get<SignedInAccount>('/me?$select=id,displayName'),
     inboxPath,
-    // The state sidecar follows the inbox file, so a TEAMS_INBOX_PATH override moves both.
+    // The state sidecar follows the inbox file, so a TEAMS_INBOX_PATH override moves both —
+    // and the yield file with them (inboxYieldPathFor derives from the same inbox path).
     statePath: join(dirname(inboxPath), 'inbox-state.json'),
+    yieldPath: inboxYieldPath,
+    ...(Number.isFinite(pollSeconds) && pollSeconds > 0 ? { pollMs: pollSeconds * 1000 } : {}),
     log: (line) => process.stderr.write(`${line}\n`),
     // 0.4.1 stuck-auth self-healing: a token that goes bad without the local cache's own expiry
     // catching up needs an external nudge to drop it — see InboxPoller.trackAuthHealth's doc
