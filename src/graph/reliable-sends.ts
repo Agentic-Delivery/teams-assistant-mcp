@@ -3,6 +3,7 @@ import { renderHtmlWithMentions, renderTextWithMentions, type MentionTarget } fr
 import type {
   AttachmentPayload,
   ChatSummary,
+  MessageActionOptions,
   OutboundFile,
   OutboundImage,
   PinnedMessage,
@@ -226,8 +227,13 @@ export class ReliableTeamsChats implements TeamsChatsPort {
     return this.inner.editHtmlMessage(chatId, messageId, html, mentions);
   }
 
-  deleteMessage(chatId: string, messageId: string): Promise<void> {
-    return this.inner.deleteMessage(chatId, messageId);
+  deleteMessage(chatId: string, messageId: string, options?: MessageActionOptions): Promise<void> {
+    // Idempotent actions on an existing id — nothing for the readback guard to do, same as edit.
+    return this.inner.deleteMessage(chatId, messageId, options);
+  }
+
+  undoDeleteMessage(chatId: string, messageId: string, options?: MessageActionOptions): Promise<void> {
+    return this.inner.undoDeleteMessage(chatId, messageId, options);
   }
 
   setReaction(chatId: string, messageId: string, reactionType: string): Promise<void> {

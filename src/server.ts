@@ -91,7 +91,7 @@ export function buildServer(deps: ServerDeps): McpServer {
   const downloadDir = deps.downloadDir ?? defaultDownloadDir();
 
   const server = new McpServer(
-    { name: 'teams-assistant-mcp', version: '0.5.0' },
+    { name: 'teams-assistant-mcp', version: '0.6.0' },
     {
       instructions:
         `Reads and posts in a fixed set of Microsoft Teams group chats as the account ` +
@@ -312,25 +312,63 @@ export function buildServer(deps: ServerDeps): McpServer {
       }),
   );
 
+  /** Shared by delete/undo: the wording IS the safety contract a caller sees. */
+  const forceSchema = z
+    .boolean()
+    .optional()
+    .describe(
+      'Skip the own-message check. Without it the message is fetched first and refused if it ' +
+        'was written by anyone but this account (or if its author cannot be verified). Only pass ' +
+        'true when you have confirmed with a human that acting on someone else\'s message is ' +
+        'wanted — in a chat with customers this is never a casual thing to do.',
+    );
+
   server.registerTool(
     'delete_chat_message',
     {
       title: 'Delete a message this account sent',
       description:
-        'Soft-deletes a message in an allowlisted chat - the reversible kind, leaving the ' +
-        '"This message was deleted" stub that Teams can restore. Graph only allows deleting ' +
-        'messages the signed-in account sent itself. There is deliberately no hard delete here.',
+        'Soft-deletes a message in an allowlisted chat — the reversible kind, leaving the ' +
+        '"This message was deleted" stub; undo_delete_chat_message puts it back. Use it to ' +
+        'withdraw something posted in the wrong chat. Own messages only: the message is fetched ' +
+        'and its author compared with this account before anything is sent, and a message ' +
+        'somebody else wrote is refused unless force is true. There is deliberately no hard ' +
+        'delete here.',
       inputSchema: {
         chatId: z.string().describe('Graph chat id, must be allowlisted with canPost: true'),
         messageId: z.string().describe('Id of a message this account sent'),
+        force: forceSchema,
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
     },
-    ({ chatId, messageId }) =>
+    ({ chatId, messageId, force }) =>
       guard(async () => {
         allowlist.assertPostable(chatId);
-        await chats.deleteMessage(chatId, messageId);
+        await chats.deleteMessage(chatId, messageId, { force: force === true });
         return ok({ deleted: true, chatId, messageId });
+      }),
+  );
+
+  server.registerTool(
+    'undo_delete_chat_message',
+    {
+      title: 'Restore a message this account deleted',
+      description:
+        'Reverses a soft delete: the "This message was deleted" stub becomes the original ' +
+        'message again, in place. Same ownership rule as delete_chat_message — own messages ' +
+        'only unless force is true.',
+      inputSchema: {
+        chatId: z.string().describe('Graph chat id, must be allowlisted with canPost: true'),
+        messageId: z.string().describe('Id of a soft-deleted message this account sent'),
+        force: forceSchema,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    ({ chatId, messageId, force }) =>
+      guard(async () => {
+        allowlist.assertPostable(chatId);
+        await chats.undoDeleteMessage(chatId, messageId, { force: force === true });
+        return ok({ restored: true, chatId, messageId });
       }),
   );
 

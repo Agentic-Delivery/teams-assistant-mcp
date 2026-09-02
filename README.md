@@ -40,7 +40,7 @@ Claude Code  --stdio-->  teams-assistant-mcp  --HTTPS-->  Microsoft Graph  -->  
                           TokenProvider  (ROPC today, swappable)
 ```
 
-The server speaks MCP over stdio and exposes sixteen tools:
+The server speaks MCP over stdio and exposes seventeen tools:
 
 | Tool | What it does |
 |---|---|
@@ -52,7 +52,8 @@ The server speaks MCP over stdio and exposes sixteen tools:
 | `reply_chat_message` | Posts a quoted reply to a specific message — chats have no reply threads, so this is the quote card the Teams UI produces; optional `mentions` |
 | `edit_chat_message` | Replaces the text of a message this account sent (Graph refuses anyone else's); same `format` and `mentions` options as `send_chat_message` |
 | `react_to_chat_message` | Puts an emoji reaction on a message — the receipt gesture for "seen, being handled" |
-| `delete_chat_message` | Soft-deletes a message this account sent — the reversible kind; no hard delete offered |
+| `delete_chat_message` | Soft-deletes a message this account sent — the reversible kind; no hard delete offered. Refuses somebody else's message unless `force` — see "Withdrawing a message" below |
+| `undo_delete_chat_message` | Puts a soft-deleted message back; same ownership rule |
 | `get_chat_attachment` | Downloads one attachment to a local file and returns the path — shared files, and pasted images which appear as `inline-image-N` |
 | `list_chat_attachments` | The attachments on one message — id, name, contentType, downloadable — without transferring any content |
 | `download_chat_attachments` | Downloads everything downloadable on one message in one call, optionally narrowed by a case-insensitive name filter and redirected to a chosen directory — see "Downloading attachments" below |
@@ -63,9 +64,10 @@ The server speaks MCP over stdio and exposes sixteen tools:
 
 Besides the tools, the server runs a background inbox poller — see below.
 
-All posting tools pass the same allowlist `canPost` gate. Editing and deleting only work on the
-account's own messages — that is Graph's rule for delegated calls, and the server surfaces
-Graph's refusal verbatim rather than pre-checking it.
+All posting tools pass the same allowlist `canPost` gate. Editing only works on the account's
+own messages — that is Graph's rule for delegated calls, and the server surfaces Graph's refusal
+verbatim rather than pre-checking it. Deleting and restoring DO pre-check, on purpose — see
+"Withdrawing a message" below.
 
 Watermarks are exclusive ISO timestamps. Pass back what the previous call returned and you get
 only what arrived since. When nothing is new no watermark comes back, so the caller keeps the one
@@ -127,6 +129,42 @@ reconfirmed 2026-08-26) — there is no "add another pin". `pin_chat_message` re
 collection is itself an undocumented quirk: Graph answers a bare 404 where a normal empty
 collection would be `200` with `value: []` (verified live 2026-08-26); the server reads that 404
 as "nothing pinned" and returns an empty list rather than surfacing it as a failure.
+
+## Withdrawing a message
+
+`delete_chat_message` (and `teams-delete`) is for the case that actually happens: the agent
+posted something into a customer chat that belonged in an internal one. It is Graph's soft
+delete — `POST /me/chats/{chatId}/messages/{messageId}/softDelete` — so Teams shows the "This
+message was deleted" stub and `undo_delete_chat_message` (`teams-delete --undo`,
+`.../undoSoftDelete`) puts the original back in place. There is no hard delete anywhere in this
+package, and no plan for one. Before 0.6.0 the interim was editing the message down to a
+placeholder, which leaves the placeholder standing; the delete leaves the stub, which is what a
+person deleting in the Teams client leaves too.
+
+Own messages only. Before either action is sent the message is fetched and its author's AAD id
+compared with the signed-in account's (`/me`). A message written by anyone else is refused with
+a `MessageOwnershipError` naming the author — nothing is sent — and so is a message whose author
+cannot be verified because `/me` failed; an unverifiable author is not a licence to proceed.
+`force: true` (`--force`) skips the whole check, fetch included, and sends the action as-is;
+Graph then decides and its refusal comes back verbatim. The check is deliberately in the package
+and not left to Graph: in a chat with real customers, an agent deleting somebody else's message
+is not something that should happen because a tool call happened to succeed. Pass `force` only
+when a human has said so.
+
+The ownership fetch goes through the same single-message read a quoted reply uses, throttle
+fallback included — under a 429 on that family it scans the chat's recent list instead, and a
+message not among the last 50 fails with `MessageFetchThrottled`, nothing sent. It does not take
+the inbox quota yield the attachment tools take: it is one GET with a cheaper fallback, the same
+posture as `reply_chat_message`, and the write itself spends no read budget. `--force` skips the
+GET altogether, so a throttled family never stands between an operator and a message that has
+to go.
+
+Permissions: delegated `Chat.ReadWrite` (Graph reference, chatMessage: softDelete /
+undoSoftDelete, v1.0 — application permissions are not supported for either). With the shipped
+setup — a Microsoft first-party client id and the `.default` scope — the token already carries
+it, same as every other chat write here. If `TEAMS_MCP_CLIENT_ID` points at a custom app
+registration without that permission, the 403 says exactly that, Graph's own error text
+preserved, the same way the attachment download's 403 does.
 
 ## The background inbox
 
@@ -240,14 +278,15 @@ for read-budget headroom.
 
 ## The standalone CLIs
 
-Nine small commands ship beside the server for scripts, cron jobs and background monitors that
+Ten small commands ship beside the server for scripts, cron jobs and background monitors that
 need Teams without a running MCP session: `teams-post <chatId> [--html] [--mention "Name"]...`
 (text on stdin), `teams-reply <chatId> <messageId> [--mention "Name"]...` (text on stdin),
 `teams-edit <chatId> <messageId> [--html] [--mention "Name"]...` (new text on stdin), `teams-react
 <chatId> <messageId> <emoji>`, `teams-read <chatId> [--limit N] [--since ISO]`, `teams-pin
 <chatId> <messageId>`, `teams-unpin <chatId> <messageId>`, `teams-send-file <chatId> <path>
-[more paths...] [--caption "text"]` and `teams-attachments <chatId> <messageId> [--list]
-[--name <filter>] [--out <dir>]`. Same allowlist, same auth, same
+[more paths...] [--caption "text"]`, `teams-attachments <chatId> <messageId> [--list]
+[--name <filter>] [--out <dir>]` and `teams-delete <chatId> <messageId> [--undo] [--force]`.
+Same allowlist, same auth, same
 code paths as the server tools — including the send reliability below. `--html` on
 `teams-post`/`teams-edit` posts stdin as raw Teams-subset HTML, verbatim — the caller is
 responsible for entity-escaping their own `<`, `>`, `&`; see the `teams-styling` plugin for the
@@ -261,7 +300,11 @@ downloads every downloadable attachment on a message into `--out` (else
 metadata instead and downloads nothing; `--name` narrows the download by case-insensitive
 substring — see "Downloading attachments" above for the sanitization, collision and permission
 story. `teams-read` includes each message's attachment metadata whenever there is any, so a
-script reading a chat can tell there is something to fetch.
+script reading a chat can tell there is something to fetch. `teams-delete` soft-deletes one of
+this account's own messages (`--undo` restores it; `--force` skips the own-message check) — see
+"Withdrawing a message" above. A consuming machine that keeps the `~/.teams-assistant/*.mjs`
+shim convention adds one more shim for it, `delete.mjs`, importing `dist/cli/delete.js` like
+the others.
 
 Their output contract exists because of a real incident (2026-08-24): an ad-hoc wrapper's
 caller grepped for a success token the wrapper never printed, read eleven successful posts as
