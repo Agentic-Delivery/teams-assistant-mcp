@@ -475,9 +475,15 @@ export function buildServer(deps: ServerDeps): McpServer {
     {
       title: 'Share a file into a Teams chat',
       description:
-        'Uploads a local file to the assistant account\'s OneDrive and shares it into an ' +
-        'allowlisted chat with canPost enabled, as a normal Teams file attachment. Real people ' +
-        'see this immediately and it cannot be unsent through this server.',
+        'Uploads a local file to the assistant account\'s OneDrive, grants every OTHER chat ' +
+        'member read access on it, then shares it into an allowlisted chat with canPost ' +
+        'enabled, as a normal Teams file attachment. Real people see this immediately and it ' +
+        'cannot be unsent through this server. Can fail BEFORE any upload if the chat\'s member ' +
+        'list cannot be resolved, or if any other member has no Microsoft account id on record ' +
+        '(nobody would be able to open the file for them) — and can fail AFTER a successful ' +
+        'upload if the permission grant itself does not go through, in which case the file is ' +
+        'left orphaned in the assistant\'s OneDrive rather than posted where recipients could ' +
+        'not open it.',
       inputSchema: {
         chatId: z.string().describe('Graph chat id, must be allowlisted with canPost: true'),
         path: z.string().describe('Local path of the file to share'),

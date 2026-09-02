@@ -15,12 +15,23 @@ uploaded item (that same `/invite` call) BEFORE posting the chat message, resolv
 same cache-backed member roster resolveMentions already uses — never a direct call to the
 throttled `/chats/{id}/members` endpoint on the send path (see README's "@mentions" section for
 why that endpoint is avoided on sends). The assistant's own id is excluded from the grant when it
-can be determined (it already owns the item as uploader). An unresolvable/empty roster, or other
-real members none of whom has an AAD id Graph reported, now fails the send loudly BEFORE the
-upload; a failed `/invite` call fails loudly AFTER the upload (which is then left orphaned in
+can be determined (it already owns the item as uploader). An unresolvable/empty roster, or ANY
+other real member with no AAD id Graph reported (even in a mixed roster where some other members
+ARE resolvable — no partial grants), now fails the send loudly BEFORE the upload; a failed
+`/invite` call, or an `/invite` that answers HTTP success but whose own response shows no grant
+actually landed for a recipient, fails loudly AFTER the upload (which is then left orphaned in
 OneDrive — unavoidable, since the invite needs the uploaded item's id) and BEFORE the chat message
 post. See `GraphTeamsChats.sendFile`'s own doc comment (`src/graph/teams-chats.ts`) for the full
 failure contract; a card the recipients cannot open is refused rather than ever posted.
+
+**Wire-shape anchor (live verification, 2026-09-02, EPF011 delegated token, OneDrive for
+Business)** — the exact contract the code above and its tests are pinned to, captured verbatim
+(GUIDs generalized): request `POST /me/drive/items/{id}/invite` body
+`{"recipients":[{"objectId":"<aad-user-id>"}],"requireSignIn":true,"sendInvitation":false,"roles":["read"]}`
+→ `200`; a subsequent `GET .../permissions` listed read grants with `grantedToV2.user` for all six
+invited AAD users, and a human recipient confirmed the Teams file card opened. `grantedToV2.user.id`
+is the field `sendFile`'s post-invite grant check (above) reads as the source of truth, rather than
+trusting the `200` alone.
 
 ## Inbox poller: two server instances race on the same inbox (found 2026-08-21)
 
