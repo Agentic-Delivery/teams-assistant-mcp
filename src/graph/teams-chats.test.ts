@@ -573,9 +573,14 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
     });
     const chats = subject(fetchFn as unknown as typeof fetch, cache);
 
+    // 2026-09-02 re-review NIT: /determined|\/me/i used to also match this test's OWN "unexpected
+    // call" guard text (which names the /me URL as part of the upload path it refuses) — deleting
+    // the production refusal made the code fall through to the upload, tripping the test's guard
+    // instead of the intended error, and the loose matcher could not tell the difference. Matching
+    // the exact production wording closes that gap.
     await expect(
       chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' }),
-    ).rejects.toThrow(/determined|\/me/i);
+    ).rejects.toThrow(/own account id could not be determined/i);
   });
 
   // MAJOR 1 follow-up (2026-09-02 re-review): a 429 on the OPTIONAL-looking /me lookup used to
@@ -607,9 +612,11 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
     });
     const chats = new GraphTeamsChats(graph, { membersCache: cache });
 
+    // Same matcher-precision fix as the test above — the loose /determined|\/me/i also matched
+    // this test's own "unexpected call" guard text.
     await expect(
       chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' }),
-    ).rejects.toThrow(/determined|\/me/i);
+    ).rejects.toThrow(/own account id could not be determined/i);
     expect(sleepFn).not.toHaveBeenCalled();
   });
 
