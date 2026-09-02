@@ -20,6 +20,7 @@ import {
   parseSendFlags,
   run,
   succeed,
+  writeLine,
 } from './common.js';
 
 const repoRoot = join(import.meta.dirname, '..', '..');
@@ -511,7 +512,7 @@ describe('doSendFile — one sendFile call per positional path, --caption applie
       attachments: [],
     }) as ChatMessage;
 
-  it('sends a single file with no caption', async () => {
+  it('sends a single file with no caption, streamed via onSent', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'teams-send-file-'));
     const filePath = join(dir, 'a.txt');
     writeFileSync(filePath, 'hello');
@@ -520,8 +521,11 @@ describe('doSendFile — one sendFile call per positional path, --caption applie
       selfDisplayName: 'Assistant',
       sleepFn: async () => {},
     });
+    const sent: unknown[] = [];
 
-    const result = await doSendFile({ chats, allowlist }, '19:a@thread.v2', [filePath]);
+    await doSendFile({ chats, allowlist }, '19:a@thread.v2', [filePath], undefined, (payload) =>
+      sent.push(payload),
+    );
 
     expect(sendFile).toHaveBeenCalledTimes(1);
     expect(sendFile).toHaveBeenCalledWith(
@@ -529,7 +533,7 @@ describe('doSendFile — one sendFile call per positional path, --caption applie
       { bytes: expect.any(Uint8Array), name: 'a.txt' },
       undefined,
     );
-    expect(result).toEqual([{ action: 'send-file', id: 'f1', chat: 'chat A', name: 'a.txt', bytes: 5 }]);
+    expect(sent).toEqual([{ action: 'send-file', id: 'f1', chat: 'chat A', name: 'a.txt', bytes: 5 }]);
   });
 
   it('applies --caption to the FIRST file only, when several paths are given', async () => {
@@ -545,8 +549,11 @@ describe('doSendFile — one sendFile call per positional path, --caption applie
       selfDisplayName: 'Assistant',
       sleepFn: async () => {},
     });
+    const sent: unknown[] = [];
 
-    const result = await doSendFile({ chats, allowlist }, '19:a@thread.v2', [path1, path2], 'see attached');
+    await doSendFile({ chats, allowlist }, '19:a@thread.v2', [path1, path2], 'see attached', (payload) =>
+      sent.push(payload),
+    );
 
     expect(sendFile).toHaveBeenCalledTimes(2);
     expect(sendFile).toHaveBeenNthCalledWith(
@@ -561,24 +568,98 @@ describe('doSendFile — one sendFile call per positional path, --caption applie
       { bytes: expect.any(Uint8Array), name: 'second.txt' },
       undefined, // the second (and every later) file gets no caption
     );
-    expect(result).toEqual([
+    expect(sent).toEqual([
       { action: 'send-file', id: 'f-with-caption', chat: 'chat A', name: 'first.txt', bytes: 3 },
       { action: 'send-file', id: 'f-second.txt', chat: 'chat A', name: 'second.txt', bytes: 7 },
     ]);
   });
 
+  // MAJOR fix (2026-09-02 review): a multi-file send that fails partway through used to discard
+  // the JSON success lines for files already posted -- exit 1, empty stdout, file 1 irreversibly
+  // in the chat, and a caller with no way to tell it had already landed re-runs the whole batch
+  // and duplicates it (the exact 2026-08-24 incident class the CLI output contract exists to
+  // prevent). onSent must fire for each landed file BEFORE a later failure propagates.
+  it('a mid-list failure still delivers the earlier successes via onSent before rejecting', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'teams-send-file-'));
+    const path1 = join(dir, 'first.txt');
+    const path2 = join(dir, 'second.txt');
+    writeFileSync(path1, 'one');
+    writeFileSync(path2, 'two');
+    const sendFile = vi.fn(async (_chatId: string, file: { name: string }) => {
+      if (file.name === 'second.txt') {
+        throw new Error('Graph unavailable');
+      }
+      return stubMessage(`f-${file.name}`);
+    });
+    const chats = new ReliableTeamsChats(fakeFilePort({ sendFile }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+    const sent: unknown[] = [];
+
+    await expect(
+      doSendFile({ chats, allowlist }, '19:a@thread.v2', [path1, path2], undefined, (payload) =>
+        sent.push(payload),
+      ),
+    ).rejects.toThrow(/Graph unavailable/);
+
+    // The first file's success is visible even though the batch overall failed on the second.
+    expect(sent).toEqual([
+      { action: 'send-file', id: 'f-first.txt', chat: 'chat A', name: 'first.txt', bytes: 3 },
+    ]);
+    expect(sendFile).toHaveBeenCalledTimes(2); // both were attempted; only the second failed
+  });
+
+  // MINOR fix (2026-09-02 review, mutation-verified gap): a bare `.rejects.toThrow()` with no
+  // matcher and a genuinely nonexistent path passes on ANY rejection, including readFile's own
+  // ENOENT -- it does not actually prove the allowlist check ran BEFORE the filesystem read. A
+  // real file plus a specific error match closes that gap: if the allowlist check were ever
+  // skipped, this would proceed to read the (real) file and reach sendFile instead of throwing.
   it('a chat without canPost is refused before any file is even read from disk', async () => {
     const readonly = new ChatAllowlist([{ id: '19:ro@thread.v2', label: 'read-only', canPost: false }]);
+    const dir = mkdtempSync(join(tmpdir(), 'teams-send-file-'));
+    const realFile = join(dir, 'exists.txt');
+    writeFileSync(realFile, 'hello');
     const sendFile = vi.fn();
+    const onSent = vi.fn();
     const chats = new ReliableTeamsChats(fakeFilePort({ sendFile }), {
       selfDisplayName: 'Assistant',
       sleepFn: async () => {},
     });
 
     await expect(
-      doSendFile({ chats, allowlist: readonly }, '19:ro@thread.v2', ['/does/not/exist.txt']),
-    ).rejects.toThrow();
+      doSendFile({ chats, allowlist: readonly }, '19:ro@thread.v2', [realFile], undefined, onSent),
+    ).rejects.toThrow(/not on the allowlist/);
     expect(sendFile).not.toHaveBeenCalled();
+    expect(onSent).not.toHaveBeenCalled();
+  });
+});
+
+describe('writeLine() — the per-file streaming primitive teams-send-file uses (replaces succeedMany, 2026-09-02 review MINOR: untested happy path / dead empty-branch)', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it('resolves only after the write callback fires — a full pipe cannot truncate the line', async () => {
+    let flushCallback: (() => void) | undefined;
+    const write = vi
+      .spyOn(process.stdout, 'write')
+      .mockImplementation((_chunk: unknown, cb?: unknown) => {
+        flushCallback = cb as () => void;
+        return false; // signal a full pipe: the data is NOT yet delivered
+      });
+
+    let resolved = false;
+    const promise = writeLine({ action: 'send-file', id: 'f1' }).then(() => {
+      resolved = true;
+    });
+
+    expect(write).toHaveBeenCalledWith(
+      `${JSON.stringify({ ok: true, action: 'send-file', id: 'f1' })}\n`,
+      expect.any(Function),
+    );
+    expect(resolved).toBe(false); // the old bug this guards against: resolving before the flush
+    flushCallback?.();
+    await promise;
+    expect(resolved).toBe(true);
   });
 });
 
@@ -730,6 +811,20 @@ describe('teams-send-file — exit codes (subprocess)', () => {
     expect(result.code).toBe(2);
     expect(result.stdout).toBe('');
     expect(result.stderr).toMatch(/--caption/);
+  });
+
+  // MINOR fix (2026-09-02 review): align with teams-reply's doctrine of refusing a stray leftover
+  // flag instead of silently treating it as a literal path.
+  it('an unrecognised leftover flag: exit 2, stdout empty', async () => {
+    const result = await runCli(
+      'send-file.ts',
+      ['19:readonly@thread.v2', '/tmp/does-not-matter.txt', '--verbose'],
+      fixtureEnv(),
+    );
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/--verbose/);
   });
 });
 
