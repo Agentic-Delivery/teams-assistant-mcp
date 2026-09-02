@@ -48,7 +48,7 @@ The server speaks MCP over stdio and exposes fourteen tools:
 | `read_chat_messages` | Messages from one chat, oldest first, with a watermark for the next call |
 | `send_chat_message` | Posts to a chat whose allowlist entry has `canPost: true`; `format: 'text'` (default) escapes and renders, `format: 'html'` posts raw HTML verbatim; optional `mentions` — see "@mentions" below |
 | `send_chat_image` | Posts a PNG/JPEG that renders inline, from a local path or base64 bytes |
-| `send_chat_file` | Uploads a local file to the account's OneDrive (`TEAMS_MCP_UPLOAD_DIR`, default `ai-test`) and shares it into the chat |
+| `send_chat_file` | Uploads a local file to the account's OneDrive (`TEAMS_MCP_UPLOAD_DIR`, default `ai-test`) and shares it into the chat, granting every other chat member read access on the uploaded item |
 | `reply_chat_message` | Posts a quoted reply to a specific message — chats have no reply threads, so this is the quote card the Teams UI produces; optional `mentions` |
 | `edit_chat_message` | Replaces the text of a message this account sent (Graph refuses anyone else's); same `format` and `mentions` options as `send_chat_message` |
 | `react_to_chat_message` | Puts an emoji reaction on a message — the receipt gesture for "seen, being handled" |
@@ -179,24 +179,31 @@ Two knobs: `TEAMS_INBOX_PATH` moves the inbox (the sidecar follows it), and
 
 ## The standalone CLIs
 
-Seven small commands ship beside the server for scripts, cron jobs and background monitors that
+Eight small commands ship beside the server for scripts, cron jobs and background monitors that
 need Teams without a running MCP session: `teams-post <chatId> [--html] [--mention "Name"]...`
 (text on stdin), `teams-reply <chatId> <messageId> [--mention "Name"]...` (text on stdin),
 `teams-edit <chatId> <messageId> [--html] [--mention "Name"]...` (new text on stdin), `teams-react
 <chatId> <messageId> <emoji>`, `teams-read <chatId> [--limit N] [--since ISO]`, `teams-pin
-<chatId> <messageId>` and `teams-unpin <chatId> <messageId>`. Same allowlist, same auth, same
+<chatId> <messageId>`, `teams-unpin <chatId> <messageId>` and `teams-send-file <chatId> <path>
+[more paths...] [--caption "text"]`. Same allowlist, same auth, same
 code paths as the server tools — including the send reliability below. `--html` on
 `teams-post`/`teams-edit` posts stdin as raw Teams-subset HTML, verbatim — the caller is
 responsible for entity-escaping their own `<`, `>`, `&`; see the `teams-styling` plugin for the
 verified vocabulary. `--mention
 "Name"` (repeatable) @mentions that person, same resolution and placement rules as the
-`mentions` tool parameter — see "@mentions" above.
+`mentions` tool parameter — see "@mentions" above. `teams-send-file` uploads and shares one or
+more files in one call (one `send_chat_file` per path); `--caption` (optional, anywhere in argv)
+is shown above the FIRST file's card only, never repeated on every card.
 
 Their output contract exists because of a real incident (2026-08-24): an ad-hoc wrapper's
 caller grepped for a success token the wrapper never printed, read eleven successful posts as
 eleven throttles, and re-posted a broadcast ten times. So: success is exactly one JSON line on
 stdout and exit 0; failure is prose on stderr and a non-zero exit (2 usage, 3 allowlist,
-1 anything else). **Branch on the exit code, never on output text.**
+1 anything else). **Branch on the exit code, never on output text.** `teams-send-file` with
+several paths STREAMS one JSON line per sent file as EACH one lands, rather than buffering until
+the whole batch finishes: if a later file fails partway through, the earlier files' lines are
+already on stdout and the exit code is still non-zero — the already-printed lines are proof those
+files landed, so a caller must not blindly re-run the whole batch and re-send them.
 
 ## Send reliability: readback before retry
 

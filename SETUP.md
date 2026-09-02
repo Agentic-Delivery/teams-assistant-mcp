@@ -284,7 +284,7 @@ The fourteen tools, as registered in `src/server.ts`. All results are JSON text;
 | `react_to_chat_message` | Puts an emoji reaction on a message in an allowlisted chat | `chatId`, `messageId`, `emoji` |
 | `delete_chat_message` | Soft-deletes a message this account sent (restorable in Teams) | `chatId`, `messageId` |
 | `send_chat_image` | Posts a PNG/JPEG that renders inline | `chatId`, `path?` or `base64?` (exactly one), `mime?` (required with base64), `text?` |
-| `send_chat_file` | Uploads to the account's OneDrive and shares into the chat as a file card | `chatId`, `path`, `text?` |
+| `send_chat_file` | Uploads to the account's OneDrive and shares into the chat as a file card, granting every other chat member read access on the uploaded item | `chatId`, `path`, `text?` |
 | `get_chat_attachment` | Downloads one attachment to `TEAMS_MCP_DOWNLOAD_DIR` and returns the path; pasted images appear as `inline-image-N` | `chatId`, `messageId`, `attachmentId?` (default: first) |
 | `poll_chats` | Reads every allowlisted chat in one call, carrying a watermark per chat | `watermarks?` (chatId → ISO watermark), `limit?` |
 | `pin_chat_message` | Pins a message — REPLACES whatever was pinned before it (a chat effectively holds one pin); returns the resulting pinned list | `chatId`, `messageId` |
@@ -305,13 +305,16 @@ when to tag someone versus just naming them.
 
 ## The standalone CLIs
 
-Beside the server, `npm run build` produces seven commands under `dist/cli/` (also exposed as
+Beside the server, `npm run build` produces eight commands under `dist/cli/` (also exposed as
 package bins): `teams-post [--html] [--mention "Name"]...`, `teams-reply [--mention "Name"]...`,
 `teams-edit [--html] [--mention "Name"]...`, `teams-react`, `teams-read`, `teams-pin`,
-`teams-unpin`. Same env vars,
-same allowlist, same send-reliability code paths as the server tools. `--html` on
+`teams-unpin` and `teams-send-file <chatId> <path> [more paths...] [--caption "text"]`. Same env
+vars, same allowlist, same send-reliability code paths as the server tools. `--html` on
 `teams-post`/`teams-edit` posts stdin as raw HTML verbatim, same contract as `format: 'html'`
-above; `--mention "Name"` (repeatable) works the same as the `mentions` tool parameter. Success
-is exactly one JSON line on stdout and exit 0; failure is stderr plus a non-zero exit (2 usage,
-3 allowlist, 1 anything else). Branch on the exit code, never on output text — see README's "The
-standalone CLIs" for the incident that made this a rule.
+above; `--mention "Name"` (repeatable) works the same as the `mentions` tool parameter.
+`teams-send-file` sends one or more local files (`--caption`, optional, shown on the first file
+only), streaming one JSON line to stdout as EACH file lands rather than buffering until the whole
+batch finishes — see README's "The standalone CLIs" for why a mid-batch failure still needs the
+earlier lines visible. Success is exactly one JSON line on stdout and exit 0; failure is stderr
+plus a non-zero exit (2 usage, 3 allowlist, 1 anything else). Branch on the exit code, never on
+output text — see README's "The standalone CLIs" for the incident that made this a rule.
