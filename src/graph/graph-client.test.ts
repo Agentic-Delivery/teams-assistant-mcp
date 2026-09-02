@@ -1244,3 +1244,30 @@ describe('teams chats — getAttachments downloads a whole message in one pass (
     expect(fetchFn.mock.calls.some(([url]) => String(url).includes('/shares/') || String(url).includes('/hostedContents/'))).toBe(false);
   });
 });
+
+describe('graph client — the live-measured 62 s window is slept, not refused (0.5.0)', () => {
+  it('a Retry-After of 62 — the number Graph actually names on this family — gets one honest sleep and a retry', async () => {
+    // Before 0.5.0 the sleep cap was a round 60_000: one wall-clock second UNDER Microsoft's own
+    // live throttle window, so every honest retry was refused as "too long" by exactly that margin.
+    const waits: number[] = [];
+    let now = 0;
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'throttled' } }), {
+          status: 429,
+          headers: { 'retry-after': '62', 'content-type': 'application/json' },
+        }),
+      )
+      .mockResolvedValueOnce(json({ id: 'fine' }));
+    const client = new GraphClient({
+      tokenProvider: stubToken,
+      fetchFn: fetchFn as never,
+      sleepFn: async (ms) => { waits.push(ms); now += ms; },
+      nowFn: () => now,
+    });
+
+    expect(await client.get('/chats/x/messages/1')).toEqual({ id: 'fine' });
+    expect(waits).toEqual([62_000]);
+  });
+});

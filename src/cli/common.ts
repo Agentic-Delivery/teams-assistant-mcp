@@ -3,6 +3,7 @@ import { basename } from 'node:path';
 import { buildChats } from '../build-chats.js';
 import { ChatNotAllowedError, type ChatAllowlist } from '../allowlist.js';
 import { defaultDownloadDir, sanitizeFileName, writeDownload } from '../downloads.js';
+import { withQuotaYield } from '../inbox-yield.js';
 import { loadConfig } from '../config.js';
 import { retryAfterSuffix } from '../graph/graph-client.js';
 import type { ReliableTeamsChats } from '../graph/reliable-sends.js';
@@ -213,10 +214,17 @@ export async function doDownloadAttachments(
   { chats, allowlist }: CliContext,
   chatId: string,
   messageId: string,
-  options: { name?: string; out?: string } = {},
+  options: { name?: string; out?: string; yieldPath?: string } = {},
 ): Promise<{ action: 'attachments'; chat: string; messageId: string; count: number; files: DownloadedAttachment[] }> {
   const entry = allowlist.assertReadable(chatId);
-  const payloads = await chats.getAttachments(chatId, messageId, options.name);
+  // yieldPath (attachments.ts passes the real one) asks any running inbox poller — usually the
+  // daemon in another process — to go quiet while this CLI spends the shared per-mailbox Graph
+  // read budget; without the yield, the poller starves ad-hoc reads outright (measured
+  // 2026-09-02, see inbox-yield.ts). Only the Graph work is held under it; local file writes
+  // need no quota.
+  const payloads = await withQuotaYield(options.yieldPath, 'teams-attachments', () =>
+    chats.getAttachments(chatId, messageId, options.name),
+  );
   const dir = options.out ?? defaultDownloadDir();
   const files: DownloadedAttachment[] = [];
   for (const payload of payloads) {
@@ -233,6 +241,7 @@ export async function doListAttachments(
   { chats, allowlist }: CliContext,
   chatId: string,
   messageId: string,
+  options: { yieldPath?: string } = {},
 ): Promise<{
   action: 'attachments-list';
   chat: string;
@@ -241,7 +250,11 @@ export async function doListAttachments(
   attachments: Array<{ id: string; name?: string; contentType?: string; downloadable: boolean }>;
 }> {
   const entry = allowlist.assertReadable(chatId);
-  const attachments = await chats.listAttachments(chatId, messageId);
+  // Same quota yield as doDownloadAttachments above — the metadata read hits the same
+  // throttle-prone family and usually runs right before a download.
+  const attachments = await withQuotaYield(options.yieldPath, 'teams-attachments --list', () =>
+    chats.listAttachments(chatId, messageId),
+  );
   return {
     action: 'attachments-list',
     chat: entry.label,

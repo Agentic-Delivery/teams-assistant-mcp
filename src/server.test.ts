@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -176,6 +176,10 @@ class FakeTeamsChats implements TeamsChatsPort {
     };
   }
 
+  // Lets a test observe the world (e.g. whether the quota-yield file stands) at the moment an
+  // attachment read actually runs — see the download_chat_attachments yield test.
+  onAttachmentRead?: () => void;
+
   // The download-tools fixture message: a quote card (never downloadable), a shared file with a
   // hostile sender-controlled name, and a pasted inline image.
   attachmentRefs: ChatAttachmentRef[] = [
@@ -185,6 +189,7 @@ class FakeTeamsChats implements TeamsChatsPort {
   ];
 
   async listAttachments(): Promise<ChatAttachmentRef[]> {
+    this.onAttachmentRead?.();
     return this.attachmentRefs;
   }
 
@@ -193,6 +198,7 @@ class FakeTeamsChats implements TeamsChatsPort {
     messageId: string,
     nameFilter?: string,
   ): Promise<AttachmentPayload[]> {
+    this.onAttachmentRead?.();
     const downloadable = this.attachmentRefs.filter(
       (candidate) => candidate.contentType !== 'messageReference',
     );
@@ -239,10 +245,12 @@ class FakeTeamsChats implements TeamsChatsPort {
 
 let chats: FakeTeamsChats;
 let downloadDir: string;
+let inboxYieldPath: string;
 
 async function connect() {
   chats = new FakeTeamsChats();
   downloadDir = mkdtempSync(join(tmpdir(), 'teams-mcp-test-'));
+  inboxYieldPath = join(downloadDir, 'inbox-yield.json');
   const server = buildServer({
     chats,
     allowlist: new ChatAllowlist([
@@ -251,6 +259,7 @@ async function connect() {
     ]),
     assistantDisplayName: 'Assistant (AI)',
     downloadDir,
+    inboxYieldPath,
   });
   const client = new Client({ name: 'test', version: '1.0.0' });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -930,6 +939,18 @@ describe('download_chat_attachments', () => {
     });
 
     expect(result.isError).toBe(true);
+  });
+
+  it('holds the quota yield while the Graph reads run and releases it after (2026-09-02: a polling daemon starved these reads)', async () => {
+    let yieldStoodDuringRead = false;
+    chats.onAttachmentRead = () => {
+      yieldStoodDuringRead = existsSync(inboxYieldPath);
+    };
+
+    await call(client, 'download_chat_attachments', { chatId: PILOT, messageId: 'm1' });
+
+    expect(yieldStoodDuringRead).toBe(true); // any running inbox poller sees this and sits the cycle out
+    expect(existsSync(inboxYieldPath)).toBe(false); // and resumes the moment the download is done
   });
 });
 

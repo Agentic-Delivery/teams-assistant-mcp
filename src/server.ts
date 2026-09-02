@@ -4,6 +4,7 @@ import { basename, extname } from 'node:path';
 import { z } from 'zod';
 import type { ChatAllowlist } from './allowlist.js';
 import { defaultDownloadDir, sanitizeFileName, writeDownload } from './downloads.js';
+import { withQuotaYield } from './inbox-yield.js';
 import { retryAfterSuffix } from './graph/graph-client.js';
 import type { ChatMessage, MentionTarget, PinnedMessage, TeamsChatsPort } from './graph/teams-chats.js';
 
@@ -12,6 +13,13 @@ export interface ServerDeps {
   allowlist: ChatAllowlist;
   assistantDisplayName: string;
   downloadDir?: string;
+  /**
+   * Where the attachment tools ask the inbox poller — this process's own, or a daemon's in
+   * another process — to go quiet while they spend the shared per-mailbox Graph read budget.
+   * See inbox-yield.ts for the live-measured starvation this prevents. Optional: without it
+   * the tools read without coordinating, which only works while no poller is running.
+   */
+  inboxYieldPath?: string;
 }
 
 interface ToolResult {
@@ -531,7 +539,12 @@ export function buildServer(deps: ServerDeps): McpServer {
     ({ chatId, messageId, attachmentId }) =>
       guard(async () => {
         allowlist.assertReadable(chatId);
-        const attachment = await chats.getAttachment(chatId, messageId, attachmentId);
+        // The quota yield asks any running inbox poller to sit this one out: the download and
+        // the poller share the per-mailbox Graph read budget, and the poller spending it
+        // continuously is what starved ad-hoc reads live on 2026-09-02 — see inbox-yield.ts.
+        const attachment = await withQuotaYield(deps.inboxYieldPath, 'get_chat_attachment', () =>
+          chats.getAttachment(chatId, messageId, attachmentId),
+        );
         // The sender-controlled name is sanitized BEFORE the messageId prefix goes on — a name
         // like "../../escape.pdf" must lose its path components without also eating the prefix
         // (basename of the combined string would). writeDownload then guarantees the write stays
@@ -569,7 +582,11 @@ export function buildServer(deps: ServerDeps): McpServer {
     ({ chatId, messageId }) =>
       guard(async () => {
         allowlist.assertReadable(chatId);
-        const attachments = await chats.listAttachments(chatId, messageId);
+        // Yielded like the downloads: metadata comes from the throttle-prone single-message
+        // family too (with the list-scan fallback), and it usually runs right before a download.
+        const attachments = await withQuotaYield(deps.inboxYieldPath, 'list_chat_attachments', () =>
+          chats.listAttachments(chatId, messageId),
+        );
         return ok({
           chatId,
           messageId,
@@ -613,7 +630,11 @@ export function buildServer(deps: ServerDeps): McpServer {
     ({ chatId, messageId, nameFilter, outputDir }) =>
       guard(async () => {
         allowlist.assertReadable(chatId);
-        const payloads = await chats.getAttachments(chatId, messageId, nameFilter);
+        // Same quota yield as get_chat_attachment above — one yield spans the message fetch and
+        // every download on it.
+        const payloads = await withQuotaYield(deps.inboxYieldPath, 'download_chat_attachments', () =>
+          chats.getAttachments(chatId, messageId, nameFilter),
+        );
         const dir = outputDir ?? downloadDir;
         const files = [];
         for (const payload of payloads) {

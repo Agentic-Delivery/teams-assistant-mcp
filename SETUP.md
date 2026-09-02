@@ -116,6 +116,11 @@ directory, so a relative path resolves against the wrong repo.
 gitignored here; leave the variable unset and the default lands in the agent's working directory
 instead, i.e. inside your project.
 
+**`TEAMS_INBOX_POLL_SECONDS`** — inbox poll interval, default 30. The poller is the main
+consumer of the account's per-mailbox Graph read budget; raise this if the same account also
+serves ad-hoc reads and attachment downloads (README "Downloading attachments" has the
+measured story).
+
 **`TEAMS_MCP_DOWNLOAD_DIR`** — where attachment downloads land (`get_chat_attachment`,
 `download_chat_attachments`, `teams-attachments`). Defaults to a directory
 under the OS tmpdir, which may be cleaned between sessions.
