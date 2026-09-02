@@ -10,7 +10,17 @@ import { ReliableTeamsChats } from '../graph/reliable-sends.js';
 import type { TeamsChatsPort } from '../graph/teams-chats.js';
 import type { ChatMessage, ReadResult } from '../messages.js';
 import { loadConfig } from '../config.js';
-import { doEdit, doPin, doPost, doReply, parseSendFlags, run, succeed } from './common.js';
+import {
+  doEdit,
+  doPin,
+  doPost,
+  doReply,
+  doSendFile,
+  parseSendFileFlags,
+  parseSendFlags,
+  run,
+  succeed,
+} from './common.js';
 
 const repoRoot = join(import.meta.dirname, '..', '..');
 const tsx = join(repoRoot, 'node_modules', '.bin', 'tsx');
@@ -465,6 +475,113 @@ describe('doPin — confirms the target message actually landed before claiming 
   });
 });
 
+describe('doSendFile — one sendFile call per positional path, --caption applied to the FIRST file only (new capability, 0.4.2)', () => {
+  function fakeFilePort(overrides: Partial<TeamsChatsPort>): TeamsChatsPort {
+    const reject = () => Promise.reject(new Error('not part of this test'));
+    return {
+      listChats: reject,
+      readMessages: () => Promise.resolve({ messages: [] } as unknown as ReadResult),
+      resolveMentions: reject,
+      sendMessage: reject,
+      sendHtmlMessage: reject,
+      sendImage: reject,
+      sendFile: reject,
+      replyToMessage: reject,
+      editMessage: reject,
+      editHtmlMessage: reject,
+      deleteMessage: reject,
+      setReaction: reject,
+      getAttachment: reject,
+      pinMessage: reject,
+      unpinMessage: reject,
+      listPinnedMessages: reject,
+      ...overrides,
+    } as TeamsChatsPort;
+  }
+
+  const allowlist = new ChatAllowlist([{ id: '19:a@thread.v2', label: 'chat A', canPost: true }]);
+  const stubMessage = (id: string) =>
+    ({
+      id,
+      chatId: '19:a@thread.v2',
+      createdDateTime: '2026-09-02T10:00:00Z',
+      from: 'Assistant',
+      text: '',
+      isDeleted: false,
+      attachments: [],
+    }) as ChatMessage;
+
+  it('sends a single file with no caption', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'teams-send-file-'));
+    const filePath = join(dir, 'a.txt');
+    writeFileSync(filePath, 'hello');
+    const sendFile = vi.fn(async () => stubMessage('f1'));
+    const chats = new ReliableTeamsChats(fakeFilePort({ sendFile }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    const result = await doSendFile({ chats, allowlist }, '19:a@thread.v2', [filePath]);
+
+    expect(sendFile).toHaveBeenCalledTimes(1);
+    expect(sendFile).toHaveBeenCalledWith(
+      '19:a@thread.v2',
+      { bytes: expect.any(Uint8Array), name: 'a.txt' },
+      undefined,
+    );
+    expect(result).toEqual([{ action: 'send-file', id: 'f1', chat: 'chat A', name: 'a.txt', bytes: 5 }]);
+  });
+
+  it('applies --caption to the FIRST file only, when several paths are given', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'teams-send-file-'));
+    const path1 = join(dir, 'first.txt');
+    const path2 = join(dir, 'second.txt');
+    writeFileSync(path1, 'one');
+    writeFileSync(path2, 'two-two');
+    const sendFile = vi.fn(async (_chatId: string, file: { name: string }, text?: string) =>
+      stubMessage(text ? 'f-with-caption' : `f-${file.name}`),
+    );
+    const chats = new ReliableTeamsChats(fakeFilePort({ sendFile }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    const result = await doSendFile({ chats, allowlist }, '19:a@thread.v2', [path1, path2], 'see attached');
+
+    expect(sendFile).toHaveBeenCalledTimes(2);
+    expect(sendFile).toHaveBeenNthCalledWith(
+      1,
+      '19:a@thread.v2',
+      { bytes: expect.any(Uint8Array), name: 'first.txt' },
+      'see attached',
+    );
+    expect(sendFile).toHaveBeenNthCalledWith(
+      2,
+      '19:a@thread.v2',
+      { bytes: expect.any(Uint8Array), name: 'second.txt' },
+      undefined, // the second (and every later) file gets no caption
+    );
+    expect(result).toEqual([
+      { action: 'send-file', id: 'f-with-caption', chat: 'chat A', name: 'first.txt', bytes: 3 },
+      { action: 'send-file', id: 'f-second.txt', chat: 'chat A', name: 'second.txt', bytes: 7 },
+    ]);
+  });
+
+  it('a chat without canPost is refused before any file is even read from disk', async () => {
+    const readonly = new ChatAllowlist([{ id: '19:ro@thread.v2', label: 'read-only', canPost: false }]);
+    const sendFile = vi.fn();
+    const chats = new ReliableTeamsChats(fakeFilePort({ sendFile }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    await expect(
+      doSendFile({ chats, allowlist: readonly }, '19:ro@thread.v2', ['/does/not/exist.txt']),
+    ).rejects.toThrow();
+    expect(sendFile).not.toHaveBeenCalled();
+  });
+});
+
 describe('parseSendFlags — --html and repeatable --mention', () => {
   it('finds no flags in an empty argv', () => {
     expect(parseSendFlags([])).toEqual({ html: false, mentions: [], rest: [] });
@@ -496,6 +613,26 @@ describe('parseSendFlags — --html and repeatable --mention', () => {
 
   it('leaves unrecognised arguments in rest, untouched', () => {
     expect(parseSendFlags(['--weird', 'value'])).toEqual({ html: false, mentions: [], rest: ['--weird', 'value'] });
+  });
+});
+
+describe('parseSendFileFlags — positional paths plus an optional --caption', () => {
+  it('collects one path, no caption', () => {
+    expect(parseSendFileFlags(['a.txt'])).toEqual({ caption: undefined, paths: ['a.txt'] });
+  });
+
+  it('collects several paths, in order', () => {
+    expect(parseSendFileFlags(['a.txt', 'b.txt', 'c.txt'])).toEqual({
+      caption: undefined,
+      paths: ['a.txt', 'b.txt', 'c.txt'],
+    });
+  });
+
+  it('extracts --caption regardless of where it appears among the paths, leaving it out of paths', () => {
+    expect(parseSendFileFlags(['a.txt', '--caption', 'see attached', 'b.txt'])).toEqual({
+      caption: 'see attached',
+      paths: ['a.txt', 'b.txt'],
+    });
   });
 });
 
@@ -542,6 +679,57 @@ describe('teams-pin / teams-unpin — exit codes (subprocess)', () => {
 
     expect(result.code).toBe(3);
     expect(result.stdout).toBe('');
+  });
+});
+
+describe('teams-send-file — exit codes (subprocess)', () => {
+  it('missing arguments: exit 2, stdout empty', async () => {
+    const result = await runCli('send-file.ts', [], {});
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/usage/);
+  });
+
+  it('a chatId with no path at all: exit 2, stdout empty', async () => {
+    const result = await runCli('send-file.ts', ['19:readonly@thread.v2'], fixtureEnv());
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+  });
+
+  it('a chat outside the allowlist: exit 3, stdout empty', async () => {
+    const result = await runCli(
+      'send-file.ts',
+      ['19:never-heard-of@thread.v2', '/tmp/does-not-matter.txt'],
+      fixtureEnv(),
+    );
+
+    expect(result.code).toBe(3);
+    expect(result.stdout).toBe('');
+  });
+
+  it('an allowlisted chat without canPost: exit 3, stdout empty', async () => {
+    const result = await runCli(
+      'send-file.ts',
+      ['19:readonly@thread.v2', '/tmp/does-not-matter.txt'],
+      fixtureEnv(),
+    );
+
+    expect(result.code).toBe(3);
+    expect(result.stdout).toBe('');
+  });
+
+  it('--caption with no value: exit 2', async () => {
+    const result = await runCli(
+      'send-file.ts',
+      ['19:readonly@thread.v2', '/tmp/does-not-matter.txt', '--caption'],
+      fixtureEnv(),
+    );
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/--caption/);
   });
 });
 

@@ -83,7 +83,7 @@ export function buildServer(deps: ServerDeps): McpServer {
   const downloadDir = deps.downloadDir ?? join(tmpdir(), 'teams-assistant-mcp');
 
   const server = new McpServer(
-    { name: 'teams-assistant-mcp', version: '0.4.1' },
+    { name: 'teams-assistant-mcp', version: '0.4.2' },
     {
       instructions:
         `Reads and posts in a fixed set of Microsoft Teams group chats as the account ` +
