@@ -264,8 +264,10 @@ the message when you re-read the chat. If catching edits matters, re-read instea
 the poll.
 
 Deleted messages read back with `isDeleted: true` and an emptied body. The agent's own
-`delete_chat_message` is the soft kind (Teams shows the "This message was deleted" stub and can
-restore it); there is no hard delete here.
+`delete_chat_message` is the soft kind (Teams shows the "This message was deleted" stub) and
+`undo_delete_chat_message` puts the original back; there is no hard delete here. Both act on
+the account's own messages only unless told `force` — the typical use is withdrawing something
+posted in the wrong chat, not tidying up after other people.
 
 Replies are quote-cards. Chats have no real threads (that is a channels feature), so
 `reply_chat_message` posts a normal message carrying a quote of the original at the bottom of the
@@ -277,7 +279,7 @@ read-only because their entry says `canPost: false`, not because anyone remember
 
 ## 8. Tool reference
 
-The sixteen tools, as registered in `src/server.ts`. All results are JSON text; errors
+The seventeen tools, as registered in `src/server.ts`. All results are JSON text; errors
 (including allowlist refusals) come back as readable text, not transport failures.
 
 | Tool | What it does | Input |
@@ -288,7 +290,8 @@ The sixteen tools, as registered in `src/server.ts`. All results are JSON text; 
 | `reply_chat_message` | Posts a quote-card reply to a specific message | `chatId`, `replyToMessageId`, `text`, `mentions?` |
 | `edit_chat_message` | Replaces the text of a message this account sent; Teams shows "Edited" | `chatId`, `messageId`, `newText`, `format?`, `mentions?` (same as `send_chat_message`) |
 | `react_to_chat_message` | Puts an emoji reaction on a message in an allowlisted chat | `chatId`, `messageId`, `emoji` |
-| `delete_chat_message` | Soft-deletes a message this account sent (restorable in Teams) | `chatId`, `messageId` |
+| `delete_chat_message` | Soft-deletes a message this account sent (restorable); refuses somebody else's message unless `force` | `chatId`, `messageId`, `force?` |
+| `undo_delete_chat_message` | Restores a soft-deleted message this account sent; same ownership rule | `chatId`, `messageId`, `force?` |
 | `send_chat_image` | Posts a PNG/JPEG that renders inline | `chatId`, `path?` or `base64?` (exactly one), `mime?` (required with base64), `text?` |
 | `send_chat_file` | Uploads to the account's OneDrive and shares into the chat as a file card, granting every other chat member read access on the uploaded item | `chatId`, `path`, `text?` |
 | `get_chat_attachment` | Downloads one attachment to `TEAMS_MCP_DOWNLOAD_DIR` and returns the path; pasted images appear as `inline-image-N` | `chatId`, `messageId`, `attachmentId?` (default: first) |
@@ -299,8 +302,12 @@ The sixteen tools, as registered in `src/server.ts`. All results are JSON text; 
 | `unpin_chat_message` | Unpins a message; refuses if it is not the one currently pinned | `chatId`, `messageId` |
 | `list_pinned_messages` | Lists what is currently pinned (at most one entry in practice), with a plain-text preview | `chatId` |
 
-Editing and deleting only work on the account's own messages; that is Graph's rule for delegated
-calls, and the server passes Graph's refusal through verbatim rather than pre-checking it.
+Editing only works on the account's own messages; that is Graph's rule for delegated calls, and
+the server passes Graph's refusal through verbatim rather than pre-checking it. Deleting and
+restoring are pre-checked on purpose: the message is fetched and its author compared with the
+signed-in account before anything is sent, and anyone else's message is refused — with the
+author named — unless `force` is true. Pass `force` only when a human has asked for it; see
+README's "Withdrawing a message" for the permission (`Chat.ReadWrite`) and the throttle story.
 
 `mentions` (`send_chat_message`/`reply_chat_message`/`edit_chat_message`) is a list of display
 names to actually NOTIFY, not just reference — resolved case-insensitively as an unambiguous
@@ -313,12 +320,15 @@ when to tag someone versus just naming them.
 
 ## The standalone CLIs
 
-Beside the server, `npm run build` produces nine commands under `dist/cli/` (also exposed as
+Beside the server, `npm run build` produces ten commands under `dist/cli/` (also exposed as
 package bins): `teams-post [--html] [--mention "Name"]...`, `teams-reply [--mention "Name"]...`,
 `teams-edit [--html] [--mention "Name"]...`, `teams-react`, `teams-read`, `teams-pin`,
-`teams-unpin`, `teams-send-file <chatId> <path> [more paths...] [--caption "text"]` and
+`teams-unpin`, `teams-send-file <chatId> <path> [more paths...] [--caption "text"]`,
 `teams-attachments <chatId> <messageId> [--list] [--name <filter>] [--out <dir>]` (download all,
-or `--list` for metadata only — see README's "Downloading attachments"). Same env
+or `--list` for metadata only — see README's "Downloading attachments") and `teams-delete
+<chatId> <messageId> [--undo] [--force]` (soft-delete one of the account's own messages, `--undo`
+to restore it, `--force` to skip the own-message check — see README's "Withdrawing a message").
+Same env
 vars, same allowlist, same send-reliability code paths as the server tools. `--html` on
 `teams-post`/`teams-edit` posts stdin as raw HTML verbatim, same contract as `format: 'html'`
 above; `--mention "Name"` (repeatable) works the same as the `mentions` tool parameter.

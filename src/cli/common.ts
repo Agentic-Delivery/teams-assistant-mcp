@@ -11,7 +11,7 @@ import type { MentionTarget, PinnedMessage } from '../graph/teams-chats.js';
 
 /**
  * Shared plumbing for the standalone CLIs (teams-post, teams-reply, teams-edit, teams-react,
- * teams-read, teams-send-file).
+ * teams-read, teams-send-file, teams-attachments, teams-delete).
  *
  * The output contract is the whole point, learned the hard way on 2026-08-24 when a caller
  * grepped for a success token the old ad-hoc script never printed and re-posted a broadcast
@@ -145,6 +145,48 @@ export function parseAttachmentFlags(args: readonly string[]): { list: boolean; 
     }
   }
   return { list, ...(name !== undefined ? { name } : {}), ...(out !== undefined ? { out } : {}) };
+}
+
+/**
+ * Parses teams-delete's trailing argv: a bare `--undo` (restore instead of delete) and a bare
+ * `--force` (skip the own-message check). No values, no positionals — anything else is refused
+ * loudly, same doctrine as parseAttachmentFlags above.
+ */
+export function parseDeleteFlags(args: readonly string[]): { undo: boolean; force: boolean } {
+  let undo = false;
+  let force = false;
+  for (const arg of args) {
+    if (arg === '--undo') {
+      undo = true;
+    } else if (arg === '--force') {
+      force = true;
+    } else {
+      usage(`teams-delete: unrecognised argument ${arg}`);
+    }
+  }
+  return { undo, force };
+}
+
+/**
+ * teams-delete's routing — same direct-call testability rationale as doPost below: a subprocess
+ * test stops at the allowlist gate either way, so which port method runs (delete or undo) and
+ * whether --force reached it can only be proven by calling this with a fake port. The
+ * own-message check itself lives in the port (GraphTeamsChats.assertOwnMessage), not here, so
+ * the MCP tool and this CLI cannot drift apart on it.
+ */
+export async function doDelete(
+  { chats, allowlist }: CliContext,
+  chatId: string,
+  messageId: string,
+  options: { undo: boolean; force: boolean },
+): Promise<{ action: 'delete' | 'undo-delete'; messageId: string; chat: string }> {
+  const entry = allowlist.assertPostable(chatId);
+  if (options.undo) {
+    await chats.undoDeleteMessage(chatId, messageId, { force: options.force });
+    return { action: 'undo-delete', messageId, chat: entry.label };
+  }
+  await chats.deleteMessage(chatId, messageId, { force: options.force });
+  return { action: 'delete', messageId, chat: entry.label };
 }
 
 /**

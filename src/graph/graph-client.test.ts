@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { GraphClient, GraphError } from './graph-client.js';
 import type { MembersCachePort } from './teams-chats.js';
-import { GraphTeamsChats, shareIdFor } from './teams-chats.js';
+import { GraphTeamsChats, MessageOwnershipError, shareIdFor } from './teams-chats.js';
 import type { TokenProvider } from '../auth/token-provider.js';
 
 const stubToken: TokenProvider = { kind: 'stub', getAccessToken: async () => 'the-token' };
@@ -327,18 +327,24 @@ describe('teams chats over graph', () => {
   });
 
   it('soft-deletes a message through the /me softDelete action, with no body', async () => {
-    const fetchFn = vi.fn(async () => new Response(null, { status: 204 }));
+    // Since 0.6.0 the delete checks ownership first (/me, then the message) — the full
+    // ownership behaviour has its own describe block further down; this test keeps its
+    // original job of pinning the wire shape of the action itself.
+    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
+      if (init.method === 'POST') return new Response(null, { status: 204 });
+      if (url.endsWith('/me?$select=id')) return json({ id: 'self-aad-id' });
+      return json({ id: 'm7', createdDateTime: '2026-08-19T08:00:00Z', from: { user: { id: 'self-aad-id', displayName: 'Assistant (AI)' } }, body: { contentType: 'text', content: 'oops' } });
+    });
     const chats = new GraphTeamsChats(
       new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     await chats.deleteMessage('19:a@thread.v2', 'm7');
 
-    const [url, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
-    expect(url).toBe(
+    const post = fetchFn.mock.calls.find(([, init]) => (init as RequestInit).method === 'POST') as unknown as [string, RequestInit];
+    expect(post[0]).toBe(
       'https://graph.microsoft.com/v1.0/me/chats/19%3Aa%40thread.v2/messages/m7/softDelete',
     );
-    expect(init.method).toBe('POST');
-    expect(init.body).toBeUndefined();
+    expect(post[1].body).toBeUndefined();
   });
 
   it('surfaces Graph\'s own refusal when editing someone else\'s message', async () => {
@@ -1269,5 +1275,195 @@ describe('graph client — the live-measured 62 s window is slept, not refused (
 
     expect(await client.get('/chats/x/messages/1')).toEqual({ id: 'fine' });
     expect(waits).toEqual([62_000]);
+  });
+});
+
+describe('teams chats — delete/undo act on this account\'s own messages only (0.6.0: withdrawing a message posted in the wrong chat)', () => {
+  const SELF = 'self-aad-id';
+  const message = (id: string, authorId: string, authorName: string, extra: Record<string, unknown> = {}) => ({
+    id,
+    createdDateTime: '2026-09-02T08:00:00Z',
+    from: { user: { id: authorId, displayName: authorName } },
+    body: { contentType: 'text', content: 'text' },
+    ...extra,
+  });
+
+  /** One fetch stub for the whole block: /me answers SELF, the message endpoint answers whatever
+   *  `target` is (or a 429 when `throttled`), the list answers `recent`, and every POST answers
+   *  `actionStatus` with `actionBody`. Returns the stub so a test can inspect the calls. */
+  function graph(options: {
+    me?: Response;
+    target?: unknown;
+    throttled?: boolean;
+    recent?: unknown[];
+    actionStatus?: number;
+    actionBody?: unknown;
+  }) {
+    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
+      if (init.method === 'POST') {
+        const status = options.actionStatus ?? 204;
+        return status === 204 ? new Response(null, { status }) : json(options.actionBody, status);
+      }
+      if (url.endsWith('/me?$select=id')) return options.me ?? json({ id: SELF });
+      if (/\/messages\/[^/?]+$/.test(url)) {
+        return options.throttled
+          ? new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 't' } }), { status: 429, headers: { 'retry-after': '62', 'content-type': 'application/json' } })
+          : json(options.target);
+      }
+      return json({ value: options.recent ?? [] });
+    });
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }),
+      { membersCache: noMembersCache },
+    );
+    const posts = () => fetchFn.mock.calls.filter(([, init]) => (init as RequestInit).method === 'POST').map(([url]) => String(url));
+    return { chats, fetchFn, posts };
+  }
+
+  it('own message: /me and the message are read, then softDelete is posted', async () => {
+    const { chats, posts } = graph({ target: message('m1', SELF, 'Assistant (AI)') });
+
+    await chats.deleteMessage('19:a@thread.v2', 'm1');
+
+    expect(posts()).toEqual(['https://graph.microsoft.com/v1.0/me/chats/19%3Aa%40thread.v2/messages/m1/softDelete']);
+  });
+
+  it('somebody else\'s message: refused by name, with the author named, and NOTHING posted', async () => {
+    const { chats, posts } = graph({ target: message('m2', 'aad-celine', 'Kleivdal, Celine') });
+
+    const error = (await chats.deleteMessage('19:a@thread.v2', 'm2').catch((c: unknown) => c)) as Error;
+
+    expect(error).toBeInstanceOf(MessageOwnershipError);
+    expect(error.name).toBe('MessageOwnershipError');
+    expect(error.message).toContain('Kleivdal, Celine');
+    expect(error.message).toContain('aad-celine');
+    expect(error.message).toMatch(/Nothing was changed/);
+    expect(error.message).toMatch(/force/);
+    expect(posts()).toEqual([]);
+  });
+
+  it('force: somebody else\'s message is deleted WITHOUT reading /me or the message first', async () => {
+    const { chats, fetchFn, posts } = graph({ target: message('m2', 'aad-celine', 'Kleivdal, Celine') });
+
+    await chats.deleteMessage('19:a@thread.v2', 'm2', { force: true });
+
+    expect(posts()).toEqual(['https://graph.microsoft.com/v1.0/me/chats/19%3Aa%40thread.v2/messages/m2/softDelete']);
+    // Force skips the whole gate — one request, the action itself. The single-message family
+    // may be throttled when a wrong-chat message needs withdrawing, so the gate must not be in
+    // the way once the caller has taken responsibility.
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('an unverifiable author (/me failed) is refused, not waved through', async () => {
+    const { chats, posts } = graph({
+      me: json({ error: { code: 'Forbidden', message: 'nope' } }, 403),
+      target: message('m1', SELF, 'Assistant (AI)'),
+    });
+
+    const error = (await chats.deleteMessage('19:a@thread.v2', 'm1').catch((c: unknown) => c)) as Error;
+
+    expect(error).toBeInstanceOf(MessageOwnershipError);
+    expect(error.message).toMatch(/could not be determined/);
+    expect(posts()).toEqual([]);
+  });
+
+  it('a system message (no user author at all) is not this account\'s, so it is refused too', async () => {
+    const { chats, posts } = graph({ target: { id: 'sys', createdDateTime: '2026-09-02T08:00:00Z', messageType: 'systemEventMessage', body: { content: '' } } });
+
+    await expect(chats.deleteMessage('19:a@thread.v2', 'sys')).rejects.toBeInstanceOf(MessageOwnershipError);
+    expect(posts()).toEqual([]);
+  });
+
+  it('the ownership read uses fetchMessage, so a throttled single-message family falls back to the list scan', async () => {
+    const { chats, posts } = graph({
+      throttled: true,
+      recent: [message('other', 'aad-celine', 'Kleivdal, Celine'), message('m1', SELF, 'Assistant (AI)')],
+    });
+
+    await chats.deleteMessage('19:a@thread.v2', 'm1');
+
+    expect(posts()).toEqual(['https://graph.microsoft.com/v1.0/me/chats/19%3Aa%40thread.v2/messages/m1/softDelete']);
+  });
+
+  it('a 403 on the action names Chat.ReadWrite and the custom-app-registration cause, Graph\'s words kept', async () => {
+    const { chats } = graph({
+      target: message('m1', SELF, 'Assistant (AI)'),
+      actionStatus: 403,
+      actionBody: { error: { code: 'Forbidden', message: 'Missing scope permissions on the request.' } },
+    });
+
+    const error = (await chats.deleteMessage('19:a@thread.v2', 'm1').catch((c: unknown) => c)) as GraphError;
+
+    expect(error).toBeInstanceOf(GraphError);
+    expect(error.status).toBe(403);
+    expect(error.code).toBe('Forbidden');
+    expect(error.message).toContain('Chat.ReadWrite');
+    expect(error.message).toContain('admin consent');
+    expect(error.message).toContain('TEAMS_MCP_CLIENT_ID');
+    expect(error.message).toContain('Missing scope permissions on the request.');
+  });
+
+  it('the licence 403 is left alone — it has its own name and its own fix', async () => {
+    const { chats } = graph({
+      target: message('m1', SELF, 'Assistant (AI)'),
+      actionStatus: 403,
+      actionBody: { error: { code: 'UnknownError', message: 'Failed to get license information for the user' } },
+    });
+
+    const error = (await chats.deleteMessage('19:a@thread.v2', 'm1').catch((c: unknown) => c)) as GraphError;
+
+    expect(error.isLicenceProblem).toBe(true);
+    expect(error.message).not.toContain('Chat.ReadWrite');
+  });
+
+  it('a non-403 failure on the action passes through untouched, Retry-After included', async () => {
+    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
+      if (init.method === 'POST') return new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'slow down' } }), { status: 429, headers: { 'retry-after': '62', 'content-type': 'application/json' } });
+      if (url.endsWith('/me?$select=id')) return json({ id: SELF });
+      return json(message('m1', SELF, 'Assistant (AI)'));
+    });
+    const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }), { membersCache: noMembersCache });
+
+    await expect(chats.deleteMessage('19:a@thread.v2', 'm1')).rejects.toMatchObject({ status: 429, code: 'TooManyRequests', retryAfterSeconds: 62 });
+  });
+
+  it('undo: the same gate, then undoSoftDelete — a deleted message still reads back with its author', async () => {
+    const { chats, posts } = graph({ target: message('m1', SELF, 'Assistant (AI)', { deletedDateTime: '2026-09-02T09:00:00Z', body: { content: '' } }) });
+
+    await chats.undoDeleteMessage('19:a@thread.v2', 'm1');
+
+    expect(posts()).toEqual(['https://graph.microsoft.com/v1.0/me/chats/19%3Aa%40thread.v2/messages/m1/undoSoftDelete']);
+  });
+
+  it('undo: somebody else\'s deleted message is refused the same way, the verb says "restore"', async () => {
+    const { chats, posts } = graph({ target: message('m2', 'aad-celine', 'Kleivdal, Celine', { deletedDateTime: '2026-09-02T09:00:00Z' }) });
+
+    const error = (await chats.undoDeleteMessage('19:a@thread.v2', 'm2').catch((c: unknown) => c)) as Error;
+
+    expect(error).toBeInstanceOf(MessageOwnershipError);
+    expect(error.message).toMatch(/Refusing to restore message m2/);
+    expect(posts()).toEqual([]);
+  });
+
+  it('undo with force posts undoSoftDelete straight away', async () => {
+    const { chats, fetchFn, posts } = graph({});
+
+    await chats.undoDeleteMessage('19:a@thread.v2', 'm2', { force: true });
+
+    expect(posts()).toEqual(['https://graph.microsoft.com/v1.0/me/chats/19%3Aa%40thread.v2/messages/m2/undoSoftDelete']);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('undo: a 403 gets the same Chat.ReadWrite diagnosis, naming undoSoftDelete', async () => {
+    const { chats } = graph({
+      target: message('m1', SELF, 'Assistant (AI)'),
+      actionStatus: 403,
+      actionBody: { error: { code: 'Forbidden', message: 'Missing scope permissions on the request.' } },
+    });
+
+    const error = (await chats.undoDeleteMessage('19:a@thread.v2', 'm1').catch((c: unknown) => c)) as GraphError;
+
+    expect(error.message).toMatch(/refused undoSoftDelete/);
+    expect(error.message).toContain('Chat.ReadWrite');
   });
 });

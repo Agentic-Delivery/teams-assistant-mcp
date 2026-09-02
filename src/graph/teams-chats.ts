@@ -53,6 +53,24 @@ export interface OutboundFile {
   contentType?: string;
 }
 
+export interface MessageActionOptions {
+  /** Skip the own-message check — see TeamsChatsPort.deleteMessage. */
+  force?: boolean;
+}
+
+/**
+ * The refusal deleteMessage/undoDeleteMessage raise BEFORE touching Graph when the target was not
+ * written by the signed-in account (or its author could not be verified) and `force` was not
+ * given. Its own class so a caller can tell "you asked for someone else's message" apart from a
+ * Graph failure — and can choose to retry with force if that is really what they meant.
+ */
+export class MessageOwnershipError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'MessageOwnershipError';
+  }
+}
+
 /**
  * Secondary port for Teams chats. Everything above it (the MCP tools) speaks ChatSummary and
  * ChatMessage, never Graph JSON, so a different backing API or a test double swaps in here.
@@ -90,7 +108,19 @@ export interface TeamsChatsPort {
   editMessage(chatId: string, messageId: string, newText: string, mentions?: readonly MentionTarget[]): Promise<void>;
   /** Same verbatim contract as sendHtmlMessage, applied to an edit. */
   editHtmlMessage(chatId: string, messageId: string, html: string, mentions?: readonly MentionTarget[]): Promise<void>;
-  deleteMessage(chatId: string, messageId: string): Promise<void>;
+  /**
+   * Soft-deletes a message — Graph's reversible kind: Teams shows the "This message was deleted"
+   * stub, and undoDeleteMessage puts it back. There is deliberately no hard delete anywhere here.
+   *
+   * Own messages only, unless `force`: the message is fetched first and its author compared with
+   * the signed-in account's own id; a message somebody else wrote is refused with a
+   * MessageOwnershipError, before anything is sent. So is a message whose author cannot be
+   * verified (the /me lookup failed). `force: true` skips that check entirely and sends the
+   * action as-is — Graph then decides, and its refusal comes back verbatim (0.6.0).
+   */
+  deleteMessage(chatId: string, messageId: string, options?: MessageActionOptions): Promise<void>;
+  /** Reverses a soft delete. Same ownership rule and `force` escape as deleteMessage (0.6.0). */
+  undoDeleteMessage(chatId: string, messageId: string, options?: MessageActionOptions): Promise<void>;
   setReaction(chatId: string, messageId: string, reactionType: string): Promise<void>;
   getAttachment(chatId: string, messageId: string, attachmentId?: string): Promise<AttachmentPayload>;
   /**
@@ -796,12 +826,93 @@ export class GraphTeamsChats implements TeamsChatsPort {
     );
   }
 
-  async deleteMessage(chatId: string, messageId: string): Promise<void> {
+  async deleteMessage(chatId: string, messageId: string, options: MessageActionOptions = {}): Promise<void> {
     // The reversible soft delete — the message becomes "This message was deleted" in Teams and
-    // can be restored. Hard delete is deliberately not offered here.
-    await this.graph.postAction(
-      `/me/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}/softDelete`,
-    );
+    // undoDeleteMessage restores it. Hard delete is deliberately not offered here.
+    await this.assertOwnMessage(chatId, messageId, options, 'delete');
+    await this.messageAction(chatId, messageId, 'softDelete');
+  }
+
+  async undoDeleteMessage(chatId: string, messageId: string, options: MessageActionOptions = {}): Promise<void> {
+    // A soft-deleted message still reads back with its author (only the body is emptied), so
+    // the same ownership check applies — restoring somebody else's message into a chat is no
+    // more casual an act than deleting it.
+    await this.assertOwnMessage(chatId, messageId, options, 'restore');
+    await this.messageAction(chatId, messageId, 'undoSoftDelete');
+  }
+
+  /**
+   * The own-message gate behind deleteMessage/undoDeleteMessage. The message is fetched (through
+   * fetchMessage, so the single-message throttle falls back to the list scan the same way a
+   * quoted reply does) and its author id compared with the signed-in account's. Two things are
+   * refused, both BEFORE any action is sent: a message by somebody else, and a message whose
+   * author cannot be verified because /me failed — an unverifiable author is not a licence to
+   * proceed, same posture as sendFile's pre-upload refusal. `force` skips the whole gate,
+   * including the fetch: the caller has said "this one, whoever wrote it", and a throttled
+   * single-message family must not stand between them and a message they need gone.
+   */
+  private async assertOwnMessage(
+    chatId: string,
+    messageId: string,
+    options: MessageActionOptions,
+    verb: 'delete' | 'restore',
+  ): Promise<void> {
+    if (options.force) {
+      return;
+    }
+    const selfId = await this.resolveSelfId();
+    if (selfId === undefined) {
+      throw new MessageOwnershipError(
+        `Refusing to ${verb} message ${messageId} in chat ${chatId}: the signed-in account's own id ` +
+          'could not be determined (the /me lookup failed), so the message\'s author could not be ' +
+          'verified as this account. Nothing was changed — try again once /me is reachable, or pass ' +
+          'force to skip the check.',
+      );
+    }
+    const target = await this.fetchMessage(chatId, messageId);
+    if (target.fromId !== selfId) {
+      throw new MessageOwnershipError(
+        `Refusing to ${verb} message ${messageId} in chat ${chatId}: it was written by ` +
+          `${target.from}${target.fromId ? ` (${target.fromId})` : ''}, not by this account. ` +
+          'Nothing was changed. Pass force to act on it anyway.',
+      );
+    }
+  }
+
+  /**
+   * The softDelete/undoSoftDelete actions share one shape: a body-less POST under /me answering
+   * 204, needing the delegated Chat.ReadWrite permission (Graph reference, chatMessage: softDelete
+   * and undoSoftDelete, v1.0). With the shipped setup — a Microsoft first-party client id and the
+   * `.default` scope — the token already carries it. A 403 that is not the licence problem is
+   * therefore almost always a custom TEAMS_MCP_CLIENT_ID whose registration never asked for (or
+   * was never consented) that permission, and the error says so in one message, Graph's own
+   * words kept — same treatment the SharePoint download 403 got in 0.5.0.
+   */
+  private async messageAction(
+    chatId: string,
+    messageId: string,
+    action: 'softDelete' | 'undoSoftDelete',
+  ): Promise<void> {
+    try {
+      await this.graph.postAction(
+        `/me/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}/${action}`,
+      );
+    } catch (caught) {
+      if (caught instanceof GraphError && caught.status === 403 && !caught.isLicenceProblem) {
+        throw new GraphError(
+          `Graph refused ${action} on message ${messageId} (403${caught.code ? ` ${caught.code}` : ''}): ` +
+            'the signed-in token may not delete or restore chat messages. With the default Microsoft ' +
+            'first-party client id this works without any setup; if TEAMS_MCP_CLIENT_ID is a custom app ' +
+            'registration, that registration needs the delegated Chat.ReadWrite Graph permission, and ' +
+            'granting it may require admin consent. Graph said: ' +
+            caught.message,
+          caught.status,
+          caught.code,
+          caught.retryAfterSeconds,
+        );
+      }
+      throw caught;
+    }
   }
 
   async setReaction(chatId: string, messageId: string, reactionType: string): Promise<void> {
