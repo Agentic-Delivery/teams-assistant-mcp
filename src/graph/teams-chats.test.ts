@@ -89,6 +89,19 @@ describe('GraphTeamsChats.resolveMentions — member cache (0.4.1, live-diagnose
     ]);
   });
 
+  // 2026-09-02 review NIT: cacheIfNonEmpty applies the "never persist an empty answer" principle
+  // (originally sendFile-only) to resolveMentions too, in the one shared place both callers use.
+  it('an empty refresh (Graph genuinely reports nobody) is never persisted to the cache either', async () => {
+    const cache = new MembersCache({ path });
+    const { fetchFn } = countingMembersFetch(() => json({ value: [] }));
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    await expect(chats.resolveMentions(CHAT, ['Shiv'])).rejects.toThrow(
+      /No chat member matches mention "Shiv"/,
+    );
+    expect(cache.get(CHAT)).toBeUndefined();
+  });
+
   it('a name the cache does not have refreshes once, then still fails with the existing clear error', async () => {
     const cache = new MembersCache({ path });
     cache.set(CHAT, [{ id: 'aad-shiv', displayName: 'Garg, Shivankit' }]);
@@ -120,6 +133,10 @@ describe('GraphTeamsChats.resolveMentions — member cache (0.4.1, live-diagnose
     // sole renderer, so it is never stated twice on the surfaces that actually show it to someone).
     expect((error as GraphError).retryAfterSeconds).toBe(62);
     expect((error as GraphError).message).not.toMatch(/retry after|\d+s/);
+    // 2026-09-02 re-review MINOR: the refreshMembers extraction (shared with membersForInvite)
+    // dropped this exact reassurance clause once already — pinned here so it cannot regress a
+    // second time silently (same shape of loss as 0.4.1's Retry-After dropping off the MCP path).
+    expect((error as GraphError).message).toMatch(/does not mean the name does not exist/);
     expect(calls).toHaveLength(1);
   });
 
@@ -395,6 +412,49 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
     ).rejects.toThrow(/grant|invite/i);
   });
 
+  // MAJOR 2 (2026-09-02 re-review): grantedToIdentitiesV2 is a documented Graph variant some
+  // permission kinds use — several recipients' grants folded under ONE permission entry, an
+  // array, instead of one grantedToV2 entry per recipient. Both are live-verified wire shapes
+  // (see KNOWN-ISSUES.md); tolerating this one too means a shape drift degrades to acceptance,
+  // not a false outage.
+  it('accepts grantedToIdentitiesV2[].user.id as an equivalent grant echo — a documented Graph variant, not a false failure', async () => {
+    const cache = new MembersCache({ path });
+    cache.set(CHAT, [
+      { id: 'aad-self', displayName: 'Assistant (AI)' },
+      { id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+      { id: 'aad-johan', displayName: 'Spännare, Johan' },
+    ]);
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) return selfIdResponse();
+      if (u.includes('/root:') && method === 'PUT') return uploadResponse();
+      if (u.includes('/invite')) {
+        return json({
+          value: [
+            {
+              grantedToIdentitiesV2: [{ user: { id: 'aad-shiv' } }, { user: { id: 'aad-johan' } }],
+            },
+          ],
+        });
+      }
+      if (u.includes('/messages') && method === 'POST') {
+        return json({
+          id: 'msg-identities-variant',
+          chatId: CHAT,
+          createdDateTime: '2026-09-02T10:00:00Z',
+          body: { contentType: 'html', content: '' },
+        });
+      }
+      throw new Error(`unexpected call in this test: ${method} ${u}`);
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    const sent = await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
+
+    expect(sent.id).toBe('msg-identities-variant');
+  });
+
   it('an empty/unresolvable member roster fails BEFORE the upload — no orphaned OneDrive item, and nothing useless is cached', async () => {
     const cache = new MembersCache({ path }); // never warmed -> triggers a refresh
     const fetchFn = vi.fn(async (url: string) => {
@@ -490,14 +550,18 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
   // TRUE for every member who has an id and FALSE for every member who does NOT — i.e. it kept
   // the real assistant "as an other" and silently treated the id-less member as if THEY were
   // self, dropping them out of the exclusion set and out of the "who is unresolvable" check
-  // entirely. Reproduced verbatim: roster [{id:'aad-self'}, {displayName:'No Id Person'}] with
-  // /me answering 403 used to invite the assistant, post the message, and leave the id-less real
-  // member with a dead card. It must now fail loudly instead, before ever reaching the upload.
-  it('BLOCKER regression: a failed self-id lookup must not disguise an id-less real member as "self"', async () => {
+  // entirely. MAJOR 1 (2026-09-02 re-review) went further: the FIRST fix's fallback — include
+  // everyone, self included, as a "harmless but noisy" grant when self is undetermined — still
+  // meant a /me outage orphaned one upload per sendFile attempt for its entire duration, with no
+  // clean pre-upload signal. This version refuses BEFORE the upload instead, for any reason /me
+  // could not be resolved — no orphan, no partial roster analysis, no dependency on what else is
+  // in the roster (an id-less member or not).
+  it('a failed self-id lookup refuses BEFORE the upload — no orphan, regardless of roster shape', async () => {
     const cache = new MembersCache({ path });
     cache.set(CHAT, [
       { id: 'aad-self', displayName: 'Assistant (AI)' },
-      { displayName: 'No Id Person' }, // Graph reported no id for this REAL member
+      { displayName: 'No Id Person' }, // Graph reported no id for this REAL member — irrelevant
+      // here: the /me failure itself is refused on before this roster shape is ever examined.
     ]);
     const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
       const u = String(url);
@@ -511,15 +575,49 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
 
     await expect(
       chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' }),
-    ).rejects.toThrow(/AAD id|grant/i);
+    ).rejects.toThrow(/determined|\/me/i);
+  });
+
+  // MAJOR 1 follow-up (2026-09-02 re-review): a 429 on the OPTIONAL-looking /me lookup used to
+  // cost a real Retry-After sleep before failing anyway — now that an undetermined self id
+  // refuses the whole send regardless of the reason, sleeping through the throttle only to still
+  // refuse serves no purpose. readRetries: 0 on that GET means GraphClient never sleeps for it;
+  // proven here with a REAL GraphClient (not a stub) and a spied sleepFn a mutation to that
+  // option would cause to actually be invoked.
+  it('a /me 429 is never slept through — sendFile refuses immediately rather than waiting out Retry-After', async () => {
+    const cache = new MembersCache({ path });
+    cache.set(CHAT, [
+      { id: 'aad-self', displayName: 'Assistant (AI)' },
+      { id: 'aad-bob', displayName: 'Bob Brown' },
+    ]);
+    const sleepFn = vi.fn(async () => {});
+    const fetchFn = vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes('/me?') && u.includes('select=id')) {
+        return json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
+          'retry-after': '5', // short enough that a real sleep would NOT fast-fail on its own
+        });
+      }
+      throw new Error(`unexpected call — upload/invite/message must never be reached: ${u}`);
+    });
+    const graph = new GraphClient({
+      tokenProvider: stubToken,
+      fetchFn: fetchFn as unknown as typeof fetch,
+      sleepFn,
+    });
+    const chats = new GraphTeamsChats(graph, { membersCache: cache });
+
+    await expect(
+      chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' }),
+    ).rejects.toThrow(/determined|\/me/i);
+    expect(sleepFn).not.toHaveBeenCalled();
   });
 
   // BLOCKER fix, second half: a failed self-id lookup is NOT memoized for the process/instance
   // lifetime — the next sendFile call on the SAME GraphTeamsChats retries it. First call: /me
-  // fails, self is undetermined, so BOTH the real self and the other member get invited (the
-  // documented "harmless but noisy" outcome). Second call: /me now succeeds, and self is
-  // properly excluded from the grant this time.
-  it('a failed self-id lookup is retried on the NEXT sendFile call, not stuck forever', async () => {
+  // fails, self undetermined -> refused before touching upload/invite/message at all (MAJOR 1).
+  // Second call: /me now succeeds, and self is properly excluded from the grant, send lands.
+  it('a failed self-id lookup is retried on the NEXT sendFile call — first refuses, second recovers', async () => {
     const cache = new MembersCache({ path });
     cache.set(CHAT, [
       { id: 'aad-self', displayName: 'Assistant (AI)' },
@@ -557,14 +655,15 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
     });
     const chats = subject(fetchFn as unknown as typeof fetch, cache);
 
-    await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
-    await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
+    // First call: /me fails -> refused before ever touching upload/invite/message.
+    await expect(
+      chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' }),
+    ).rejects.toThrow(/determined|\/me/i);
+    expect(invitedObjectIds).toHaveLength(0);
 
-    // First call: self undetermined -> both the real self and the other member are invited.
-    expect(invitedObjectIds[0]).toEqual(expect.arrayContaining(['aad-self', 'aad-bob']));
-    expect(invitedObjectIds[0]).toHaveLength(2);
-    // Second call: self resolved -> only the other member is invited.
-    expect(invitedObjectIds[1]).toEqual(['aad-bob']);
+    // Second call: /me now succeeds -> self is properly excluded and the send lands.
+    await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
+    expect(invitedObjectIds).toEqual([['aad-bob']]);
   });
 
   it('a chat with no OTHER members (assistant-only roster) skips the invite entirely and still sends', async () => {
