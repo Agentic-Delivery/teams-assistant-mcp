@@ -1,16 +1,26 @@
 
-## send_chat_file: recipients get no permission on the uploaded item (found 2026-08-20)
+## send_chat_file: recipients get no permission on the uploaded item (found 2026-08-20, fixed 0.4.2)
 
-The tool uploads to the signed-in account's OneDrive and posts a file-reference card, but never
-grants the chat's members permission on the drive item. In a one-on-one or meeting chat the
-recipient hits "request access", and the request lands in the service account's unread mailbox.
-Observed live: a chat member could not open a file the assistant had shared; fixed by hand with
-a Graph `POST /me/drive/items/{id}/invite` (roles: read, sendInvitation: false), which worked
-instantly.
+The tool uploaded to the signed-in account's OneDrive and posted a file-reference card, but never
+granted the chat's members permission on the drive item. Recipients hit "can't be viewed or
+downloaded" (a group chat) or "request access" (a one-on-one/meeting chat), and the request landed
+in the service account's unread mailbox. Observed live twice: first 2026-08-20 (fixed by hand with
+a Graph `POST /me/drive/items/{id}/invite`, roles: read, sendInvitation: false, which worked
+instantly), then again 2026-09-02 confirming the tool itself was still unfixed — a sent file's
+permissions listed ONLY `{roles:["owner"], to: the assistant account}` until the same manual invite
+was repeated per chat member.
 
-Fix direction: after upload, enumerate the chat's members (`GET /chats/{id}/members`) and invite
-each with read role before posting the card — or create an organization link scoped share if
-policy allows. Until then, senders must expect the access-request dead end.
+**Fixed 0.4.2**: `GraphTeamsChats.sendFile` now grants each OTHER chat member read access on the
+uploaded item (that same `/invite` call) BEFORE posting the chat message, resolved through the
+same cache-backed member roster resolveMentions already uses — never a direct call to the
+throttled `/chats/{id}/members` endpoint on the send path (see README's "@mentions" section for
+why that endpoint is avoided on sends). The assistant's own id is excluded from the grant when it
+can be determined (it already owns the item as uploader). An unresolvable/empty roster, or other
+real members none of whom has an AAD id Graph reported, now fails the send loudly BEFORE the
+upload; a failed `/invite` call fails loudly AFTER the upload (which is then left orphaned in
+OneDrive — unavoidable, since the invite needs the uploaded item's id) and BEFORE the chat message
+post. See `GraphTeamsChats.sendFile`'s own doc comment (`src/graph/teams-chats.ts`) for the full
+failure contract; a card the recipients cannot open is refused rather than ever posted.
 
 ## Inbox poller: two server instances race on the same inbox (found 2026-08-21)
 
