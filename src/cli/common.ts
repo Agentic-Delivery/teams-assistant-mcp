@@ -1,3 +1,5 @@
+import { readFile } from 'node:fs/promises';
+import { basename } from 'node:path';
 import { buildChats } from '../build-chats.js';
 import { ChatNotAllowedError, type ChatAllowlist } from '../allowlist.js';
 import { loadConfig } from '../config.js';
@@ -7,7 +9,7 @@ import type { MentionTarget, PinnedMessage } from '../graph/teams-chats.js';
 
 /**
  * Shared plumbing for the standalone CLIs (teams-post, teams-reply, teams-edit, teams-react,
- * teams-read).
+ * teams-read, teams-send-file).
  *
  * The output contract is the whole point, learned the hard way on 2026-08-24 when a caller
  * grepped for a success token the old ad-hoc script never printed and re-posted a broadcast
@@ -59,6 +61,38 @@ export function parseSendFlags(args: readonly string[]): { html: boolean; mentio
     }
   }
   return { html, mentions, rest };
+}
+
+/**
+ * Parses teams-send-file's trailing argv: an optional `--caption <text>` (anywhere among the
+ * positionals, same flag-anywhere convention as --mention above) and one or more positional file
+ * paths, in order. Unlike parseSendFlags there is no `rest` — every non-flag argument here IS a
+ * path, so a stray typo'd flag would otherwise be silently uploaded as a literal filename; letting
+ * every non-`--caption` argument through as a path is deliberate, not an oversight.
+ */
+export function parseSendFileFlags(args: readonly string[]): { caption?: string; paths: string[] } {
+  let caption: string | undefined;
+  const paths: string[] = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--caption') {
+      const value = args[i + 1];
+      // Same reasoning as --mention's identical guard above: a missing or flag-like value fails
+      // loudly here instead of silently uploading "--caption" (or nothing) as a caption/path.
+      if (value === undefined || value.startsWith('--')) {
+        usage(
+          value === undefined
+            ? '--caption needs a value'
+            : `--caption needs a value, got "${value}" which looks like a flag`,
+        );
+      }
+      caption = value;
+      i += 1;
+    } else {
+      paths.push(arg as string);
+    }
+  }
+  return { ...(caption !== undefined ? { caption } : {}), paths };
 }
 
 /** Resolves --mention names against the chat's member list, or [] when none were given — same
@@ -129,6 +163,35 @@ export async function doReply(
 }
 
 /**
+ * teams-send-file's per-path plumbing. One `chats.sendFile` call per path, in order; `caption`
+ * (from --caption) is applied to the FIRST file only — a caption on every card in a multi-file
+ * send would repeat the same text under each one, which is never what a caller wants when they
+ * pass several paths in one invocation. The allowlist gate runs BEFORE any file is read from
+ * disk, same ordering as doPost/doReply/doEdit above: a chat without canPost is refused without
+ * even touching the filesystem.
+ */
+export async function doSendFile(
+  { chats, allowlist }: CliContext,
+  chatId: string,
+  paths: readonly string[],
+  caption?: string,
+): Promise<Array<{ action: 'send-file'; id: string; chat: string; name: string; bytes: number }>> {
+  const entry = allowlist.assertPostable(chatId);
+  const results: Array<{ action: 'send-file'; id: string; chat: string; name: string; bytes: number }> = [];
+  for (const [index, filePath] of paths.entries()) {
+    const buffer = await readFile(filePath);
+    const name = basename(filePath);
+    const sent = await chats.sendFile(
+      chatId,
+      { bytes: new Uint8Array(buffer), name },
+      index === 0 ? caption : undefined,
+    );
+    results.push({ action: 'send-file', id: sent.id, chat: entry.label, name, bytes: buffer.byteLength });
+  }
+  return results;
+}
+
+/**
  * teams-pin's confirm-before-claiming-success check — same reasoning as pin_chat_message in
  * server.ts: Graph reporting the pinMessage POST as a success is not proof the pin landed, only
  * the re-list pinMessage itself returns is. Duplicated here (not shared with server.ts) because
@@ -166,6 +229,19 @@ export function readStdin(): Promise<string> {
  *  bigger than the 64 KiB pipe buffer would otherwise be truncated mid-JSON with exit 0. */
 export function succeed(payload: Record<string, unknown>): void {
   process.stdout.write(`${JSON.stringify({ ok: true, ...payload })}\n`, () => process.exit(0));
+}
+
+/**
+ * teams-send-file's multi-file variant of succeed(): one JSON line per sent file, same {ok, ...}
+ * shape and same drain-before-exit discipline as succeed() above — a single write of every line
+ * joined by newlines, exit(0) only once that write's callback fires (see succeed()'s own comment
+ * for the 64 KiB pipe-truncation hazard this avoids). An empty `payloads` still writes nothing and
+ * exits 0 rather than writing a blank line — callers of this function already guarantee at least
+ * one file was sent by the time it is called.
+ */
+export function succeedMany(payloads: ReadonlyArray<Record<string, unknown>>): void {
+  const lines = payloads.map((payload) => JSON.stringify({ ok: true, ...payload }));
+  process.stdout.write(lines.length > 0 ? `${lines.join('\n')}\n` : '', () => process.exit(0));
 }
 
 export function usage(text: string): never {
