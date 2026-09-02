@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -1180,5 +1180,75 @@ describe('teams-attachments — usage refusals (subprocess: the argv contract, e
 
     expect(result.code).toBe(3);
     expect(result.stdout).toBe('');
+  });
+});
+
+describe('teams-attachments — the quota yield (0.5.0: a running daemon starved ad-hoc reads, measured 2026-09-02)', () => {
+  const allowlist = new ChatAllowlist([{ id: '19:r@thread.v2', label: 'watched chat', canPost: false }]);
+
+  function reliableWith(overrides: Partial<TeamsChatsPort>): ReliableTeamsChats {
+    return new ReliableTeamsChats(overrides as TeamsChatsPort, {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+  }
+
+  it('doDownloadAttachments holds the yield file across the Graph work and releases it after', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'teams-attachments-yield-'));
+    const yieldPath = join(dir, 'inbox-yield.json');
+    let stoodDuringRead = false;
+    const getAttachments = vi.fn(async () => {
+      stoodDuringRead = existsSync(yieldPath);
+      return [{ bytes: new Uint8Array([1]), contentType: 'application/pdf', name: 'plan.pdf' }];
+    });
+
+    await doDownloadAttachments(
+      { chats: reliableWith({ getAttachments }), allowlist },
+      '19:r@thread.v2',
+      'msg-7',
+      { out: dir, yieldPath },
+    );
+
+    expect(stoodDuringRead).toBe(true); // the poller sees this and sits the cycle out
+    expect(existsSync(yieldPath)).toBe(false); // released the moment the Graph work is done
+  });
+
+  it('a failed download releases the yield too — a dead CLI must not silence the inbox until the deadline', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'teams-attachments-yield-'));
+    const yieldPath = join(dir, 'inbox-yield.json');
+    const getAttachments = vi.fn(async () => {
+      throw new GraphError('throttled', 429, 'TooManyRequests', 62);
+    });
+
+    await expect(
+      doDownloadAttachments(
+        { chats: reliableWith({ getAttachments }), allowlist },
+        '19:r@thread.v2',
+        'msg-7',
+        { out: dir, yieldPath },
+      ),
+    ).rejects.toThrow('throttled');
+
+    expect(existsSync(yieldPath)).toBe(false);
+  });
+
+  it('doListAttachments yields the same way', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'teams-attachments-yield-'));
+    const yieldPath = join(dir, 'inbox-yield.json');
+    let stoodDuringRead = false;
+    const listAttachments = vi.fn(async () => {
+      stoodDuringRead = existsSync(yieldPath);
+      return [];
+    });
+
+    await doListAttachments(
+      { chats: reliableWith({ listAttachments }), allowlist },
+      '19:r@thread.v2',
+      'msg-7',
+      { yieldPath },
+    );
+
+    expect(stoodDuringRead).toBe(true);
+    expect(existsSync(yieldPath)).toBe(false);
   });
 });

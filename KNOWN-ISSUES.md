@@ -1,3 +1,31 @@
+## The inbox poller starves ad-hoc reads on the same mailbox (measured 2026-09-02, mitigated 0.5.0)
+
+Graph's read quota is per mailbox (client id + signed-in user together — see README "Throttle
+budgets are per client id"), and a running inbox poller consumes it continuously. Measured live
+2026-09-02: with the daemon polling, ad-hoc single-message GETs (`/chats/{id}/messages/{id}`)
+answered 429 with `retry-after: 62` on EVERY attempt across 20+ minutes of patient
+Retry-After-honouring backoff. Waiting is not enough: the waiting caller and the poller draw on
+one budget, and the poller spends the replenishment the moment each window reopens. Attachment
+downloads — reads by nature, and bursty — were dead on arrival next to a running poller.
+
+**Mitigated 0.5.0**, three layers:
+
+1. **Quota yield** (`src/inbox-yield.ts`): the attachment tools and the `teams-attachments` CLI
+   write `inbox-yield.json` next to the inbox before touching Graph; every poller checks it at
+   the top of each cycle and skips polling while it stands (logged once per yield, counted as a
+   clean cycle so backoff never doubles); the file is removed when the reads finish, failure
+   included, and its deadline (3 min default, 10 min hard cap) bounds what a crashed reader can
+   silence. Works in-process and cross-process alike — the poller never cares who wrote it.
+2. **The retry sleep cap moved off Microsoft's number**: `MAX_RETRY_SLEEP_MS` was a round 60s —
+   one second UNDER the 62s window Graph actually names on this family, so every honest single
+   retry was refused as "too long to sleep" by exactly that margin. It is 90s since 0.5.0.
+3. **`TEAMS_INBOX_POLL_SECONDS`**: the poll interval (default 30s) is now a knob, for
+   deployments where the same account routinely serves ad-hoc reads.
+
+Not fixed, by design: two ad-hoc readers in ONE process can release each other's yield early
+(cost: one contended poll cycle), and the poller checks the yield once per cycle, so a yield
+written mid-cycle waits for the next one.
+
 
 ## send_chat_file: recipients get no permission on the uploaded item (found 2026-08-20, fixed 0.4.2)
 

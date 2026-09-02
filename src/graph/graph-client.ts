@@ -59,7 +59,15 @@ export const DEFAULT_THROTTLE_WINDOW_MS = 30_000;
  * with the 429 and the gate keeps everyone else honest until the window really passes.
  */
 const MAX_THROTTLE_WINDOW_MS = 60 * 60_000;
-export const MAX_RETRY_SLEEP_MS = 60_000;
+/**
+ * 90s, not the round 60s it used to be: the throttle window Graph actually names live on this
+ * endpoint family is `retry-after: 62` (measured repeatedly 2026-09-02) — one wall-clock second
+ * above the old cap, so every honest single retry was refused as "too long to sleep" by exactly
+ * the margin of Microsoft's own number. The cap still exists and still means what it meant — a
+ * call must not hang for minutes — it just no longer sits inside the one window Graph is known
+ * to hand out.
+ */
+export const MAX_RETRY_SLEEP_MS = 90_000;
 
 const RETRYABLE_READ_STATUSES = new Set([429, 503, 504]);
 /** Graph collections whose next path segment is an id — the shape of a resource family. Only the

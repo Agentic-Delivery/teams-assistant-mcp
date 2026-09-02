@@ -176,8 +176,13 @@ The recommended consumption pattern: arm a file watcher (Claude Code's `Monitor`
 inotify) on the inbox path at session start and react per line. Do not poll the tools for new
 messages any more.
 
-Two knobs: `TEAMS_INBOX_PATH` moves the inbox (the sidecar follows it), and
-`TEAMS_INBOX_DISABLED=1` switches the poller off entirely for consumers that only post.
+Three knobs: `TEAMS_INBOX_PATH` moves the inbox (the sidecar and the quota-yield file follow
+it), `TEAMS_INBOX_POLL_SECONDS` changes the 30s poll interval (the poller is the main consumer
+of the per-mailbox Graph read budget — see "Downloading attachments" for the measured
+consequences), and `TEAMS_INBOX_DISABLED=1` switches the poller off entirely for consumers that
+only post. The poller also honours the quota-yield file the attachment tools write — while it
+stands, cycles are skipped (logged once per yield, not per cycle) and the backoff does not
+double, so polling resumes at the normal cadence the moment the yield lifts.
 
 ## Downloading attachments
 
@@ -211,11 +216,27 @@ registration needs the delegated `Files.Read.All` (or `Sites.Read.All`) Graph pe
 may require admin consent — and a 403 from the download says exactly that, with Graph's own
 error text preserved.
 
-Throttling: these are exactly the reads that share the per-mailbox Graph budget with the inbox
-poller, so binary downloads retry a 429/503/504 through the same `GraphClient` read loop as every
-other GET — Retry-After honoured, bounded, gate-aware (see "Send reliability" below for the gate
-story). Multiple attachments on one message are downloaded sequentially, not in parallel, for the
-same reason.
+Throttling — and why retries alone are NOT enough: these reads share the per-mailbox Graph
+budget with the inbox poller, and the poller spends that budget continuously. Measured live
+2026-09-02: with a poller running, ad-hoc single-message GETs answered 429 with `retry-after: 62`
+on every attempt across 20+ minutes of patient backoff — the waiting caller and the poller share
+one budget, and the poller consumes it again the moment each window reopens. So the attachment
+tools COORDINATE instead of just waiting: before touching Graph they write a quota-yield file
+(`inbox-yield.json`, next to the inbox), every inbox poller checks it at the top of each cycle
+and skips polling while it stands, and the file is removed the moment the reads finish — on
+failure too. The yield's own deadline (3 minutes by default, 10 minutes hard cap) bounds how
+long a crashed reader can silence the inbox. This works identically whether the poller runs in
+the same process (the MCP server's own tools) or in another one (the `teams-attachments` CLI
+next to a running daemon); the poller never cares who wrote the file. See `src/inbox-yield.ts`.
+
+On top of the coordination, binary downloads retry a 429/503/504 through the same `GraphClient`
+read loop as every other GET — Retry-After honoured, bounded, gate-aware (see "Send reliability"
+below) — and the retry sleep cap is 90s, deliberately above the 62s window Graph actually names
+on this family (the old round 60s cap sat one second UNDER Microsoft's own number, refusing
+every honest retry by exactly that margin). Multiple attachments on one message download
+sequentially, not in parallel. If ad-hoc reads matter routinely in a deployment, also consider
+slowing the poller itself down: `TEAMS_INBOX_POLL_SECONDS` (default 30) trades inbox latency
+for read-budget headroom.
 
 ## The standalone CLIs
 
@@ -375,6 +396,7 @@ credential, an account name, or a tenant id, and nothing ever should.
 | `TEAMS_MCP_UPLOAD_DIR` | no | OneDrive folder where `send_chat_file` parks uploads. Defaults to `ai-test` |
 | `TEAMS_MCP_DISPLAY_NAME` | no | Overrides the expected display name for the probe |
 | `TEAMS_INBOX_PATH` | no | Where the background inbox JSONL lands. Defaults to `~/.teams-assistant/inbox.jsonl` |
+| `TEAMS_INBOX_POLL_SECONDS` | no | Inbox poll interval, default 30. Raising it frees per-mailbox Graph read budget for ad-hoc reads — see "Downloading attachments" |
 | `TEAMS_INBOX_DISABLED` | no | Set to `1` to not run the background inbox poller at all |
 
 ### Throttle budgets are per client id
