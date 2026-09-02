@@ -120,12 +120,22 @@ interface GraphDriveItem {
 /**
  * The shape of a successful `POST /me/drive/items/{id}/invite` response: a collection of
  * Permission resources, one per grant Graph actually created. Live-verified 2026-09-02 (see
- * KNOWN-ISSUES.md's wire-shape snapshot): each landed grant's AAD user id lives under
- * `grantedToV2.user.id` — NOT proven by the HTTP status alone, which can be 200 with an empty or
- * partial `value` array when a recipient's grant did not actually land.
+ * KNOWN-ISSUES.md's wire-shape snapshots): each landed grant's AAD user id lives under
+ * `grantedToV2.user.id` for a direct per-recipient grant — NOT proven by the HTTP status alone,
+ * which can be 200 with an empty or partial `value` array when a recipient's grant did not
+ * actually land. `grantedToIdentitiesV2` (an array, sibling to `grantedToV2` on the SAME
+ * permission entry) is a documented Graph variant some permission kinds use instead — several
+ * recipients' grants folded under one permission resource rather than one entry each — tolerated
+ * as an equivalent echo (2026-09-02 re-review MAJOR 2) so that shape drift degrades to acceptance,
+ * not a false outage.
  */
 interface GraphInviteResult {
-  value?: Array<{ grantedToV2?: { user?: { id?: string } | null } | null } | null> | null;
+  value?: Array<
+    {
+      grantedToV2?: { user?: { id?: string } | null } | null;
+      grantedToIdentitiesV2?: ReadonlyArray<{ user?: { id?: string } | null } | null> | null;
+    } | null
+  > | null;
 }
 
 /**
@@ -267,17 +277,26 @@ export class GraphTeamsChats implements TeamsChatsPort {
    * A single, never-retried `/members` refresh, with the 429→THROTTLED translation shared by
    * BOTH resolveMentions and membersForInvite — those two used to carry nearly identical but
    * independently-worded catch blocks (2026-09-02 review MINOR: one owner now). `reason` is the
-   * only thing that differs between callers, folded into one message. Same rule either way: the
-   * wait itself is NOT stated in the message text — retryAfterSeconds (the 4th constructor
-   * argument) is the one place that number lives; retryAfterSuffix (graph-client.ts) is the only
-   * renderer, shared by the CLI and the MCP tool path (0.4.1 review round 2).
+   * only thing that differs between callers, folded into one message; `extraOnThrottle`, when
+   * given, is appended verbatim — resolveMentions uses it to keep its own specific reassurance
+   * ("this does not mean the name does not exist") alive through the shared helper instead of
+   * silently dropping it (2026-09-02 re-review MINOR: the first extraction lost this exact clause,
+   * the same shape of regression as 0.4.1 losing Retry-After off the MCP tool path — pinned by a
+   * test this time, not just a doc comment promise). Same rule either way: the wait itself is NOT
+   * stated in the message text — retryAfterSeconds (the 4th constructor argument) is the one place
+   * that number lives; retryAfterSuffix (graph-client.ts) is the only renderer, shared by the CLI
+   * and the MCP tool path (0.4.1 review round 2).
    */
-  private async refreshMembers(chatId: string, reason: string): Promise<ChatMember[]> {
+  private async refreshMembers(
+    chatId: string,
+    reason: string,
+    extraOnThrottle = '',
+  ): Promise<ChatMember[]> {
     return this.membersOf(chatId).catch((caught: unknown) => {
       if (caught instanceof GraphError && caught.status === 429) {
         throw new GraphError(
           `THROTTLED: the member list refresh ${reason} was throttled; nothing was done. Wait ` +
-            'and try again.',
+            `and try again.${extraOnThrottle}`,
           429,
           'MembersRefreshThrottled',
           caught.retryAfterSeconds,
@@ -285,6 +304,19 @@ export class GraphTeamsChats implements TeamsChatsPort {
       }
       throw caught;
     });
+  }
+
+  /**
+   * A fresh roster is worth caching only when it is non-empty (2026-09-02 review NIT, generalised
+   * from membersForInvite's own reasoning to the one place both callers share): an empty answer —
+   * whether from a genuinely memberless chat or some transient gap — is a non-answer, not a
+   * confirmed fact worth trusting until the TTL expires. Applying this in ONE place means
+   * resolveMentions and membersForInvite can never drift into inconsistent caching policies again.
+   */
+  private cacheIfNonEmpty(chatId: string, members: ChatMember[]): void {
+    if (members.length > 0) {
+      this.membersCache.set(chatId, members);
+    }
   }
 
   /**
@@ -309,15 +341,20 @@ export class GraphTeamsChats implements TeamsChatsPort {
         // Fall through to a single refresh — see doc comment above.
       }
     }
-    const fresh = await this.refreshMembers(chatId, 'for mention resolution');
-    cache.set(chatId, fresh);
+    const fresh = await this.refreshMembers(
+      chatId,
+      'for mention resolution',
+      ' This does not mean the name does not exist.',
+    );
+    this.cacheIfNonEmpty(chatId, fresh);
     return resolveMentionTargets(names, fresh);
   }
 
   /**
    * The chat's current member roster for sendFile's permission grant — the SAME cache-first,
    * refresh-once-on-miss path resolveMentions uses (see its doc comment for the full rationale):
-   * a cache hit costs zero Graph calls, a miss refreshes ONCE via membersOf and persists it. Never
+   * a cache hit costs zero Graph calls, a miss refreshes ONCE via membersOf and persists it (via
+   * cacheIfNonEmpty — see its own doc comment for why an empty result is never persisted). Never
    * calls `/chats/{id}/members` directly on the send path — that endpoint shares a Graph throttle
    * budget across every process signed in with the same client id, and the 0.4.1 incident that
    * starved mention resolution on it applies identically to a file share.
@@ -325,9 +362,7 @@ export class GraphTeamsChats implements TeamsChatsPort {
    * Deliberately does NOT treat "empty" as "nobody to invite": an empty roster — whether the
    * cache never had one, or a fresh call to Graph itself reports nobody — is read as "we do not
    * reliably know who is in this chat" and left for sendFile to fail loudly on, never silently
-   * skipped as if the file were being shared into an empty room. An empty roster is also never
-   * PERSISTED to the cache (2026-09-02 review NIT): it is a non-answer, not a confirmed fact
-   * worth trusting until the TTL expires — the next call should try again, not inherit it.
+   * skipped as if the file were being shared into an empty room.
    */
   private async membersForInvite(chatId: string): Promise<ChatMember[]> {
     const cached = this.membersCache.get(chatId);
@@ -335,30 +370,37 @@ export class GraphTeamsChats implements TeamsChatsPort {
       return cached;
     }
     const fresh = await this.refreshMembers(chatId, 'needed to grant file access');
-    if (fresh.length > 0) {
-      this.membersCache.set(chatId, fresh);
-    }
+    this.cacheIfNonEmpty(chatId, fresh);
     return fresh;
   }
 
   /**
    * The assistant's own AAD id — used only so sendFile can exclude the assistant from its own
    * permission grant (it already owns the uploaded item as the uploader; granting itself `read`
-   * on top would be harmless but noisy, not wrong). Best-effort: a failure here does NOT fail the
-   * send. Memoized ONLY on success: caching a FAILED lookup just as permanently as a real id was
-   * a BLOCKER (2026-09-02 review, live-probed) — a single transient 403 used to disarm self-
-   * exclusion for the rest of this instance's lifetime, and worse, the resulting `undefined`
-   * self id made every subsequent sendFile call read "this member has no AAD id" (the id-less
-   * shape) as "this member IS self" (see sendFile's own doc comment for why that inversion
-   * mattered). A failed lookup here is retried on the NEXT sendFile call instead. Not shared
-   * across instances: each GraphTeamsChats resolves it against its own signed-in account.
+   * on top would be harmless but noisy, not wrong). Returning `undefined` here does NOT itself
+   * throw — the caller (sendFile) decides what an undetermined self id means, and since 2026-09-02
+   * review MAJOR 1 that decision is a hard PRE-UPLOAD refusal, not the earlier "include everyone,
+   * self included" soft fallback (which orphaned an upload on every attempt for the whole
+   * duration of a `/me` outage — see sendFile's own doc comment for the full contract). Memoized
+   * ONLY on success: caching a FAILED lookup just as permanently as a real id was a BLOCKER
+   * (2026-09-02 review, live-probed) — a single transient 403 used to disarm self-exclusion for
+   * the rest of this instance's lifetime. A failed lookup here is retried on the NEXT sendFile
+   * call instead. Not shared across instances: each GraphTeamsChats resolves it against its own
+   * signed-in account.
+   *
+   * `readRetries: 0`: a 429 here used to cost a real Retry-After sleep before failing anyway
+   * (2026-09-02 review MAJOR 1 follow-up) — now that an undetermined self id refuses the whole
+   * send regardless of why, there is no value in sleeping through the throttle only to still
+   * refuse; fail fast and let the caller retry the whole `sendFile` call once the throttle
+   * clears, same as `fetchMessage`'s `readRetries: 0` (a different rationale there — a cheaper
+   * fallback exists — but the same "don't sleep for nothing" conclusion).
    */
   private async resolveSelfId(): Promise<string | undefined> {
     if (this.selfId !== undefined) {
       return this.selfId;
     }
     try {
-      const me = await this.graph.get<{ id?: string }>('/me?$select=id');
+      const me = await this.graph.get<{ id?: string }>('/me?$select=id', { readRetries: 0 });
       this.selfId = me.id;
     } catch {
       return undefined; // best-effort, deliberately NOT memoized — see doc comment above
@@ -456,17 +498,25 @@ export class GraphTeamsChats implements TeamsChatsPort {
    *
    * Self-exclusion: the assistant's own id is excluded from the grant when resolveSelfId can
    * determine it — it already owns the item as the uploader, so granting itself `read` on top
-   * would be harmless but noisy. When it CANNOT be determined (resolveSelfId returns undefined),
-   * this deliberately does NOT drop anyone from the "other members" set — every member, self
-   * included, is treated as an "other" and gets invited (a harmless, if noisy, self-grant). The
-   * inverse — silently excluding whichever member merely happens to have no `id` (mistaking an
-   * id-less REAL member for "self" because `undefined !== undefined` is false) — was a BLOCKER
-   * live-probed on 2026-09-02: it let an id-less recipient's dead card go out silently while the
-   * assistant granted itself access instead. See resolveSelfId's own doc comment.
+   * would be harmless but noisy. When it CANNOT be determined (resolveSelfId returns undefined —
+   * a `/me` outage, a transient 403, …), this REFUSES the send before ever touching OneDrive
+   * (2026-09-02 review MAJOR 1) — the earlier "include everyone, self included" soft fallback
+   * looked harmless in isolation but meant a `/me` outage orphaned one upload attempt per
+   * `sendFile` call for its entire duration, 100% failure with no clean pre-upload signal. Before
+   * that, an even earlier BLOCKER version silently excluded whichever member merely happened to
+   * have no `id` (mistaking an id-less REAL member for "self" because `undefined !== undefined`
+   * is false), letting their dead card go out while the assistant granted itself access instead —
+   * live-probed 2026-09-02. This version's structure makes that class of bug impossible again: the
+   * pre-upload refusal below narrows `selfId` to a definite `string` for everything that follows,
+   * so there is no code path left where "self" and "undetermined" can be confused. See
+   * resolveSelfId's own doc comment for the retry/no-memoize-on-failure behaviour this refusal
+   * pairs with.
    *
    * Failure contract — no dead cards, ever:
    *  - an unresolvable or empty member roster (cache empty/expired AND the refresh fails or comes
    *    back empty) throws BEFORE the OneDrive upload — nothing is wasted;
+   *  - an undetermined self id (the `/me` lookup itself failed) ALSO throws BEFORE the upload,
+   *    for the reason above;
    *  - ANY other member (after self-exclusion) with no AAD id Graph reported also throws BEFORE
    *    the upload — a MIXED roster (some resolvable, some not) is refused whole, never granted
    *    only to the resolvable ones while posting anyway (2026-09-02 review MAJOR: silently
@@ -477,9 +527,11 @@ export class GraphTeamsChats implements TeamsChatsPort {
    *    cannot open;
    *  - a `/invite` call that answers HTTP success is NOT trusted by status alone: Graph can
    *    report 200 with an empty or partial `value` array when a grant did not actually land
-   *    (2026-09-02 review MAJOR — the response's own `grantedToV2.user.id` entries are the source
-   *    of truth). Any recipient missing from those grants throws, same as an outright /invite
-   *    failure, same orphan-honesty;
+   *    (2026-09-02 review MAJOR — the response's own `grantedToV2.user.id` entries, OR the
+   *    equivalent `grantedToIdentitiesV2[].user.id` shape some permission kinds use instead
+   *    (2026-09-02 re-review MAJOR 2), are the source of truth — see KNOWN-ISSUES.md for both
+   *    live-verified wire shapes this reads against). Any recipient missing from those grants
+   *    throws, same as an outright /invite failure, same orphan-honesty;
    *  - a chat whose only member is the assistant itself (no OTHER member at all) skips the invite
    *    call entirely and sends normally — there is nobody who could see a dead card.
    */
@@ -492,10 +544,16 @@ export class GraphTeamsChats implements TeamsChatsPort {
       );
     }
     const selfId = await this.resolveSelfId();
-    // selfId === undefined means "cannot determine who the assistant is", NEVER "nobody is self"
-    // — see the doc comment above and resolveSelfId's own for why the naive `member.id !== selfId`
-    // form (which reads as true for every member WITH an id when selfId is undefined) was wrong.
-    const others = members.filter((member) => !(selfId !== undefined && member.id === selfId));
+    if (selfId === undefined) {
+      throw new Error(
+        `Cannot share ${file.name} into chat ${chatId}: the assistant's own account id could ` +
+          "not be determined (the /me lookup failed), so members could not be safely excluded " +
+          'from the read permission grant. Nothing was uploaded — try again once /me is reachable.',
+      );
+    }
+    // selfId is a definite string from here on — see the method doc comment for why that
+    // structurally rules out the earlier self/id-less-member confusion.
+    const others = members.filter((member) => member.id !== selfId);
     const unresolvable = others.filter((member) => !member.id);
     if (unresolvable.length > 0) {
       throw new Error(
@@ -551,8 +609,14 @@ export class GraphTeamsChats implements TeamsChatsPort {
       // KNOWN-ISSUES.md's wire-shape snapshot for the live evidence this reads against.
       const grantedIds = new Set(
         (inviteResult.value ?? []).flatMap((permission) => {
-          const grantedId = permission?.grantedToV2?.user?.id;
-          return grantedId ? [grantedId] : [];
+          const direct = permission?.grantedToV2?.user?.id;
+          // grantedToIdentitiesV2 is a documented Graph variant — see GraphInviteResult's doc
+          // comment — some permission kinds use instead of one grantedToV2 entry per recipient.
+          const viaIdentities = (permission?.grantedToIdentitiesV2 ?? []).flatMap((identity) => {
+            const id = identity?.user?.id;
+            return id ? [id] : [];
+          });
+          return [...(direct ? [direct] : []), ...viaIdentities];
         }),
       );
       const missing = recipientIds.filter((id) => !grantedIds.has(id));
