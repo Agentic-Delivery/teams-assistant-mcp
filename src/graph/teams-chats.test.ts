@@ -239,13 +239,13 @@ describe('buildChats — the composition actually wires the members cache (0.4.1
   });
 });
 
-// 0.4.3 — same composition-wiring hazard the members-cache test above guards against (0.4.1
+// 0.5.1 — same composition-wiring hazard the members-cache test above guards against (0.4.1
 // review MAJOR 1): an optional selfIdCache wired inconsistently (or not at all) in build-chats.ts
 // would leave production exactly where the 2026-09-03 incident found it, with every test still
 // green, since GraphTeamsChats itself degrades safely to NullSelfIdCache. This test drives a real
 // sendFile through the REAL composition buildChats returns, so a dropped wire here can only pass
 // by actually reaching Graph's throttled /me endpoint, which the guard below would then catch.
-describe('buildChats — the composition wires the self id cache (0.4.3)', () => {
+describe('buildChats — the composition wires the self id cache (0.5.1)', () => {
   let dir: string;
 
   beforeEach(async () => {
@@ -315,6 +315,82 @@ describe('buildChats — the composition wires the self id cache (0.4.3)', () =>
       const sent = await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
 
       expect(sent.id).toBe('msg-composition');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  // MAJOR 1 (review round 2): the TEAMS_MCP_SELF_ID override wire from loadConfig into buildChats
+  // (build-chats.ts's `...(config.selfIdOverride !== undefined ? { selfIdOverride: ... } : {})`)
+  // had no test — deleting that one line left the full suite green, because the GraphTeamsChats
+  // unit tests for scenario (d) construct selfIdOverride directly, never through config+buildChats
+  // together. This drives the REAL composition end to end: a config built from TEAMS_MCP_SELF_ID,
+  // a COLD self id cache (never written), and a live /me that would 429 if it were ever called.
+  it('TEAMS_MCP_SELF_ID reaches buildChats() end to end — a cold cache and a 429ing /me are both bypassed', async () => {
+    const { loadConfig } = await import('../config.js');
+    const { buildChats } = await import('../build-chats.js');
+    const configPath = join(dir, 'teams-mcp.config.json');
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(
+      configPath,
+      JSON.stringify({ allowedChats: [{ id: CHAT, label: 'pilot', canPost: true }] }),
+    );
+    const config = loadConfig({
+      TEAMS_MCP_CONFIG: configPath,
+      TEAMS_MCP_TENANT_ID: 'tenant',
+      TEAMS_MCP_USERNAME: 'assistant@example.com',
+      TEAMS_MCP_PASSWORD: 'secret',
+      TEAMS_MCP_TOKEN_CACHE: join(dir, '.token-cache.json'),
+      TEAMS_MCP_SELF_ID: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+    });
+    expect(config.selfIdOverride).toBe('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+
+    new MembersCache({ path: config.membersCachePath }).set(CHAT, [
+      { id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', displayName: 'Assistant (AI)' },
+      { id: 'aad-bob', displayName: 'Bob Brown' },
+    ]);
+    // Deliberately COLD: config.selfIdCachePath is never written in this test — the override
+    // must win without ever touching either the cache or /me.
+    expect(new FileSelfIdCache({ path: config.selfIdCachePath }).read()).toBeUndefined();
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) {
+        // A live /me that WOULD 429 if reached — the override must never let this be called.
+        return json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
+          'retry-after': '5',
+        });
+      }
+      if (u.includes('/root:') && method === 'PUT') {
+        return json({
+          id: 'drive-item-override',
+          eTag: '"{ABCDEF12-3456-7890-ABCD-EF1234567890},1"',
+          webUrl: 'https://contoso.sharepoint.com/personal/assistant/report.pdf',
+          name: 'report.pdf',
+        });
+      }
+      if (u.includes('/invite')) {
+        return json({ value: [{ grantedToV2: { user: { id: 'aad-bob' } } }] });
+      }
+      if (u.includes('/messages') && method === 'POST') {
+        return json({
+          id: 'msg-override-composition',
+          chatId: CHAT,
+          createdDateTime: '2026-09-02T10:00:00Z',
+          body: { contentType: 'html', content: '' },
+        });
+      }
+      throw new Error(`this test only exercises sendFile — unexpected call: ${method} ${u}`);
+    }) as typeof fetch;
+    try {
+      const { chats, tokenProvider } = buildChats(config);
+      vi.spyOn(tokenProvider, 'getAccessToken').mockResolvedValue('fake-token');
+
+      const sent = await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
+
+      expect(sent.id).toBe('msg-override-composition');
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -785,14 +861,14 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
     expect(sent.id).toBe('msg-solo');
   });
 
-  // 0.4.3 — live incident 2026-09-03: eight consecutive teams-send-file CLI attempts over 20
+  // 0.5.1 — live incident 2026-09-03: eight consecutive teams-send-file CLI attempts over 20
   // minutes each failed the pre-upload refusal above, because every CLI invocation is a fresh
   // process and resolveSelfId's in-memory memo dies with it, paying (and losing) a throttled
   // `/me` call every single time. The account's own id never changes, so it is now persisted to
   // disk and read back BEFORE any `/me` call is attempted.
 
   // Scenario (a): a warm persisted cache answers resolveSelfId with ZERO /me calls.
-  it('(0.4.3 scenario a) a warm persisted self-id cache resolves self with ZERO /me calls', async () => {
+  it('(0.5.1 scenario a) a warm persisted self-id cache resolves self with ZERO /me calls', async () => {
     const cache = new MembersCache({ path });
     cache.set(CHAT, [
       { id: 'aad-self', displayName: 'Assistant (AI)' },
@@ -833,7 +909,7 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
   // Scenario (b): /me itself fails, but a persisted cache is present — the send proceeds and the
   // self-exclusion grant math is unchanged from the healthy-/me case (aad-bob invited, aad-self
   // excluded), because the cached id is used as the source of truth for self-exclusion.
-  it('(0.4.3 scenario b) a failed /me does not block the send when a persisted self-id cache is present', async () => {
+  it('(0.5.1 scenario b) a failed /me does not block the send when a persisted self-id cache is present', async () => {
     const cache = new MembersCache({ path });
     cache.set(CHAT, [
       { id: 'aad-self', displayName: 'Assistant (AI)' },
@@ -887,7 +963,7 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
   // Scenario (d): TEAMS_MCP_SELF_ID (validated GUID-shaped by config.ts before it reaches here)
   // wins over both the persisted cache and a live /me — the last-resort operator seed for a
   // throttle bad enough that even the cache never got its first write.
-  it('(0.4.3 scenario d) selfIdOverride wins over the persisted cache and /me — zero of either called', async () => {
+  it('(0.5.1 scenario d) selfIdOverride wins over the persisted cache and /me — zero of either called', async () => {
     const cache = new MembersCache({ path });
     cache.set(CHAT, [
       { id: 'aad-override-self', displayName: 'Assistant (AI)' },
@@ -934,7 +1010,7 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
   // Scenario (e): the FIRST successful /me call, with a cold (never-written) persisted cache,
   // writes the resolved id to disk — proven with a real FileSelfIdCache, not a double, so the
   // write is exercised end to end.
-  it('(0.4.3 scenario e) a cold persisted cache is written on the first successful /me call', async () => {
+  it('(0.5.1 scenario e) a cold persisted cache is written on the first successful /me call', async () => {
     const cache = new MembersCache({ path });
     cache.set(CHAT, [
       { id: 'aad-self', displayName: 'Assistant (AI)' },
@@ -968,12 +1044,12 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
     expect(selfIdCache.read()).toEqual({ id: 'aad-self', resolvedAt: expect.any(Number) });
   });
 
-  // Scenario (c) — the existing pre-0.4.3 refusal test above already covers this: omitting
+  // Scenario (c) — the existing pre-0.5.1 refusal test above already covers this: omitting
   // selfIdCache must refuse the send exactly like a real NullSelfIdCache would (no cache, no
   // override, /me fails). Pinned explicitly here so the equivalence itself — not just the
   // outcome — cannot silently drift (e.g. a future default that happens to swallow errors
   // differently from NullSelfIdCache would still pass the outcome-only test above).
-  it('(0.4.3 scenario c) omitting selfIdCache behaves exactly like an explicit NullSelfIdCache', async () => {
+  it('(0.5.1 scenario c) omitting selfIdCache behaves exactly like an explicit NullSelfIdCache', async () => {
     const cache = new MembersCache({ path });
     cache.set(CHAT, [{ id: 'aad-self', displayName: 'Assistant (AI)' }, { id: 'aad-bob', displayName: 'Bob Brown' }]);
     const failingMe = async (url: string) => {
