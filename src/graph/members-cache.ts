@@ -1,5 +1,5 @@
-import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { readFileSync, type renameSync, type writeFileSync } from 'node:fs';
+import { writeAtomicCacheFile } from './atomic-cache-write.js';
 import type { ChatMember } from './mentions.js';
 
 /** TEAMS_MCP_MEMBERS_TTL_SECONDS overrides this. Chat membership in these allowlisted chats
@@ -62,15 +62,18 @@ export class MembersCache {
   private readonly path: string;
   private readonly ttlMs: number;
   private readonly now: () => number;
-  private readonly writeFileFn: typeof writeFileSync;
-  private readonly renameFn: typeof renameSync;
+  /** Undefined means "use writeAtomicCacheFile's own default" — this class no longer needs the
+   *  real writeFileSync/renameSync values itself now that the write mechanism lives in
+   *  atomic-cache-write.ts (review round 2). */
+  private readonly writeFileFn: typeof writeFileSync | undefined;
+  private readonly renameFn: typeof renameSync | undefined;
 
   constructor(options: MembersCacheOptions) {
     this.path = options.path;
     this.ttlMs = options.ttlMs ?? DEFAULT_MEMBERS_TTL_MS;
     this.now = options.now ?? Date.now;
-    this.writeFileFn = options.writeFileFn ?? writeFileSync;
-    this.renameFn = options.renameFn ?? renameSync;
+    this.writeFileFn = options.writeFileFn;
+    this.renameFn = options.renameFn;
   }
 
   get(chatId: string): ChatMember[] | undefined {
@@ -121,19 +124,18 @@ export class MembersCache {
   }
 
   /**
-   * Write-to-temp-then-rename: a crash mid-write must never leave a half-written cache file that
-   * the next read chokes on — same failure mode the watermark sidecar's plain writeFile had.
-   * 0600 mirrors the token cache sibling's posture (FileTokenCache): set on the tmp file at
-   * create time, chmodSync as belt-and-braces (writeFileSync's mode option only applies on
-   * create, not on an existing path), and once more on the final path after the rename, since an
-   * exotic umask/platform edge case is cheaper to guard against here than to debug later.
+   * The write-to-temp-then-rename/0600 mechanism itself lives in atomic-cache-write.ts (review
+   * round 2: FileSelfIdCache, self-id-cache.ts, used to carry its own copy of this exact code with
+   * no test ever exercising its rename seam — sharing one implementation means the atomicity test
+   * below covers both). This method's own job is only building the JSON payload.
    */
   private writeFile(file: MembersCacheFile): void {
-    mkdirSync(dirname(this.path), { recursive: true });
-    const tmpPath = `${this.path}.tmp-${process.pid}-${this.now()}`;
-    this.writeFileFn(tmpPath, JSON.stringify(file, null, 2), { encoding: 'utf8', mode: 0o600 });
-    chmodSync(tmpPath, 0o600);
-    this.renameFn(tmpPath, this.path);
-    chmodSync(this.path, 0o600);
+    writeAtomicCacheFile({
+      path: this.path,
+      data: JSON.stringify(file, null, 2),
+      now: this.now,
+      ...(this.writeFileFn !== undefined ? { writeFileFn: this.writeFileFn } : {}),
+      ...(this.renameFn !== undefined ? { renameFn: this.renameFn } : {}),
+    });
   }
 }

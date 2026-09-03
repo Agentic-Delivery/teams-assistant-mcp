@@ -13,6 +13,11 @@ teams-mcp.config.json
 .members-cache.json
 *.members-cache.json
 
+# The signed-in account's own AAD id, plus the username that resolved it (0.5.1) — not secret,
+# but per-instance state, same as the two caches above.
+.self-id-cache.json
+*.self-id-cache.json
+
 # npm pack output
 *.tgz
 

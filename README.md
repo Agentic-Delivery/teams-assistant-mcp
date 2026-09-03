@@ -390,8 +390,9 @@ credential, an account name, or a tenant id, and nothing ever should.
 | `TEAMS_MCP_PASSWORD` | yes | |
 | `TEAMS_MCP_CONFIG` | yes | Path to the allowlist config. The server will not start without one |
 | `TEAMS_MCP_CLIENT_ID` | no | Defaults to the first-party Teams client id; see SETUP.md for why you usually want the Office one. Also the knob for Graph throttle isolation — see "Throttle budgets are per client id" below |
-| `TEAMS_MCP_TOKEN_CACHE` | no | Defaults to `.token-cache.json` in the working directory. The members cache (see "@mentions" below) lives next to it |
+| `TEAMS_MCP_TOKEN_CACHE` | no | Defaults to `.token-cache.json` in the working directory. The members cache (see "@mentions" below) and the self-id cache (below) live next to it |
 | `TEAMS_MCP_MEMBERS_TTL_SECONDS` | no | How long a chat's cached member list is trusted before a mention resolution refreshes it. Defaults to 24h (86400) |
+| `TEAMS_MCP_SELF_ID` | no | Last-resort operator seed for the signed-in account's own AAD id (`resolveSelfId`), used internally so `send_chat_file` (row above) can exclude the assistant from its own read-access grant on the uploaded item. Normally unnecessary: the id is resolved once from `/me` and persisted next to the token cache with no TTL, so only the first process on a fresh install pays the live lookup. Must be GUID-shaped or it is ignored |
 | `TEAMS_MCP_DOWNLOAD_DIR` | no | Where attachment downloads land (`get_chat_attachment`, `download_chat_attachments`, `teams-attachments`). Defaults to a temp directory |
 | `TEAMS_MCP_UPLOAD_DIR` | no | OneDrive folder where `send_chat_file` parks uploads. Defaults to `ai-test` |
 | `TEAMS_MCP_DISPLAY_NAME` | no | Overrides the expected display name for the probe |

@@ -1,3 +1,47 @@
+## send_chat_file: a throttled /me refused every CLI attempt, one process at a time (live 2026-09-03, mitigated 0.5.1)
+
+`resolveSelfId`'s in-memory memo (`teams-chats.ts`) protects nothing across process boundaries,
+and every standalone CLI invocation (`teams-send-file`) is a fresh process. Live 2026-09-03: eight
+consecutive `teams-send-file` attempts over 20 minutes each answered the pre-upload refusal from
+the 0.4.2 fix above — "the assistant's own account id could not be determined (the /me lookup
+failed)" — because Graph was throttling `/me` for this app+user (two daemons share the first-party
+client id), and each fresh process paid, and lost, the same throttled call. The account's own AAD
+id never changes, so there was never a reason to re-resolve it live every time.
+
+**Mitigated 0.5.1**: the signed-in account's own id is now persisted to disk
+(`.self-id-cache.json`, next to the token cache — `FileSelfIdCache`, `src/graph/self-id-cache.ts`,
+modeled on the existing members cache), with no TTL, and read back BEFORE any `/me` call is
+attempted — a warm cache costs zero `/me` calls, so the first process to resolve it (server or any
+CLI invocation) is the only one that ever pays the live lookup. `TEAMS_MCP_SELF_ID` is a
+last-resort operator override (GUID-validated) for a throttle bad enough that even that first
+resolution cannot land; it wins outright over the cache and the memo (subject only to sendFile's
+roster-membership re-check — see below) and is never itself persisted, so removing it later
+reverts cleanly to live/cached resolution. See `GraphTeamsChats.resolveSelfId`'s own doc comment
+(`src/graph/teams-chats.ts`) for the full resolution order.
+
+**Two cheap defences against a WRONG cached/overridden id (review round 2)**, closing the
+realistic ways one reaches this far — a `TEAMS_MCP_SELF_ID` typo that still happens to look
+GUID-shaped, or a stale `.self-id-cache.json` surviving `TEAMS_MCP_USERNAME` being repointed at
+the same instance dir (a consuming project switching service accounts without also switching
+`TEAMS_MCP_TOKEN_CACHE`) — both dangerous the same way: a wrong id that happens to equal a REAL
+other chat member's id would silently exclude THAT PERSON from the grant instead of the assistant:
+- `FileSelfIdCache` stamps the resolving account's `TEAMS_MCP_USERNAME` into every entry it writes
+  and treats a stored entry from a DIFFERENT username (or a legacy entry with no username field at
+  all) as a plain miss, not a wrongly-trusted id.
+- `sendFile` never trusts a resolved self id that is not a member of the SAME chat roster it
+  already fetched for the grant — a value nobody in that roster has forces exactly one live `/me`
+  re-check (bypassing override/memo/cache), correcting the persisted cache on success.
+
+**Known limitation, genuinely out of scope for 0.5.1**: a wrong id that happens to equal a REAL
+OTHER member's id in the SAME chat passes both defences above undetected — the roster-membership
+check sees a real member and is satisfied, and the username stamp only catches a different
+account, not a same-account typo that happens to collide with a real member's own GUID. This is
+the account-swap-adjacent case originally named here; nothing invalidates it, the cache is trusted
+until the file is deleted by hand. The CLI-per-invocation `/me` cost is not eliminated either way,
+only paid once instead of every time: the FIRST `teams-send-file` invocation against a cold cache
+(a fresh install, or after the cache file is deleted) still pays one live `/me` call, same as
+before this fix.
+
 ## The inbox poller starves ad-hoc reads on the same mailbox (measured 2026-09-02, mitigated 0.5.0)
 
 Graph's read quota is per mailbox (client id + signed-in user together — see README "Throttle
@@ -43,10 +87,12 @@ uploaded item (that same `/invite` call) BEFORE posting the chat message, resolv
 same cache-backed member roster resolveMentions already uses — never a direct call to the
 throttled `/chats/{id}/members` endpoint on the send path (see README's "@mentions" section for
 why that endpoint is avoided on sends). The assistant's own id is excluded from the grant when it
-can be determined (it already owns the item as uploader); when it CANNOT be determined (a `/me`
-outage, a transient failure — see the second wire-shape anchor below), the send refuses BEFORE the
-upload rather than falling back to an "invite everyone including self" default that would have
-orphaned an upload per attempt for the whole outage. An unresolvable/empty roster, or ANY other
+can be determined (it already owns the item as uploader) — since 0.5.1, via the persisted self-id
+cache first, a live `/me` only when that cache is cold (see the entry above); when it CANNOT be
+determined by ANY of those means (a `/me` outage with a cold cache and no `TEAMS_MCP_SELF_ID`
+override — see the second wire-shape anchor below), the send refuses BEFORE the upload rather than
+falling back to an "invite everyone including self" default that would have orphaned an upload per
+attempt for the whole outage. An unresolvable/empty roster, or ANY other
 real member with no AAD id Graph reported (even in a mixed roster where some other members ARE
 resolvable — no partial grants), also fails the send loudly BEFORE the upload; a failed `/invite`
 call, or an `/invite` that answers HTTP success but whose own response shows no grant actually

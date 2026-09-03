@@ -101,11 +101,18 @@ standalone polling daemon)? Give each its own `TEAMS_MCP_CLIENT_ID` (any other M
 first-party id from the same published list) so their throttle budgets are separate. See the
 README's "Throttle budgets are per client id" section.
 
-**`TEAMS_MCP_TOKEN_CACHE` and the member cache** — the per-chat @mention member cache
-(`TEAMS_MCP_MEMBERS_TTL_SECONDS`, default 24h) is written next to whatever `TEAMS_MCP_TOKEN_CACHE`
-resolves to, as `.members-cache.json` in the same directory. Both files hold per-instance state, so
-this is another reason two long-lived instances for the same account want separate working
-directories (and separate `TEAMS_MCP_TOKEN_CACHE` paths), not just separate client ids.
+**`TEAMS_MCP_TOKEN_CACHE`, the member cache and the self-id cache** — the per-chat @mention member
+cache (`TEAMS_MCP_MEMBERS_TTL_SECONDS`, default 24h) is written next to whatever
+`TEAMS_MCP_TOKEN_CACHE` resolves to, as `.members-cache.json` in the same directory. The signed-in
+account's own AAD id, plus the username that resolved it (`.self-id-cache.json`, no TTL — the
+account's own id does not change, and the stamped username is what lets a later
+`TEAMS_MCP_USERNAME` repoint at this same directory be detected as a miss rather than a wrongly
+trusted stale id) lives there too, resolved once from `/me` and reused by every process after
+that, server or CLI alike — `TEAMS_MCP_SELF_ID` is the last-resort operator override if even that
+first resolution cannot land.
+All three files hold per-instance state, so this is another reason two long-lived instances for the
+same account want separate working directories (and separate `TEAMS_MCP_TOKEN_CACHE` paths), not
+just separate client ids.
 
 **`TEAMS_MCP_CONFIG`** — absolute path to the allowlist file (step 5). The server refuses to
 start without it. Absolute, because the agent starts the server from the consuming project's

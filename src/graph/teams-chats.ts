@@ -7,6 +7,7 @@ import {
   type ChatMember,
   type MentionTarget,
 } from './mentions.js';
+import { NullSelfIdCache, type SelfIdCachePort } from './self-id-cache.js';
 import { textToHtml } from '../formatting.js';
 import {
   type ChatAttachmentRef,
@@ -186,6 +187,32 @@ export interface GraphTeamsChatsOptions {
    * production or test, must say explicitly what it wants here.
    */
   membersCache: MembersCachePort;
+  /**
+   * Disk-persisted cache for the signed-in account's own AAD id — see self-id-cache.ts and
+   * resolveSelfId's own doc comment for the incident this exists to fix (0.5.1, live-diagnosed
+   * 2026-09-03: a throttled `/me` failing on every fresh CLI process, because the in-memory memo
+   * this cache backs up dies with each process). Optional, unlike membersCache above: omitting
+   * it degrades to the pre-0.5.1 behaviour (memo-only, gone at process exit) rather than
+   * reintroducing a correctness hazard — there is no throttled endpoint a missing wire falls
+   * back to here, only a missed optimisation, so the 0.4.1-review reasoning that made
+   * membersCache required does not apply. Defaults to NullSelfIdCache.
+   */
+  selfIdCache?: SelfIdCachePort;
+  /**
+   * TEAMS_MCP_SELF_ID — the last-resort operator seed for a throttle bad enough that even the
+   * persisted cache never got its first write. Wins over BOTH the persisted cache and a live
+   * `/me` call; never itself written to the persisted cache (an operator removing the override
+   * later must not find a stale copy of it surviving there). Validated as GUID-shaped before it
+   * reaches here — see config.ts's selfIdOverrideFrom.
+   */
+  selfIdOverride?: string;
+  /**
+   * Low-volume operational line, same shape as InboxPoller's own `log` option (inbox.ts).
+   * Defaults to a no-op so no test needs to wire one. Used only to make resolveSelfId's
+   * cache-vs-live-/me choice visible to an operator — never carries the resolved id or the
+   * override value itself beyond what error messages elsewhere already surface.
+   */
+  log?: (line: string) => void;
 }
 
 export const DEFAULT_UPLOAD_DIR = 'ai-test';
@@ -233,6 +260,9 @@ function toPinnedMessage(entry: GraphPinnedMessage): PinnedMessage | undefined {
 export class GraphTeamsChats implements TeamsChatsPort {
   private readonly uploadDir: string;
   private readonly membersCache: MembersCachePort;
+  private readonly selfIdCache: SelfIdCachePort;
+  private readonly selfIdOverride: string | undefined;
+  private readonly log: (line: string) => void;
   /** Memoized by resolveSelfId, but ONLY on success — see its doc comment for why a failed
    *  lookup must NOT stick for the instance's lifetime. */
   private selfId: string | undefined;
@@ -243,6 +273,9 @@ export class GraphTeamsChats implements TeamsChatsPort {
   ) {
     this.uploadDir = options.uploadDir?.trim() || DEFAULT_UPLOAD_DIR;
     this.membersCache = options.membersCache;
+    this.selfIdCache = options.selfIdCache ?? new NullSelfIdCache();
+    this.selfIdOverride = options.selfIdOverride;
+    this.log = options.log ?? (() => {});
   }
 
   async listChats(): Promise<ChatSummary[]> {
@@ -405,32 +438,99 @@ export class GraphTeamsChats implements TeamsChatsPort {
    * The assistant's own AAD id — used only so sendFile can exclude the assistant from its own
    * permission grant (it already owns the uploaded item as the uploader; granting itself `read`
    * on top would be harmless but noisy, not wrong). Returning `undefined` here does NOT itself
-   * throw — the caller (sendFile) decides what an undetermined self id means, and since 2026-09-02
-   * review MAJOR 1 that decision is a hard PRE-UPLOAD refusal, not the earlier "include everyone,
-   * self included" soft fallback (which orphaned an upload on every attempt for the whole
-   * duration of a `/me` outage — see sendFile's own doc comment for the full contract). Memoized
-   * ONLY on success: caching a FAILED lookup just as permanently as a real id was a BLOCKER
-   * (2026-09-02 review, live-probed) — a single transient 403 used to disarm self-exclusion for
-   * the rest of this instance's lifetime. A failed lookup here is retried on the NEXT sendFile
-   * call instead. Not shared across instances: each GraphTeamsChats resolves it against its own
-   * signed-in account.
+   * throw — the caller (sendFile) decides what an undetermined self id means: a hard PRE-UPLOAD
+   * refusal, never a soft "assume it's fine" fallback — see sendFile's own doc comment for the
+   * fuller history of why.
+   *
+   * Resolution order (0.5.1, live-diagnosed 2026-09-03 — eight consecutive `teams-send-file` CLI
+   * attempts over 20 minutes each failed this lookup, because every CLI invocation is a fresh
+   * process and the in-memory memo below dies with it, paying and losing a throttled `/me` call
+   * every single time; the account's own id never changes, so it is now worth persisting):
+   *  1. `selfIdOverride` (TEAMS_MCP_SELF_ID, GUID-validated in config.ts) — a last-resort operator
+   *     seed, wins outright over the persisted cache and the memo below (no cache read, no `/me`
+   *     call from resolveSelfId itself), subject only to sendFile's roster-membership re-check
+   *     (that method's own doc comment) — never written back to the cache (an operator who unsets
+   *     the override later must not find a stale copy surviving on disk).
+   *  2. The in-memory memo (`this.selfId`) from an earlier successful resolution THIS instance
+   *     already made.
+   *  3. The persisted cache (`selfIdCache`, self-id-cache.ts) — no TTL, since the account's own
+   *     id does not change. A hit here is used AS IS, with ZERO `/me` calls: the whole point is
+   *     that a fresh CLI process never has to pay the throttled lookup again once any process has
+   *     resolved it once. Two independent, cheap defences against a WRONG value reaching this far
+   *     (review round 2 — the exotic "account swap surfaced by a 403" limitation named here before
+   *     was not actually the most likely way a wrong id reaches this cache; a GUID-shaped but
+   *     wrong `TEAMS_MCP_SELF_ID` typo, or a stale entry surviving `TEAMS_MCP_USERNAME` being
+   *     repointed at the same instance dir, are both far more realistic, and dangerous the same
+   *     way: a wrong id that happens to equal a REAL other member's id would silently exclude
+   *     THAT PERSON from the grant instead of the assistant, since sendFile trusts whatever
+   *     `resolveSelfId` returns as "not a recipient" with no further check of its own):
+   *       - `FileSelfIdCache` stamps the resolving account's username into the entry at write
+   *         time and rejects a stored entry whose username does not match the current one as a
+   *         plain miss (self-id-cache.ts) — closes the "username repointed at the same instance
+   *         dir" case specifically.
+   *       - `sendFile` itself never trusts a resolved self id that is not a member of the SAME
+   *         roster it already has in hand at the grant site — see its own doc comment for that
+   *         check, which closes the "cache/override holds a value nobody in THIS chat has" case
+   *         (a GUID-shaped typo, most commonly). Neither defence is a full account-swap detector:
+   *         a wrong id that happens to coincide with a real member of the SAME chat is not
+   *         caught by either — that residual is the one limitation actually worth naming (below).
+   *  4. `GET /me?$select=id` (`readRetries: 0` — see below) — only reached when steps 1–3 all
+   *     miss. On success, both the in-memory memo and the persisted cache are written before
+   *     returning.
+   * Only when step 4 ALSO fails (readRetries: 0's 429, or any other error) does this return
+   * `undefined` — memoized nowhere, so the NEXT call (the next sendFile on this instance, or a
+   * fresh process with a still-cold cache) retries it rather than being stuck on one transient
+   * failure for the rest of an instance's lifetime (BLOCKER, 2026-09-02 review, live-probed).
    *
    * `readRetries: 0`: a 429 here used to cost a real Retry-After sleep before failing anyway
    * (2026-09-02 review MAJOR 1 follow-up) — now that an undetermined self id refuses the whole
    * send regardless of why, there is no value in sleeping through the throttle only to still
    * refuse; fail fast and let the caller retry the whole `sendFile` call once the throttle
    * clears, same as `fetchMessage`'s `readRetries: 0` (a different rationale there — a cheaper
-   * fallback exists — but the same "don't sleep for nothing" conclusion).
+   * fallback exists — but the same "don't sleep for nothing" conclusion). The persisted cache is
+   * exactly what makes that retry cheap now instead of paying another throttled `/me`.
+   *
+   * Residual limitation, genuinely out of scope for 0.5.1: a wrong id (override typo, stale
+   * cache) that happens to equal a REAL other member's id in the SAME chat passes both defences
+   * above undetected — the roster-membership check (sendFile) sees a real member and is
+   * satisfied, and the username stamp (FileSelfIdCache) only catches a DIFFERENT account, not a
+   * same-account operator typo. Nothing here invalidates that case; the cache is trusted until
+   * the file is deleted by hand.
    */
   private async resolveSelfId(): Promise<string | undefined> {
+    if (this.selfIdOverride !== undefined) {
+      return this.selfIdOverride;
+    }
     if (this.selfId !== undefined) {
       return this.selfId;
     }
+    const cached = this.selfIdCache.read();
+    if (cached) {
+      this.selfId = cached.id;
+      this.log('self id served from the persisted cache; /me not called.');
+      return this.selfId;
+    }
+    return this.resolveSelfIdLive();
+  }
+
+  /**
+   * The live-only half of resolveSelfId (review round 2 extraction): a bare `GET /me?$select=id`
+   * with no override/memo/cache consulted, used both when resolveSelfId's own cache-first path
+   * misses AND by sendFile's roster-membership re-check (see that method's doc comment) when a
+   * cached/overridden self id turns out not to be anyone in the roster it is about to grant
+   * access against. On success both the in-memory memo and the persisted cache are (re)written —
+   * a successful re-check here corrects a stale/wrong persisted value going forward, not just for
+   * this one send.
+   */
+  private async resolveSelfIdLive(): Promise<string | undefined> {
     try {
       const me = await this.graph.get<{ id?: string }>('/me?$select=id', { readRetries: 0 });
-      this.selfId = me.id;
+      if (me.id) {
+        this.selfId = me.id;
+        this.selfIdCache.write({ id: me.id, resolvedAt: Date.now() });
+      }
     } catch {
-      return undefined; // best-effort, deliberately NOT memoized — see doc comment above
+      return undefined; // best-effort, deliberately NOT memoized — see resolveSelfId's doc comment
     }
     return this.selfId;
   }
@@ -539,6 +639,19 @@ export class GraphTeamsChats implements TeamsChatsPort {
    * resolveSelfId's own doc comment for the retry/no-memoize-on-failure behaviour this refusal
    * pairs with.
    *
+   * Roster-membership re-check (review round 2): resolveSelfId's own doc comment names the
+   * realistic ways a WRONG id reaches this far — a `TEAMS_MCP_SELF_ID` typo that still happens to
+   * be GUID-shaped, or a stale cache entry from before the account changed. Before trusting
+   * whatever `resolveSelfId` returned, this checks it against the roster `membersForInvite`
+   * already fetched for THIS chat: a resolved self id that matches nobody in that roster is not
+   * self, it is a wrong value that would otherwise silently exclude an innocent bystander id from
+   * nothing (the filter below simply never matches it) while doing nothing to protect a REAL
+   * member who happens to share that exact id — so instead of trusting it, this forces exactly
+   * one live `resolveSelfIdLive()` call (bypassing override/memo/cache entirely) and uses ITS
+   * result instead, which also corrects the persisted cache going forward. If that live call also
+   * fails, the pre-upload refusal below still applies — a wrong-but-present cached value is never
+   * silently substituted back in as a fallback.
+   *
    * Failure contract — no dead cards, ever:
    *  - an unresolvable or empty member roster (cache empty/expired AND the refresh fails or comes
    *    back empty) throws BEFORE the OneDrive upload — nothing is wasted;
@@ -570,7 +683,17 @@ export class GraphTeamsChats implements TeamsChatsPort {
           'empty, so no recipient permission grant could be attempted. Nothing was uploaded.',
       );
     }
-    const selfId = await this.resolveSelfId();
+    let selfId = await this.resolveSelfId();
+    if (selfId !== undefined && !members.some((member) => member.id === selfId)) {
+      // Roster-membership re-check — see this method's own doc comment for the realistic ways a
+      // WRONG id reaches this point (a TEAMS_MCP_SELF_ID typo, a stale cache entry). Bypasses
+      // override/memo/cache entirely: only a fresh /me is trustworthy enough to override a value
+      // that does not match anyone in this specific chat.
+      this.log(
+        'resolved self id does not match this chat\'s roster; re-resolving live rather than trusting it.',
+      );
+      selfId = await this.resolveSelfIdLive();
+    }
     if (selfId === undefined) {
       throw new Error(
         `Cannot share ${file.name} into chat ${chatId}: the assistant's own account id could ` +
