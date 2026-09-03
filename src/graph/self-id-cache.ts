@@ -1,5 +1,5 @@
-import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { readFileSync, type renameSync, type writeFileSync } from 'node:fs';
+import { writeAtomicCacheFile } from './atomic-cache-write.js';
 
 /**
  * The signed-in account's own AAD id, plus when it was last confirmed against `/me`.
@@ -63,14 +63,16 @@ export interface FileSelfIdCacheOptions {
 export class FileSelfIdCache implements SelfIdCachePort {
   private readonly path: string;
   private readonly now: () => number;
-  private readonly writeFileFn: typeof writeFileSync;
-  private readonly renameFn: typeof renameSync;
+  /** Undefined means "use writeAtomicCacheFile's own default" — same reasoning as MembersCache's
+   *  identical fields (members-cache.ts), review round 2. */
+  private readonly writeFileFn: typeof writeFileSync | undefined;
+  private readonly renameFn: typeof renameSync | undefined;
 
   constructor(options: FileSelfIdCacheOptions) {
     this.path = options.path;
     this.now = options.now ?? Date.now;
-    this.writeFileFn = options.writeFileFn ?? writeFileSync;
-    this.renameFn = options.renameFn ?? renameSync;
+    this.writeFileFn = options.writeFileFn;
+    this.renameFn = options.renameFn;
   }
 
   read(): SelfIdCacheEntry | undefined {
@@ -95,12 +97,19 @@ export class FileSelfIdCache implements SelfIdCachePort {
     }
   }
 
+  /**
+   * The write-to-temp-then-rename/0600 mechanism itself lives in atomic-cache-write.ts, shared
+   * with MembersCache (review round 2) — see that module's doc comment and members-cache.test.ts's
+   * atomicity test, which this class's write path now runs through unchanged rather than a second,
+   * separately-untested copy of the same nine lines.
+   */
   write(entry: SelfIdCacheEntry): void {
-    mkdirSync(dirname(this.path), { recursive: true });
-    const tmpPath = `${this.path}.tmp-${process.pid}-${this.now()}`;
-    this.writeFileFn(tmpPath, JSON.stringify(entry, null, 2), { encoding: 'utf8', mode: 0o600 });
-    chmodSync(tmpPath, 0o600);
-    this.renameFn(tmpPath, this.path);
-    chmodSync(this.path, 0o600);
+    writeAtomicCacheFile({
+      path: this.path,
+      data: JSON.stringify(entry, null, 2),
+      now: this.now,
+      ...(this.writeFileFn !== undefined ? { writeFileFn: this.writeFileFn } : {}),
+      ...(this.renameFn !== undefined ? { renameFn: this.renameFn } : {}),
+    });
   }
 }

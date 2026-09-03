@@ -960,6 +960,67 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
     });
   });
 
+  // MINOR (review round 2): a resolved self id that is not anyone in THIS chat's roster is not
+  // trusted — a realistic way this happens is a stale cache entry surviving an account swap, or
+  // a GUID-shaped-but-wrong TEAMS_MCP_SELF_ID typo. Here the cache holds 'aad-totally-wrong', a
+  // value absent from the roster entirely; sendFile must not treat it as self (which would leave
+  // NOBODY excluded from the grant, since the filter simply never matches it) — it must force a
+  // live /me call instead and use that result for self-exclusion.
+  it('(review round 2) a cached self id absent from this chat\'s roster is not trusted — forces a live /me instead', async () => {
+    const cache = new MembersCache({ path });
+    cache.set(CHAT, [
+      { id: 'aad-self', displayName: 'Assistant (AI)' },
+      { id: 'aad-bob', displayName: 'Bob Brown' },
+    ]);
+    let selfIdCacheWrites: Array<{ id: string; resolvedAt: number }> = [];
+    const staleSelfIdCache = {
+      read: (): SelfIdCacheEntry | undefined => ({ id: 'aad-totally-wrong', resolvedAt: 1 }),
+      write: (entry: SelfIdCacheEntry) => {
+        selfIdCacheWrites.push(entry);
+      },
+    };
+    let meCalls = 0;
+    let inviteBody: unknown;
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) {
+        meCalls += 1;
+        return selfIdResponse(); // { id: 'aad-self' } — the genuine self id
+      }
+      if (u.includes('/root:') && method === 'PUT') return uploadResponse();
+      if (u.includes('/invite')) {
+        inviteBody = JSON.parse(String(init?.body));
+        return grantsFor(['aad-bob']);
+      }
+      if (u.includes('/messages') && method === 'POST') {
+        return json({
+          id: 'msg-roster-recheck',
+          chatId: CHAT,
+          createdDateTime: '2026-09-02T10:00:00Z',
+          body: { contentType: 'html', content: '' },
+        });
+      }
+      throw new Error(`unexpected call in this test: ${method} ${u}`);
+    });
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch });
+    const chats = new GraphTeamsChats(graph, { membersCache: cache, selfIdCache: staleSelfIdCache });
+
+    const sent = await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
+
+    expect(meCalls).toBe(1); // exactly one forced live re-check, not a retry loop
+    expect(sent.id).toBe('msg-roster-recheck');
+    // aad-bob invited, aad-self correctly excluded via the LIVE id — not aad-totally-wrong,
+    // which would have excluded nobody and (wrongly) invited aad-self as if it were a recipient.
+    expect(inviteBody).toEqual({
+      recipients: [{ objectId: 'aad-bob' }],
+      requireSignIn: true,
+      sendInvitation: false,
+      roles: ['read'],
+    });
+    expect(selfIdCacheWrites).toEqual([{ id: 'aad-self', resolvedAt: expect.any(Number) }]);
+  });
+
   // Scenario (d): TEAMS_MCP_SELF_ID (validated GUID-shaped by config.ts before it reaches here)
   // wins over both the persisted cache and a live /me — the last-resort operator seed for a
   // throttle bad enough that even the cache never got its first write.
