@@ -14,7 +14,8 @@ modeled on the existing members cache), with no TTL, and read back BEFORE any `/
 attempted — a warm cache costs zero `/me` calls, so the first process to resolve it (server or any
 CLI invocation) is the only one that ever pays the live lookup. `TEAMS_MCP_SELF_ID` is a
 last-resort operator override (GUID-validated) for a throttle bad enough that even that first
-resolution cannot land; it wins outright and is never itself persisted, so removing it later
+resolution cannot land; it wins outright over the cache and the memo (subject only to sendFile's
+roster-membership re-check — see below) and is never itself persisted, so removing it later
 reverts cleanly to live/cached resolution. See `GraphTeamsChats.resolveSelfId`'s own doc comment
 (`src/graph/teams-chats.ts`) for the full resolution order.
 

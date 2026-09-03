@@ -447,9 +447,10 @@ export class GraphTeamsChats implements TeamsChatsPort {
    * process and the in-memory memo below dies with it, paying and losing a throttled `/me` call
    * every single time; the account's own id never changes, so it is now worth persisting):
    *  1. `selfIdOverride` (TEAMS_MCP_SELF_ID, GUID-validated in config.ts) — a last-resort operator
-   *     seed, wins outright: no persisted-cache read, no `/me` call, never written back to the
-   *     cache (an operator who unsets the override later must not find a stale copy surviving on
-   *     disk).
+   *     seed, wins outright over the persisted cache and the memo below (no cache read, no `/me`
+   *     call from resolveSelfId itself), subject only to sendFile's roster-membership re-check
+   *     (that method's own doc comment) — never written back to the cache (an operator who unsets
+   *     the override later must not find a stale copy surviving on disk).
    *  2. The in-memory memo (`this.selfId`) from an earlier successful resolution THIS instance
    *     already made.
    *  3. The persisted cache (`selfIdCache`, self-id-cache.ts) — no TTL, since the account's own
