@@ -239,6 +239,88 @@ describe('buildChats — the composition actually wires the members cache (0.4.1
   });
 });
 
+// 0.4.3 — same composition-wiring hazard the members-cache test above guards against (0.4.1
+// review MAJOR 1): an optional selfIdCache wired inconsistently (or not at all) in build-chats.ts
+// would leave production exactly where the 2026-09-03 incident found it, with every test still
+// green, since GraphTeamsChats itself degrades safely to NullSelfIdCache. This test drives a real
+// sendFile through the REAL composition buildChats returns, so a dropped wire here can only pass
+// by actually reaching Graph's throttled /me endpoint, which the guard below would then catch.
+describe('buildChats — the composition wires the self id cache (0.4.3)', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'build-chats-self-id-'));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('a pre-warmed cache at config.selfIdCachePath resolves self through buildChats() with ZERO /me calls', async () => {
+    const { loadConfig } = await import('../config.js');
+    const { buildChats } = await import('../build-chats.js');
+    const configPath = join(dir, 'teams-mcp.config.json');
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(
+      configPath,
+      JSON.stringify({ allowedChats: [{ id: CHAT, label: 'pilot', canPost: true }] }),
+    );
+    const config = loadConfig({
+      TEAMS_MCP_CONFIG: configPath,
+      TEAMS_MCP_TENANT_ID: 'tenant',
+      TEAMS_MCP_USERNAME: 'assistant@example.com',
+      TEAMS_MCP_PASSWORD: 'secret',
+      TEAMS_MCP_TOKEN_CACHE: join(dir, '.token-cache.json'),
+    });
+
+    new MembersCache({ path: config.membersCachePath }).set(CHAT, [
+      { id: 'aad-self', displayName: 'Assistant (AI)' },
+      { id: 'aad-bob', displayName: 'Bob Brown' },
+    ]);
+    // Pre-warm exactly where buildChats will look for it.
+    new FileSelfIdCache({ path: config.selfIdCachePath }).write({ id: 'aad-self', resolvedAt: 1 });
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) {
+        throw new Error('must never call /me — the self id cache is warm');
+      }
+      if (u.includes('/root:') && method === 'PUT') {
+        return json({
+          id: 'drive-item-1',
+          eTag: '"{ABCDEF12-3456-7890-ABCD-EF1234567890},1"',
+          webUrl: 'https://contoso.sharepoint.com/personal/assistant/report.pdf',
+          name: 'report.pdf',
+        });
+      }
+      if (u.includes('/invite')) {
+        return json({ value: [{ grantedToV2: { user: { id: 'aad-bob' } } }] });
+      }
+      if (u.includes('/messages') && method === 'POST') {
+        return json({
+          id: 'msg-composition',
+          chatId: CHAT,
+          createdDateTime: '2026-09-02T10:00:00Z',
+          body: { contentType: 'html', content: '' },
+        });
+      }
+      throw new Error(`this test only exercises sendFile — unexpected call: ${method} ${u}`);
+    }) as typeof fetch;
+    try {
+      const { chats, tokenProvider } = buildChats(config);
+      vi.spyOn(tokenProvider, 'getAccessToken').mockResolvedValue('fake-token');
+
+      const sent = await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
+
+      expect(sent.id).toBe('msg-composition');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 describe('GraphTeamsChats.sendFile — grants chat members read access on the uploaded item (bug fix 0.4.2, live-verified 2026-09-02: dead "can\'t be viewed" cards, only fixed by a manual /invite)', () => {
   let dir: string;
   let path: string;

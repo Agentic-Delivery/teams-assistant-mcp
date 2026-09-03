@@ -21,6 +21,14 @@ export interface TeamsMcpConfig {
   membersCachePath: string;
   /** TEAMS_MCP_MEMBERS_TTL_SECONDS overrides the 24h default (see members-cache.ts). */
   membersTtlMs: number;
+  /** Self id cache lives next to the token cache, same reasoning as membersCachePath above
+   *  (0.4.3: see self-id-cache.ts for the throttle incident this exists to fix). */
+  selfIdCachePath: string;
+  /** TEAMS_MCP_SELF_ID — a last-resort operator seed for resolveSelfId (teams-chats.ts), used
+   *  only when it looks like an AAD object id (a GUID). Undefined when unset OR malformed —
+   *  same best-effort posture as membersTtlSecondsFrom below: a typo here must never crash the
+   *  whole server. */
+  selfIdOverride?: string;
 }
 
 /** Derived, not hardcoded a second time: members-cache.ts's DEFAULT_MEMBERS_TTL_MS is the single
@@ -115,6 +123,20 @@ function membersTtlSecondsFrom(env: NodeJS.ProcessEnv): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MEMBERS_TTL_SECONDS;
 }
 
+/** An AAD object id: 8-4-4-4-12 hex, case-insensitive — the shape every Graph `id` field in this
+ *  package already takes (see TEAMS_FIRST_PARTY_CLIENT_ID above for the same shape used as a
+ *  non-secret published constant). */
+const AAD_OBJECT_ID_PATTERN =
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+/** TEAMS_MCP_SELF_ID is a last-resort operator seed (0.4.3) for resolveSelfId (teams-chats.ts) —
+ *  used only when it looks like an AAD object id; a malformed value is silently ignored rather
+ *  than crashing the whole server over a typo, same posture as membersTtlSecondsFrom above. */
+function selfIdOverrideFrom(env: NodeJS.ProcessEnv): string | undefined {
+  const raw = pick(env, ['TEAMS_MCP_SELF_ID']);
+  return raw !== undefined && AAD_OBJECT_ID_PATTERN.test(raw) ? raw : undefined;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): TeamsMcpConfig {
   const configPath = resolve(pick(env, ['TEAMS_MCP_CONFIG']) ?? 'teams-mcp.config.json');
 
@@ -132,6 +154,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): TeamsMcpConfig
   }
 
   const tokenCachePath = resolve(pick(env, ['TEAMS_MCP_TOKEN_CACHE']) ?? '.token-cache.json');
+  const selfIdOverride = selfIdOverrideFrom(env);
 
   return {
     tenantId: requireEnv(env, ['TEAMS_MCP_TENANT_ID']),
@@ -143,5 +166,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): TeamsMcpConfig
     allowlist: new ChatAllowlist(file.allowedChats ?? []),
     membersCachePath: join(dirname(tokenCachePath), '.members-cache.json'),
     membersTtlMs: membersTtlSecondsFrom(env) * 1000,
+    selfIdCachePath: join(dirname(tokenCachePath), '.self-id-cache.json'),
+    ...(selfIdOverride !== undefined ? { selfIdOverride } : {}),
   };
 }
