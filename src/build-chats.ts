@@ -45,7 +45,7 @@ export function buildChats(
   // Always THIS module's own cache — membersCache is deliberately excluded from
   // BuildChatsOptions so nothing calling buildChats can accidentally unwire it (0.4.1 review).
   const membersCache = new MembersCache({ path: config.membersCachePath, ttlMs: config.membersTtlMs });
-  // Same reasoning, 0.4.3: the whole point of persisting the self id is that every fresh CLI
+  // Same reasoning, 0.5.1: the whole point of persisting the self id is that every fresh CLI
   // process (buildChats's other caller, cli/common.ts) benefits from a resolution some earlier
   // process already paid for — an unwired selfIdCache here would leave that CLI exactly where
   // the 2026-09-03 incident found it, with the class of unit test at the GraphTeamsChats level

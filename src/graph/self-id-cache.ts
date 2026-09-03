@@ -7,7 +7,7 @@ import { dirname } from 'node:path';
  * operator visibility only (when was this last confirmed live). See resolveSelfId in
  * teams-chats.ts for the full read order this cache participates in, and for the one
  * invalidation case this deliberately does NOT handle (a later Graph call proving the cached id
- * wrong, e.g. a 403 naming a different principal) — out of scope for 0.4.3, a known limitation.
+ * wrong, e.g. a 403 naming a different principal) — out of scope for 0.5.1, a known limitation.
  */
 export interface SelfIdCacheEntry {
   id: string;
@@ -24,7 +24,7 @@ export interface SelfIdCachePort {
  * The safe default when a caller does not wire a real persisted cache: read() always misses,
  * write() does nothing. Unlike MembersCache (required on GraphTeamsChatsOptions since 0.4.1,
  * because an unwired members cache silently fell back to a THROTTLED live endpoint), omitting a
- * self id cache carries no such hazard — it degrades to exactly the pre-0.4.3 behaviour, an
+ * self id cache carries no such hazard — it degrades to exactly the pre-0.5.1 behaviour, an
  * in-memory-only memo gone the moment the process exits, never a wrong answer. So this one stays
  * optional; see GraphTeamsChatsOptions.selfIdCache's own doc comment.
  */

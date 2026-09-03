@@ -128,11 +128,11 @@ describe('member cache config (0.4.1)', () => {
   });
 });
 
-// 0.4.3 — live-diagnosed 2026-09-03: eight consecutive teams-send-file CLI attempts over 20
+// 0.5.1 — live-diagnosed 2026-09-03: eight consecutive teams-send-file CLI attempts over 20
 // minutes each failed the /me lookup, because every CLI invocation is a fresh process. The
 // account's own id never changes, so it is now persisted next to the token cache, same
 // reasoning and same derivation as the members cache above.
-describe('self id cache config (0.4.3)', () => {
+describe('self id cache config (0.5.1)', () => {
   it('places the self id cache next to the token cache', () => {
     const path = withConfigFile({ allowedChats: [{ id: '19:a@thread.v2' }] });
     const tokenCache = join(tmpdir(), 'some-instance-dir', '.token-cache.json');

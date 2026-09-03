@@ -5,10 +5,10 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { FileSelfIdCache, NullSelfIdCache } from './self-id-cache.js';
 
-// Disk mechanics that back scenario (e) from the 0.4.3 dispatch ("cache written on first
+// Disk mechanics that back scenario (e) from the 0.5.1 dispatch ("cache written on first
 // success, file mode 0600") — modeled directly on members-cache.test.ts (0.4.1), the sibling
 // this class is deliberately built to match.
-describe('FileSelfIdCache — disk-persisted, no TTL (0.4.3, live-diagnosed /me throttle)', () => {
+describe('FileSelfIdCache — disk-persisted, no TTL (0.5.1, live-diagnosed /me throttle)', () => {
   let dir: string;
   let path: string;
 

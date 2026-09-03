@@ -22,7 +22,7 @@ export interface TeamsMcpConfig {
   /** TEAMS_MCP_MEMBERS_TTL_SECONDS overrides the 24h default (see members-cache.ts). */
   membersTtlMs: number;
   /** Self id cache lives next to the token cache, same reasoning as membersCachePath above
-   *  (0.4.3: see self-id-cache.ts for the throttle incident this exists to fix). */
+   *  (0.5.1: see self-id-cache.ts for the throttle incident this exists to fix). */
   selfIdCachePath: string;
   /** TEAMS_MCP_SELF_ID — a last-resort operator seed for resolveSelfId (teams-chats.ts), used
    *  only when it looks like an AAD object id (a GUID). Undefined when unset OR malformed —
@@ -129,7 +129,7 @@ function membersTtlSecondsFrom(env: NodeJS.ProcessEnv): number {
 const AAD_OBJECT_ID_PATTERN =
   /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
-/** TEAMS_MCP_SELF_ID is a last-resort operator seed (0.4.3) for resolveSelfId (teams-chats.ts) —
+/** TEAMS_MCP_SELF_ID is a last-resort operator seed (0.5.1) for resolveSelfId (teams-chats.ts) —
  *  used only when it looks like an AAD object id; a malformed value is silently ignored rather
  *  than crashing the whole server over a typo, same posture as membersTtlSecondsFrom above. */
 function selfIdOverrideFrom(env: NodeJS.ProcessEnv): string | undefined {

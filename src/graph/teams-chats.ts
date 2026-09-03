@@ -189,10 +189,10 @@ export interface GraphTeamsChatsOptions {
   membersCache: MembersCachePort;
   /**
    * Disk-persisted cache for the signed-in account's own AAD id — see self-id-cache.ts and
-   * resolveSelfId's own doc comment for the incident this exists to fix (0.4.3, live-diagnosed
+   * resolveSelfId's own doc comment for the incident this exists to fix (0.5.1, live-diagnosed
    * 2026-09-03: a throttled `/me` failing on every fresh CLI process, because the in-memory memo
    * this cache backs up dies with each process). Optional, unlike membersCache above: omitting
-   * it degrades to the pre-0.4.3 behaviour (memo-only, gone at process exit) rather than
+   * it degrades to the pre-0.5.1 behaviour (memo-only, gone at process exit) rather than
    * reintroducing a correctness hazard — there is no throttled endpoint a missing wire falls
    * back to here, only a missed optimisation, so the 0.4.1-review reasoning that made
    * membersCache required does not apply. Defaults to NullSelfIdCache.
@@ -442,7 +442,7 @@ export class GraphTeamsChats implements TeamsChatsPort {
    * refusal, never a soft "assume it's fine" fallback — see sendFile's own doc comment for the
    * fuller history of why.
    *
-   * Resolution order (0.4.3, live-diagnosed 2026-09-03 — eight consecutive `teams-send-file` CLI
+   * Resolution order (0.5.1, live-diagnosed 2026-09-03 — eight consecutive `teams-send-file` CLI
    * attempts over 20 minutes each failed this lookup, because every CLI invocation is a fresh
    * process and the in-memory memo below dies with it, paying and losing a throttled `/me` call
    * every single time; the account's own id never changes, so it is now worth persisting):
@@ -455,7 +455,7 @@ export class GraphTeamsChats implements TeamsChatsPort {
    *  3. The persisted cache (`selfIdCache`, self-id-cache.ts) — no TTL, since the account's own
    *     id does not change. A hit here is used AS IS, with ZERO `/me` calls: the whole point is
    *     that a fresh CLI process never has to pay the throttled lookup again once any process has
-   *     resolved it once. Known limitation, out of scope for 0.4.3: if a later Graph call ever
+   *     resolved it once. Known limitation, out of scope for 0.5.1: if a later Graph call ever
    *     proved this cached id wrong (e.g. a 403 naming a different principal after an account
    *     swap), nothing here invalidates it — the cache is trusted until the file is deleted by
    *     hand.
