@@ -128,6 +128,53 @@ describe('member cache config (0.4.1)', () => {
   });
 });
 
+// 0.4.3 — live-diagnosed 2026-09-03: eight consecutive teams-send-file CLI attempts over 20
+// minutes each failed the /me lookup, because every CLI invocation is a fresh process. The
+// account's own id never changes, so it is now persisted next to the token cache, same
+// reasoning and same derivation as the members cache above.
+describe('self id cache config (0.4.3)', () => {
+  it('places the self id cache next to the token cache', () => {
+    const path = withConfigFile({ allowedChats: [{ id: '19:a@thread.v2' }] });
+    const tokenCache = join(tmpdir(), 'some-instance-dir', '.token-cache.json');
+
+    const config = loadConfig({ ...CREDS, TEAMS_MCP_CONFIG: path, TEAMS_MCP_TOKEN_CACHE: tokenCache });
+
+    expect(config.selfIdCachePath).toBe(join(tmpdir(), 'some-instance-dir', '.self-id-cache.json'));
+  });
+
+  it('has no selfIdOverride when TEAMS_MCP_SELF_ID is unset', () => {
+    const path = withConfigFile({ allowedChats: [{ id: '19:a@thread.v2' }] });
+
+    const config = loadConfig({ ...CREDS, TEAMS_MCP_CONFIG: path });
+
+    expect(config.selfIdOverride).toBeUndefined();
+  });
+
+  it('reads a GUID-shaped TEAMS_MCP_SELF_ID as selfIdOverride', () => {
+    const path = withConfigFile({ allowedChats: [{ id: '19:a@thread.v2' }] });
+
+    const config = loadConfig({
+      ...CREDS,
+      TEAMS_MCP_CONFIG: path,
+      TEAMS_MCP_SELF_ID: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+    });
+
+    expect(config.selfIdOverride).toBe('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+  });
+
+  it('ignores a TEAMS_MCP_SELF_ID that is not GUID-shaped rather than crashing the whole server on a typo', () => {
+    const path = withConfigFile({ allowedChats: [{ id: '19:a@thread.v2' }] });
+
+    const config = loadConfig({
+      ...CREDS,
+      TEAMS_MCP_CONFIG: path,
+      TEAMS_MCP_SELF_ID: 'not-a-guid-at-all',
+    });
+
+    expect(config.selfIdOverride).toBeUndefined();
+  });
+});
+
 describe('token cache on disk', () => {
   it('writes the cache readable only by the owner', () => {
     const path = join(mkdtempSync(join(tmpdir(), 'teams-mcp-cache-')), 'nested', '.token-cache.json');
