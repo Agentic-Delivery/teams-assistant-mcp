@@ -51,7 +51,7 @@ export function buildChats(
   // the 2026-09-03 incident found it, with the class of unit test at the GraphTeamsChats level
   // unable to catch a dropped composition wire (see this module's own buildChats test in
   // teams-chats.test.ts for the one that does).
-  const selfIdCache = new FileSelfIdCache({ path: config.selfIdCachePath });
+  const selfIdCache = new FileSelfIdCache({ path: config.selfIdCachePath, expectedUsername: config.username });
   // Readback-before-retry on every send: a failure report is a claim about the response path,
   // not the chat, and re-sending without checking is how one broadcast became eleven.
   const chats = new ReliableTeamsChats(

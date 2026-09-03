@@ -5,9 +5,11 @@ import { writeAtomicCacheFile } from './atomic-cache-write.js';
  * The signed-in account's own AAD id, plus when it was last confirmed against `/me`.
  * `resolvedAt` carries no TTL policy here — the account's own id does not change — it exists for
  * operator visibility only (when was this last confirmed live). See resolveSelfId in
- * teams-chats.ts for the full read order this cache participates in, and for the one
- * invalidation case this deliberately does NOT handle (a later Graph call proving the cached id
- * wrong, e.g. a 403 naming a different principal) — out of scope for 0.5.1, a known limitation.
+ * teams-chats.ts for the full read order this cache participates in, including the
+ * username-stamp check (FileSelfIdCacheOptions.expectedUsername, this module) and sendFile's
+ * roster-membership re-check — two defences against a wrong cached id, and the one residual
+ * limitation neither catches — that resolveSelfId's own doc comment names in full (review round
+ * 2, out of scope for 0.5.1).
  */
 export interface SelfIdCacheEntry {
   id: string;
@@ -42,6 +44,19 @@ export interface FileSelfIdCacheOptions {
   /** Absolute path — see config.ts's selfIdCachePath (derived next to the token cache, same
    *  reasoning as membersCachePath). */
   path: string;
+  /**
+   * The resolving account's username (config.username / TEAMS_MCP_USERNAME) — review round 2:
+   * stamped into every written entry and checked on every read. A mismatch (including a legacy
+   * entry with no username field at all) reads as a plain miss, same posture as every other
+   * "garbage in, miss out" shape check this class already applies — never a throw. Closes the
+   * realistic case of a consuming project repointing TEAMS_MCP_USERNAME at the same instance dir
+   * (a different service account, same token-cache directory) and silently inheriting the OLD
+   * account's AAD id as if it were the new one's. Optional and unchecked when omitted — every
+   * production call site (build-chats.ts) always supplies it; tests that do not care about this
+   * specific concern are free to omit it, same posture as selfIdCache's own optionality on
+   * GraphTeamsChatsOptions.
+   */
+  expectedUsername?: string;
   /** Injectable clock for tests; defaults to Date.now. */
   now?: () => number;
   writeFileFn?: typeof writeFileSync;
@@ -62,6 +77,7 @@ export interface FileSelfIdCacheOptions {
  */
 export class FileSelfIdCache implements SelfIdCachePort {
   private readonly path: string;
+  private readonly expectedUsername: string | undefined;
   private readonly now: () => number;
   /** Undefined means "use writeAtomicCacheFile's own default" — same reasoning as MembersCache's
    *  identical fields (members-cache.ts), review round 2. */
@@ -70,6 +86,7 @@ export class FileSelfIdCache implements SelfIdCachePort {
 
   constructor(options: FileSelfIdCacheOptions) {
     this.path = options.path;
+    this.expectedUsername = options.expectedUsername;
     this.now = options.now ?? Date.now;
     this.writeFileFn = options.writeFileFn;
     this.renameFn = options.renameFn;
@@ -83,12 +100,18 @@ export class FileSelfIdCache implements SelfIdCachePort {
       return undefined;
     }
     try {
-      const parsed = JSON.parse(raw) as Partial<SelfIdCacheEntry>;
+      const parsed = JSON.parse(raw) as Partial<SelfIdCacheEntry & { username?: string }>;
       if (
         typeof parsed.id !== 'string' ||
         parsed.id.trim() === '' ||
         typeof parsed.resolvedAt !== 'number'
       ) {
+        return undefined;
+      }
+      // A mismatch (or a legacy entry with no username field at all, once expectedUsername is
+      // set) reads as a plain miss — see FileSelfIdCacheOptions.expectedUsername's own doc
+      // comment for why. Skipped entirely when this instance was not given one to check against.
+      if (this.expectedUsername !== undefined && parsed.username !== this.expectedUsername) {
         return undefined;
       }
       return { id: parsed.id, resolvedAt: parsed.resolvedAt };
@@ -104,9 +127,14 @@ export class FileSelfIdCache implements SelfIdCachePort {
    * separately-untested copy of the same nine lines.
    */
   write(entry: SelfIdCacheEntry): void {
+    const stamped = {
+      id: entry.id,
+      resolvedAt: entry.resolvedAt,
+      ...(this.expectedUsername !== undefined ? { username: this.expectedUsername } : {}),
+    };
     writeAtomicCacheFile({
       path: this.path,
-      data: JSON.stringify(entry, null, 2),
+      data: JSON.stringify(stamped, null, 2),
       now: this.now,
       ...(this.writeFileFn !== undefined ? { writeFileFn: this.writeFileFn } : {}),
       ...(this.renameFn !== undefined ? { renameFn: this.renameFn } : {}),

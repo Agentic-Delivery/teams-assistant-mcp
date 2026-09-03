@@ -277,8 +277,14 @@ describe('buildChats — the composition wires the self id cache (0.5.1)', () =>
       { id: 'aad-self', displayName: 'Assistant (AI)' },
       { id: 'aad-bob', displayName: 'Bob Brown' },
     ]);
-    // Pre-warm exactly where buildChats will look for it.
-    new FileSelfIdCache({ path: config.selfIdCachePath }).write({ id: 'aad-self', resolvedAt: 1 });
+    // Pre-warm exactly where buildChats will look for it, stamped with the same username
+    // buildChats wires as expectedUsername (config.username) — review round 2's username check
+    // would otherwise (correctly) treat an unstamped entry as a miss; see the dedicated
+    // "config.username reaches FileSelfIdCache" test below for that check's own coverage.
+    new FileSelfIdCache({ path: config.selfIdCachePath, expectedUsername: config.username }).write({
+      id: 'aad-self',
+      resolvedAt: 1,
+    });
 
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (url: string, init?: RequestInit) => {
@@ -391,6 +397,100 @@ describe('buildChats — the composition wires the self id cache (0.5.1)', () =>
       const sent = await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
 
       expect(sent.id).toBe('msg-override-composition');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  // MINOR (review round 2): config.username is supposed to reach FileSelfIdCache as
+  // expectedUsername (build-chats.ts) so a stale entry from a DIFFERENT username is a miss, not
+  // a wrongly-trusted id — this drives that wiring end to end rather than unit-testing
+  // FileSelfIdCache's own username check in isolation (self-id-cache.test.ts already does that;
+  // this test is about whether buildChats ACTUALLY threads config.username through). The stale
+  // entry deliberately holds a REAL OTHER member's id (aad-bob), not a value absent from the
+  // roster: the roster-membership re-check (a sibling defence, added earlier this review round)
+  // would ALREADY force a live /me for a value nobody in the roster has, which would make this
+  // test pass for the wrong reason regardless of whether the username wiring works at all. A
+  // real member's id is exactly the case the roster check documents as NOT catching — the one
+  // only the username stamp closes.
+  it('config.username reaches FileSelfIdCache as expectedUsername — a cache stamped with a DIFFERENT username is a miss', async () => {
+    const { loadConfig } = await import('../config.js');
+    const { buildChats } = await import('../build-chats.js');
+    const configPath = join(dir, 'teams-mcp.config.json');
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(
+      configPath,
+      JSON.stringify({ allowedChats: [{ id: CHAT, label: 'pilot', canPost: true }] }),
+    );
+    const config = loadConfig({
+      TEAMS_MCP_CONFIG: configPath,
+      TEAMS_MCP_TENANT_ID: 'tenant',
+      TEAMS_MCP_USERNAME: 'new-assistant@example.com',
+      TEAMS_MCP_PASSWORD: 'secret',
+      TEAMS_MCP_TOKEN_CACHE: join(dir, '.token-cache.json'),
+    });
+
+    new MembersCache({ path: config.membersCachePath }).set(CHAT, [
+      { id: 'aad-self', displayName: 'Assistant (AI)' },
+      { id: 'aad-bob', displayName: 'Bob Brown' },
+    ]);
+    // A cache entry stamped with a DIFFERENT username, holding aad-bob's own (real) id —
+    // simulates a stale entry surviving TEAMS_MCP_USERNAME being repointed at this same instance
+    // dir, landing on a value the roster-membership check alone cannot flag as wrong. If
+    // buildChats wires config.username through, this reads as a miss and a live /me is used.
+    new FileSelfIdCache({ path: config.selfIdCachePath, expectedUsername: 'old-assistant@example.com' }).write({
+      id: 'aad-bob',
+      resolvedAt: 1,
+    });
+
+    let meCalls = 0;
+    let inviteBody: unknown;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) {
+        meCalls += 1;
+        return json({ id: 'aad-self' }); // the genuine, current account's id
+      }
+      if (u.includes('/root:') && method === 'PUT') {
+        return json({
+          id: 'drive-item-username',
+          eTag: '"{ABCDEF12-3456-7890-ABCD-EF1234567890},1"',
+          webUrl: 'https://contoso.sharepoint.com/personal/assistant/report.pdf',
+          name: 'report.pdf',
+        });
+      }
+      if (u.includes('/invite')) {
+        inviteBody = JSON.parse(String(init?.body));
+        return json({ value: [{ grantedToV2: { user: { id: 'aad-bob' } } }] });
+      }
+      if (u.includes('/messages') && method === 'POST') {
+        return json({
+          id: 'msg-username-mismatch',
+          chatId: CHAT,
+          createdDateTime: '2026-09-02T10:00:00Z',
+          body: { contentType: 'html', content: '' },
+        });
+      }
+      throw new Error(`this test only exercises sendFile — unexpected call: ${method} ${u}`);
+    }) as typeof fetch;
+    try {
+      const { chats, tokenProvider } = buildChats(config);
+      vi.spyOn(tokenProvider, 'getAccessToken').mockResolvedValue('fake-token');
+
+      const sent = await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
+
+      expect(meCalls).toBe(1); // the stale, wrong-username entry (aad-bob's own real id) was never trusted
+      expect(sent.id).toBe('msg-username-mismatch');
+      // aad-bob correctly invited (not wrongly treated as "self" and excluded); aad-self
+      // correctly excluded (not wrongly invited as if it were a recipient).
+      expect(inviteBody).toEqual({
+        recipients: [{ objectId: 'aad-bob' }],
+        requireSignIn: true,
+        sendInvitation: false,
+        roles: ['read'],
+      });
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -1103,6 +1203,36 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
     await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
 
     expect(selfIdCache.read()).toEqual({ id: 'aad-self', resolvedAt: expect.any(Number) });
+  });
+
+  // NIT (review round 2): a distinct predicate from scenario (e) above — `me.id` truthy is what
+  // actually gates the memoize-and-write. An EMPTY string `id` in the /me response (a malformed
+  // or degenerate Graph answer, not something normally expected but not impossible either) must
+  // NOT be trusted as a real self id: '' would satisfy `member.id !== selfId` for every real
+  // member (nobody has an empty AAD id), silently disabling self-exclusion rather than refusing
+  // loudly. The pre-upload refusal is the correct outcome here, not a wrongly "successful" send.
+  it('(review round 2) an empty-string id in the /me response is never memoized or written to the cache', async () => {
+    const cache = new MembersCache({ path });
+    cache.set(CHAT, [
+      { id: 'aad-self', displayName: 'Assistant (AI)' },
+      { id: 'aad-bob', displayName: 'Bob Brown' },
+    ]);
+    const selfIdCachePath = join(dir, '.self-id-cache-empty.json');
+    const selfIdCache = new FileSelfIdCache({ path: selfIdCachePath });
+    const fetchFn = vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes('/me?') && u.includes('select=id')) {
+        return json({ id: '' }); // degenerate but not impossible Graph answer
+      }
+      throw new Error(`unexpected call — upload/invite/message must never be reached: ${u}`);
+    });
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch });
+    const chats = new GraphTeamsChats(graph, { membersCache: cache, selfIdCache });
+
+    await expect(
+      chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' }),
+    ).rejects.toThrow(/own account id could not be determined/i);
+    expect(selfIdCache.read()).toBeUndefined(); // never written
   });
 
   // Scenario (c) — the existing pre-0.5.1 refusal test above already covers this: omitting
