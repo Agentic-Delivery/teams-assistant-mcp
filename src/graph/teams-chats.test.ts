@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GraphClient, GraphError } from './graph-client.js';
 import { MembersCache } from './members-cache.js';
+import { FileSelfIdCache, NullSelfIdCache, type SelfIdCacheEntry } from './self-id-cache.js';
 import { GraphTeamsChats } from './teams-chats.js';
 import type { TokenProvider } from '../auth/token-provider.js';
 
@@ -700,6 +701,220 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
     const sent = await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
 
     expect(sent.id).toBe('msg-solo');
+  });
+
+  // 0.4.3 — live incident 2026-09-03: eight consecutive teams-send-file CLI attempts over 20
+  // minutes each failed the pre-upload refusal above, because every CLI invocation is a fresh
+  // process and resolveSelfId's in-memory memo dies with it, paying (and losing) a throttled
+  // `/me` call every single time. The account's own id never changes, so it is now persisted to
+  // disk and read back BEFORE any `/me` call is attempted.
+
+  // Scenario (a): a warm persisted cache answers resolveSelfId with ZERO /me calls.
+  it('(0.4.3 scenario a) a warm persisted self-id cache resolves self with ZERO /me calls', async () => {
+    const cache = new MembersCache({ path });
+    cache.set(CHAT, [
+      { id: 'aad-self', displayName: 'Assistant (AI)' },
+      { id: 'aad-bob', displayName: 'Bob Brown' },
+    ]);
+    const warmSelfIdCache = {
+      read: (): SelfIdCacheEntry | undefined => ({ id: 'aad-self', resolvedAt: 1_000 }),
+      write: () => {
+        throw new Error('must not write — this test only exercises a warm read');
+      },
+    };
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) {
+        throw new Error('must never call /me when the persisted self-id cache is warm');
+      }
+      if (u.includes('/root:') && method === 'PUT') return uploadResponse();
+      if (u.includes('/invite')) return grantsFor(['aad-bob']);
+      if (u.includes('/messages') && method === 'POST') {
+        return json({
+          id: 'msg-cache-hit',
+          chatId: CHAT,
+          createdDateTime: '2026-09-02T10:00:00Z',
+          body: { contentType: 'html', content: '' },
+        });
+      }
+      throw new Error(`unexpected call in this test: ${method} ${u}`);
+    });
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch });
+    const chats = new GraphTeamsChats(graph, { membersCache: cache, selfIdCache: warmSelfIdCache });
+
+    const sent = await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
+
+    expect(sent.id).toBe('msg-cache-hit');
+  });
+
+  // Scenario (b): /me itself fails, but a persisted cache is present — the send proceeds and the
+  // self-exclusion grant math is unchanged from the healthy-/me case (aad-bob invited, aad-self
+  // excluded), because the cached id is used as the source of truth for self-exclusion.
+  it('(0.4.3 scenario b) a failed /me does not block the send when a persisted self-id cache is present', async () => {
+    const cache = new MembersCache({ path });
+    cache.set(CHAT, [
+      { id: 'aad-self', displayName: 'Assistant (AI)' },
+      { id: 'aad-bob', displayName: 'Bob Brown' },
+    ]);
+    const warmSelfIdCache = {
+      read: (): SelfIdCacheEntry | undefined => ({ id: 'aad-self', resolvedAt: 1_000 }),
+      write: () => {
+        throw new Error('must not write — a cache hit never re-resolves against /me');
+      },
+    };
+    let inviteBody: unknown;
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) {
+        // Present to prove the cache is what is actually used — reaching this at all would
+        // itself be a scenario-(a) failure, but scenario (b) is deliberately tolerant of /me
+        // being unreachable (a network failure, not just a 429) and asserts the OUTCOME.
+        return json({ error: { code: 'ServiceUnavailable', message: 'down' } }, 503);
+      }
+      if (u.includes('/root:') && method === 'PUT') return uploadResponse();
+      if (u.includes('/invite')) {
+        inviteBody = JSON.parse(String(init?.body));
+        return grantsFor(['aad-bob']);
+      }
+      if (u.includes('/messages') && method === 'POST') {
+        return json({
+          id: 'msg-cache-fallback',
+          chatId: CHAT,
+          createdDateTime: '2026-09-02T10:00:00Z',
+          body: { contentType: 'html', content: '' },
+        });
+      }
+      throw new Error(`unexpected call in this test: ${method} ${u}`);
+    });
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch });
+    const chats = new GraphTeamsChats(graph, { membersCache: cache, selfIdCache: warmSelfIdCache });
+
+    const sent = await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
+
+    expect(sent.id).toBe('msg-cache-fallback');
+    expect(inviteBody).toEqual({
+      recipients: [{ objectId: 'aad-bob' }],
+      requireSignIn: true,
+      sendInvitation: false,
+      roles: ['read'],
+    });
+  });
+
+  // Scenario (d): TEAMS_MCP_SELF_ID (validated GUID-shaped by config.ts before it reaches here)
+  // wins over both the persisted cache and a live /me — the last-resort operator seed for a
+  // throttle bad enough that even the cache never got its first write.
+  it('(0.4.3 scenario d) selfIdOverride wins over the persisted cache and /me — zero of either called', async () => {
+    const cache = new MembersCache({ path });
+    cache.set(CHAT, [
+      { id: 'aad-override-self', displayName: 'Assistant (AI)' },
+      { id: 'aad-bob', displayName: 'Bob Brown' },
+    ]);
+    const selfIdCache = {
+      read: (): SelfIdCacheEntry | undefined => {
+        throw new Error('must not read the persisted cache — the override wins outright');
+      },
+      write: () => {
+        throw new Error('must not write the persisted cache — the override is never persisted');
+      },
+    };
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) {
+        throw new Error('must never call /me when an override is set');
+      }
+      if (u.includes('/root:') && method === 'PUT') return uploadResponse();
+      if (u.includes('/invite')) return grantsFor(['aad-bob']);
+      if (u.includes('/messages') && method === 'POST') {
+        return json({
+          id: 'msg-override',
+          chatId: CHAT,
+          createdDateTime: '2026-09-02T10:00:00Z',
+          body: { contentType: 'html', content: '' },
+        });
+      }
+      throw new Error(`unexpected call in this test: ${method} ${u}`);
+    });
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch });
+    const chats = new GraphTeamsChats(graph, {
+      membersCache: cache,
+      selfIdCache,
+      selfIdOverride: 'aad-override-self',
+    });
+
+    const sent = await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
+
+    expect(sent.id).toBe('msg-override');
+  });
+
+  // Scenario (e): the FIRST successful /me call, with a cold (never-written) persisted cache,
+  // writes the resolved id to disk — proven with a real FileSelfIdCache, not a double, so the
+  // write is exercised end to end.
+  it('(0.4.3 scenario e) a cold persisted cache is written on the first successful /me call', async () => {
+    const cache = new MembersCache({ path });
+    cache.set(CHAT, [
+      { id: 'aad-self', displayName: 'Assistant (AI)' },
+      { id: 'aad-bob', displayName: 'Bob Brown' },
+    ]);
+    const selfIdCachePath = join(dir, '.self-id-cache.json');
+    const selfIdCache = new FileSelfIdCache({ path: selfIdCachePath });
+    expect(selfIdCache.read()).toBeUndefined(); // cold: never written before this test
+
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) return selfIdResponse();
+      if (u.includes('/root:') && method === 'PUT') return uploadResponse();
+      if (u.includes('/invite')) return grantsFor(['aad-bob']);
+      if (u.includes('/messages') && method === 'POST') {
+        return json({
+          id: 'msg-first-write',
+          chatId: CHAT,
+          createdDateTime: '2026-09-02T10:00:00Z',
+          body: { contentType: 'html', content: '' },
+        });
+      }
+      throw new Error(`unexpected call in this test: ${method} ${u}`);
+    });
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch });
+    const chats = new GraphTeamsChats(graph, { membersCache: cache, selfIdCache });
+
+    await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
+
+    expect(selfIdCache.read()).toEqual({ id: 'aad-self', resolvedAt: expect.any(Number) });
+  });
+
+  // Scenario (c) — the existing pre-0.4.3 refusal test above already covers this: omitting
+  // selfIdCache must refuse the send exactly like a real NullSelfIdCache would (no cache, no
+  // override, /me fails). Pinned explicitly here so the equivalence itself — not just the
+  // outcome — cannot silently drift (e.g. a future default that happens to swallow errors
+  // differently from NullSelfIdCache would still pass the outcome-only test above).
+  it('(0.4.3 scenario c) omitting selfIdCache behaves exactly like an explicit NullSelfIdCache', async () => {
+    const cache = new MembersCache({ path });
+    cache.set(CHAT, [{ id: 'aad-self', displayName: 'Assistant (AI)' }, { id: 'aad-bob', displayName: 'Bob Brown' }]);
+    const failingMe = async (url: string) => {
+      const u = String(url);
+      if (u.includes('/me?') && u.includes('select=id')) {
+        return json({ error: { code: 'Forbidden', message: 'insufficient privileges' } }, 403);
+      }
+      throw new Error(`unexpected call — upload/invite/message must never be reached: ${u}`);
+    };
+    const graphDefault = new GraphClient({ tokenProvider: stubToken, fetchFn: vi.fn(failingMe) as unknown as typeof fetch });
+    const graphExplicit = new GraphClient({ tokenProvider: stubToken, fetchFn: vi.fn(failingMe) as unknown as typeof fetch });
+    const chatsDefault = new GraphTeamsChats(graphDefault, { membersCache: cache });
+    const chatsExplicit = new GraphTeamsChats(graphExplicit, { membersCache: cache, selfIdCache: new NullSelfIdCache() });
+
+    const defaultResult = await chatsDefault
+      .sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' })
+      .catch((error: unknown) => error);
+    const explicitResult = await chatsExplicit
+      .sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' })
+      .catch((error: unknown) => error);
+
+    expect(defaultResult).toBeInstanceOf(Error);
+    expect((defaultResult as Error).message).toBe((explicitResult as Error).message);
   });
 });
 
