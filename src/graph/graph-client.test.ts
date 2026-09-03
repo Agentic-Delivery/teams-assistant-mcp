@@ -354,7 +354,16 @@ describe('teams chats over graph', () => {
   });
 
   it('refuses to share a file when OneDrive returns no usable eTag', async () => {
-    const fetchFn = vi.fn(async () => json({ id: 'ITEM-ID', name: 'notes.txt' }));
+    // The self-id lookup must answer a roster member's own id (warmMembersCache's 'self-aad-id')
+    // — review round 2's roster-membership re-check would otherwise (correctly) distrust a
+    // /me answer nobody in the roster has and force a second live call, which is not what this
+    // test is about; see teams-chats.test.ts for that check's own dedicated tests.
+    const fetchFn = vi.fn(async (url: string) => {
+      if (String(url).includes('/me?') && String(url).includes('select=id')) {
+        return json({ id: 'self-aad-id' });
+      }
+      return json({ id: 'ITEM-ID', name: 'notes.txt' });
+    });
     const chats = new GraphTeamsChats(
       new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }),
       { membersCache: warmMembersCache() });

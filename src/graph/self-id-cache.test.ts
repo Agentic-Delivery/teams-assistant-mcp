@@ -1,4 +1,4 @@
-import { statSync, writeFileSync } from 'node:fs';
+import { renameSync, statSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -80,6 +80,37 @@ describe('FileSelfIdCache — disk-persisted, no TTL (0.5.1, live-diagnosed /me 
     new FileSelfIdCache({ path }).write({ id: 'aad-2', resolvedAt: 2 });
 
     expect(statSync(path).mode & 0o777).toBe(0o600);
+  });
+
+  // MINOR (review round 2): FileSelfIdCache's constructor has carried writeFileFn/renameFn
+  // injection seams since it was first written, but nothing ever drove them — mutation-verified
+  // by the reviewer: replacing the rename call in write() with a direct write left the whole
+  // suite green. The mechanism itself is now shared with MembersCache (atomic-cache-write.ts,
+  // see its own doc comment), and MembersCache's own atomicity test already proves that shared
+  // implementation — but that alone does not prove THIS class actually calls it rather than some
+  // other write path, which is what this test pins, mirroring members-cache.test.ts's identically
+  // named test for its sibling.
+  it('write() reaches the destination path ONLY via rename, never a direct write (atomicity)', () => {
+    const directWrites: string[] = [];
+    const renames: Array<{ from: string; to: string }> = [];
+    const cache = new FileSelfIdCache({
+      path,
+      writeFileFn: (target, data, options) => {
+        directWrites.push(String(target));
+        writeFileSync(target, data, options);
+      },
+      renameFn: (from, to) => {
+        renames.push({ from: String(from), to: String(to) });
+        renameSync(from, to);
+      },
+    });
+
+    cache.write({ id: 'aad-1', resolvedAt: 1 });
+
+    expect(directWrites).toHaveLength(1);
+    expect(directWrites[0]).not.toBe(path); // never written to the real destination directly
+    expect(renames).toEqual([{ from: directWrites[0], to: path }]); // the ONLY route to `path` is a rename FROM that exact temp file
+    expect(cache.read()).toEqual({ id: 'aad-1', resolvedAt: 1 }); // and the data really did land
   });
 });
 
