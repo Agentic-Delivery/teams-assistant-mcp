@@ -435,13 +435,12 @@ export class GraphTeamsChats implements TeamsChatsPort {
   }
 
   /**
-   * The assistant's own AAD id — used so sendFile can exclude the assistant from its own
+   * The assistant's own AAD id — used only so sendFile can exclude the assistant from its own
    * permission grant (it already owns the uploaded item as the uploader; granting itself `read`
-   * on top would be harmless but noisy, not wrong) and so assertOwnMessage can verify a delete
-   * target's author. Returning `undefined` here does NOT itself throw — each caller decides what
-   * an undetermined self id means (sendFile and assertOwnMessage both refuse pre-action, never a
-   * soft "assume it's fine" fallback — see sendFile's own doc comment for the fuller history of
-   * why).
+   * on top would be harmless but noisy, not wrong). Returning `undefined` here does NOT itself
+   * throw — the caller (sendFile) decides what an undetermined self id means: a hard PRE-UPLOAD
+   * refusal, never a soft "assume it's fine" fallback — see sendFile's own doc comment for the
+   * fuller history of why.
    *
    * Resolution order (0.4.3, live-diagnosed 2026-09-03 — eight consecutive `teams-send-file` CLI
    * attempts over 20 minutes each failed this lookup, because every CLI invocation is a fresh
