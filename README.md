@@ -114,16 +114,27 @@ still holds on disk, logging one line naming the fallback, and only fails the po
 requested name is absent from that stale roster too — in which case the original throttled error
 still surfaces, naming Graph's Retry-After. A 429 is never swallowed into a false "no such member".
 
-**The roster also fills and refreshes itself from ordinary chat traffic, at zero Graph cost
-(0.5.2).** Every message the background inbox poller reads already carries its sender's AAD id and
-display name (`from.user.id`/`from.user.displayName` on the Graph chat message); the poller merges
-those straight into the same on-disk roster the cache above serves mentions from
-(`MembersCache.merge`, `src/graph/members-cache.ts`), refreshing that chat's `fetchedAt` on every
-merge that lands something. A chat that stays busy therefore never needs a live `/members` call at
-all — the explicit refresh above is the fallback for a name never seen in traffic, not the primary
-path. A message whose sender Graph could not fully identify (an id with no display name — the
-`from: 'unknown'` fallback below) is never merged, so a gap in Graph's own response can't poison
-the roster with a junk entry.
+**The roster also fills itself from ordinary chat traffic, at zero Graph cost, as a PARTIAL entry
+— never used for a file-share permission grant (0.5.2, updated in the same release after a
+review found the first cut of this trusted a partial roster for that grant).** Every message the
+background inbox poller reads already carries its sender's AAD id and display name
+(`from.user.id`/`from.user.displayName` on the Graph chat message); the poller merges those into
+the same on-disk roster the cache above serves mentions from (`MembersCache.merge`,
+`src/graph/members-cache.ts`), stamping that chat's `harvestedAt` (never `fetchedAt` — that field
+is reserved for a REAL `/members` fetch) on every merge that lands something. A chat that stays
+busy therefore never needs a live `/members` call for MENTION resolution — the explicit refresh
+above is the fallback for a name never seen in traffic, not the primary path. A message whose
+sender Graph could not fully identify (an id with no display name — the `from: 'unknown'` fallback
+below) is never merged, so a gap in Graph's own response can't poison the roster with a junk entry.
+
+A roster built only from traffic is PARTIAL, not COMPLETE: it only knows who has spoken, not who
+is silently in the chat. `send_chat_file`'s permission grant (below) never trusts a partial roster
+— it always forces one real `/members` call for a chat that has no COMPLETE roster on disk yet
+(refusing the send loudly, never granting a partial list, if that call itself is throttled), and a
+COMPLETE roster's own freshness is judged only against its real `fetchedAt`, unaffected by
+intervening traffic. **Operators: no action is needed on a restart or an upgrade to 0.5.2 — a
+harvested roster on disk from an earlier build simply never drives a file grant; the very next
+`send_chat_file` into that chat pays one real `/members` call and moves on.**
 
 ## Retry-After
 
@@ -422,7 +433,7 @@ credential, an account name, or a tenant id, and nothing ever should.
 | `TEAMS_MCP_CONFIG` | yes | Path to the allowlist config. The server will not start without one |
 | `TEAMS_MCP_CLIENT_ID` | no | Defaults to the first-party Teams client id; see SETUP.md for why you usually want the Office one. Also the knob for Graph throttle isolation — see "Throttle budgets are per client id" below |
 | `TEAMS_MCP_TOKEN_CACHE` | no | Defaults to `.token-cache.json` in the working directory. The members cache (see "@mentions" below) and the self-id cache (below) live next to it |
-| `TEAMS_MCP_MEMBERS_TTL_SECONDS` | no | How long a chat's cached member list is trusted before a mention resolution refreshes it. Defaults to 24h (86400) |
+| `TEAMS_MCP_MEMBERS_TTL_SECONDS` | no | How long a chat's cached member list is trusted before a mention resolution refreshes it (bounds a COMPLETE roster's `fetchedAt` and a PARTIAL, traffic-harvested roster's `harvestedAt` alike — see "@mentions" below). `send_chat_file`'s permission grant judges freshness against `fetchedAt` alone, ignoring intervening traffic, and never uses a PARTIAL roster at all. Defaults to 24h (86400) |
 | `TEAMS_MCP_SELF_ID` | no | Last-resort operator seed for the signed-in account's own AAD id (`resolveSelfId`), used internally so `send_chat_file` (row above) can exclude the assistant from its own read-access grant on the uploaded item. Normally unnecessary: the id is resolved once from `/me` and persisted next to the token cache with no TTL, so only the first process on a fresh install pays the live lookup. Must be GUID-shaped or it is ignored |
 | `TEAMS_MCP_DOWNLOAD_DIR` | no | Where attachment downloads land (`get_chat_attachment`, `download_chat_attachments`, `teams-attachments`). Defaults to a temp directory |
 | `TEAMS_MCP_UPLOAD_DIR` | no | OneDrive folder where `send_chat_file` parks uploads. Defaults to `ai-test` |

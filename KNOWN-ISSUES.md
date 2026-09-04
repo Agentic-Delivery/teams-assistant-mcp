@@ -41,6 +41,40 @@ cold/silent chat degrades to "served from stale data, logged" rather than "hard 
 throttle happens to clear on its own." See the README's "@mentions" section for the consumer-
 facing description.
 
+## A partial (traffic-harvested) roster was trusted verbatim for send_chat_file's permission grant, and never expired (found and closed the same day, 0.5.2 review round 2, 2026-09-04)
+
+The traffic-harvest mechanism above (mitigation 2) merges (senderId, senderDisplayName) pairs into
+the on-disk members cache without any `/members` validation — deliberate, since the whole point is
+zero Graph cost. A same-day review found the first cut of that mechanism let `membersForInvite`
+(`src/graph/teams-chats.ts`, `send_chat_file`'s permission-grant roster) read that SAME cache entry
+as if it were authoritative: a chat member who had never spoken (only harvested from OTHERS'
+traffic, or never harvested at all) never appeared in the grant, so `send_chat_file` shared a card
+they could not open — exactly the "no dead cards, ever" contract that method's own doc comment
+names. Worse, because `merge()` used to stamp `fetchedAt` (the SAME field a real `/members` fetch
+stamps) on every call, a harvested-only entry never expired, so a member who later LEFT the chat
+kept their file-read grant indefinitely — the 24h TTL that used to force a periodic re-check never
+fired for a roster that had never been fetched to begin with. The same partial roster also
+resurrected the throttled-`/me` incident (entry below): `send_chat_file`'s self-id
+roster-membership re-check saw the assistant absent from a roster that had simply never harvested
+its own messages, and forced a live `/me` on every send into such a chat regardless of a valid
+persisted self-id cache.
+
+**Closed same-day, 0.5.2 (`src/graph/members-cache.ts`):** every cache entry now carries explicit
+PROVENANCE — `complete: true` (and a real `fetchedAt`) for a roster confirmed by an actual
+`/members` fetch, `complete: false` (`fetchedAt: 0`, `harvestedAt` instead) for one assembled only
+from traffic. `membersForInvite` now reads the COMPLETE-only side of the cache
+(`getComplete`/`getStaleComplete`) — a PARTIAL entry reads as a plain miss, forcing exactly the
+`/members` call that used to be skipped (refusing the send loudly, THROTTLED, if that call itself
+is throttled — no partial grants, ever). Mention resolution is unaffected: `resolveMentions` still
+reads `get`/`getStale`, which serve a PARTIAL roster exactly as before, since a harvested-only
+roster missing a name simply falls through to a live refresh there too — the hazard was specific
+to a PERMISSION GRANT trusting incomplete data, not to mentions. On-disk shape stays
+0.5.1-compatible: `fetchedAt: 0` (not omitted) on a partial entry keeps it shape-valid for an old
+daemon's own `isValidEntry` check, which then reads it as instantly expired via its own TTL
+arithmetic — never trusted as complete by an older process either. No operator action needed on
+upgrade: a harvested-only entry already on disk simply reads as a miss on the next
+`send_chat_file`, which pays one real `/members` call and moves on.
+
 ## send_chat_file: a throttled /me refused every CLI attempt, one process at a time (live 2026-09-03, mitigated 0.5.1)
 
 `resolveSelfId`'s in-memory memo (`teams-chats.ts`) protects nothing across process boundaries,
@@ -127,7 +161,9 @@ was repeated per chat member.
 
 **Fixed 0.4.2**: `GraphTeamsChats.sendFile` now grants each OTHER chat member read access on the
 uploaded item (that same `/invite` call) BEFORE posting the chat message, resolved through the
-same cache-backed member roster resolveMentions already uses — never a direct call to the
+same on-disk cache resolveMentions uses, but read through its COMPLETE-only side — see the
+"A partial (traffic-harvested) roster..." entry below for why sendFile never trusts the same
+PARTIAL roster mention resolution may use — never a direct call to the
 throttled `/chats/{id}/members` endpoint on the send path (see README's "@mentions" section for
 why that endpoint is avoided on sends). The assistant's own id is excluded from the grant when it
 can be determined (it already owns the item as uploader) — since 0.5.1, via the persisted self-id
