@@ -6,29 +6,65 @@ import type { ChatMember } from './mentions.js';
  *  effectively never changes, so a day-long TTL trades staleness risk (a departed member still
  *  mentionable for up to this long) for taking the throttled `/members` endpoint off the send
  *  path entirely — see resolveMentions in teams-chats.ts for the refresh-on-miss fallback that
- *  bounds that risk to "one bad mention attempt", not "permanently wrong". THE single source of
- *  truth for the 24h default: config.ts derives its own (seconds-flavoured) default from this,
- *  rather than hardcoding a second "24h" that could drift from this one (0.4.1 review round 1). */
+ *  bounds that risk to "one bad mention attempt", not "permanently wrong". Bounds mention
+ *  resolution's own `get()`/`getComplete()` freshness window for BOTH a real `/members` fetch
+ *  (`fetchedAt`) and traffic-harvested evidence (`harvestedAt`) — but `membersForInvite`
+ *  (sendFile's permission-grant roster, teams-chats.ts) never trusts a PARTIAL (harvested-only)
+ *  roster at all, regardless of TTL: see `getComplete`'s own doc comment (0.5.2 BLOCKER 1 fix,
+ *  2026-09-04 review) for why a departed member merely NOT re-confirmed by traffic must not keep a
+ *  file grant past this window either. THE single source of truth for the 24h default: config.ts
+ *  derives its own (seconds-flavoured) default from this, rather than hardcoding a second "24h"
+ *  that could drift from this one (0.4.1 review round 1). */
 export const DEFAULT_MEMBERS_TTL_MS = 24 * 60 * 60 * 1000;
 
 interface MembersCacheEntry {
   members: ChatMember[];
+  /** Epoch ms of the last real `GET /chats/{id}/members` fetch (`set()`). `0` for an entry that
+   *  has NEVER been backed by a real fetch — a PARTIAL, traffic-harvested-only roster (see
+   *  `complete` below). `0` (not omitted) is deliberate: 0.5.1's own `isValidEntry` requires this
+   *  field to be a `number` to accept the entry at all, so omitting it would make a 0.5.1 daemon
+   *  silently DROP a partial entry on its next read-modify-write cycle; `0` keeps the entry
+   *  shape-valid for 0.5.1 (which then reads it as instantly expired via its own `now() - 0 >
+   *  ttlMs` check — i.e. "never cached", never "trust this verbatim") while surviving round-trips
+   *  through an old daemon untouched. See merge()'s own doc comment for the fuller reasoning
+   *  (0.5.2 BLOCKER 1 fix, 2026-09-04 review). */
   fetchedAt: number;
+  /** Epoch ms of the most recent traffic harvest (`merge()`) that touched this entry — present
+   *  once ANY merge has landed, on a COMPLETE roster too (traffic reconfirming an authoritative
+   *  roster is still useful signal for `get()`, just never for `getComplete()`). Absent on an
+   *  entry only ever written by `set()`. */
+  harvestedAt?: number;
+  /** `true` = an authoritative roster confirmed by a real `/members` fetch (`set()`).
+   *  `false` = a PARTIAL roster assembled ONLY from traffic (`merge()`) — never confirmed against
+   *  `/members`, and therefore never authoritative enough for a permission grant (`getComplete`/
+   *  `getStaleComplete` refuse it). Absent reads as `true` — every entry from before this field
+   *  existed (0.5.1 and earlier) was written by `set()` alone, since `merge()` did not exist yet,
+   *  so a legacy entry with no opinion here IS a real `/members` roster. */
+  complete?: boolean;
 }
 
 type MembersCacheFile = Record<string, MembersCacheEntry>;
 
 /** True only for a shape `get()`/callers can trust: `fetchedAt` a number (a non-number would make
  *  `now() - fetchedAt` a NaN comparison, which silently reads as "never expires" — 0.4.1 review),
- *  `members` an array. Doesn't validate each member's own shape (id/displayName): a chat member
- *  the roster couldn't resolve is already handled downstream in mentions.ts, and this cache's job
- *  ends at "did the JSON honestly describe an entry, not garbage". */
+ *  `members` an array, and `harvestedAt`/`complete` — if present at all — honestly typed. Doesn't
+ *  validate each member's own shape (id/displayName): a chat member the roster couldn't resolve is
+ *  already handled downstream in mentions.ts, and this cache's job ends at "did the JSON honestly
+ *  describe an entry, not garbage". */
 function isValidEntry(value: unknown): value is MembersCacheEntry {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    !Array.isArray((value as { members?: unknown }).members) ||
+    typeof (value as { fetchedAt?: unknown }).fetchedAt !== 'number'
+  ) {
+    return false;
+  }
+  const harvestedAt = (value as { harvestedAt?: unknown }).harvestedAt;
+  const complete = (value as { complete?: unknown }).complete;
   return (
-    typeof value === 'object' &&
-    value !== null &&
-    Array.isArray((value as { members?: unknown }).members) &&
-    typeof (value as { fetchedAt?: unknown }).fetchedAt === 'number'
+    (harvestedAt === undefined || typeof harvestedAt === 'number') &&
+    (complete === undefined || typeof complete === 'boolean')
   );
 }
 
@@ -76,9 +112,44 @@ export class MembersCache {
     this.renameFn = options.renameFn;
   }
 
+  /**
+   * Fresh-enough read for MENTION resolution — the only caller with any business reading a
+   * PARTIAL (traffic-harvested-only) roster (0.5.2 BLOCKER 1 fix, 2026-09-04 review): a name
+   * absent from a partial roster still falls through to a live refresh (teams-chats.ts), so
+   * serving one here costs nothing but a possibly-incomplete match set, never a wrong grant.
+   * Freshness is judged against whichever evidence is more recent — a real `/members` fetch
+   * (`fetchedAt`) OR the last traffic harvest (`harvestedAt`) — so a busy chat's partial roster
+   * stays usable without a live call for as long as traffic keeps confirming it, same as a
+   * COMPLETE roster always has. `membersForInvite`'s permission-grant path must NEVER call this —
+   * see `getComplete` below, the one it uses instead.
+   */
   get(chatId: string): ChatMember[] | undefined {
     const entry = this.readFile()[chatId];
     if (!entry) {
+      return undefined;
+    }
+    const freshAt = Math.max(entry.fetchedAt, entry.harvestedAt ?? 0);
+    if (this.now() - freshAt > this.ttlMs) {
+      return undefined;
+    }
+    return entry.members;
+  }
+
+  /**
+   * The COMPLETE-only twin of get() — `membersForInvite`'s (sendFile's permission-grant roster,
+   * teams-chats.ts) fresh read (0.5.2 BLOCKER 1 fix, 2026-09-04 review). Refuses a PARTIAL
+   * (traffic-harvested-only, `complete: false`) entry outright, returning undefined exactly as if
+   * nothing were cached — the caller then has no choice but a real `/members` fetch, which is the
+   * whole point: a chat member who has never spoken must still be found and granted access, and a
+   * departed member who stops speaking must still fall out of the grant once this roster's OWN
+   * `fetchedAt` (never extended by traffic — see merge()'s own doc comment) goes past the TTL.
+   * Freshness is judged against `fetchedAt` ONLY, deliberately ignoring `harvestedAt`: traffic
+   * reconfirming who is still around is good enough evidence for a mention, but not for a file
+   * permission grant, which re-verifies against the authoritative endpoint on its own schedule.
+   */
+  getComplete(chatId: string): ChatMember[] | undefined {
+    const entry = this.readFile()[chatId];
+    if (!entry || entry.complete === false) {
       return undefined;
     }
     if (this.now() - entry.fetchedAt > this.ttlMs) {
@@ -95,10 +166,27 @@ export class MembersCache {
    * throttled endpoint. This method is the caller's ONLY escape hatch, and it is deliberately
    * not what get() itself does — a normal cache hit must still honour the TTL; only a caller
    * that has ALREADY tried and failed a live refresh has any business reaching for stale data.
+   * Serves ANY roster (complete or partial) — resolveMentions's stale-serve fallback may safely
+   * use a partial roster on a throttled refresh, same reasoning as get() above.
    */
   getStale(chatId: string): { members: ChatMember[]; fetchedAt: number } | undefined {
     const entry = this.readFile()[chatId];
     return entry ? { members: entry.members, fetchedAt: entry.fetchedAt } : undefined;
+  }
+
+  /**
+   * The COMPLETE-only twin of getStale() — `membersForInvite`'s stale-serve fallback on a
+   * throttled/transient `/members` refresh (0.5.2 BLOCKER 1 fix, 2026-09-04 review). A PARTIAL
+   * entry returns undefined here even though getStale() would happily serve it: a harvested-only
+   * roster has never been confirmed complete, so there is nothing honest to "serve stale" — the
+   * caller must fail the send instead (no partial grants, no dead cards).
+   */
+  getStaleComplete(chatId: string): { members: ChatMember[]; fetchedAt: number } | undefined {
+    const entry = this.readFile()[chatId];
+    if (!entry || entry.complete === false) {
+      return undefined;
+    }
+    return { members: entry.members, fetchedAt: entry.fetchedAt };
   }
 
   /**
@@ -109,10 +197,21 @@ export class MembersCache {
    * @mentioning. A harvested pair missing either field is dropped rather than persisted — this
    * is untrusted data reaching the cache directly, with no `/members` validation in between, and
    * a junk entry (an id with no name, or vice versa) would otherwise corrupt real mention
-   * resolution later. `fetchedAt` is stamped with now() on every merge that persists anything, not
-   * just a brand-new sender: traffic from an ALREADY-known member is still live evidence the
-   * roster is current, which is the whole point of "refreshes from traffic alone" — a chat that
-   * stays busy never needs a live `/members` call again. A merge with nothing valid to add never
+   * resolution later.
+   *
+   * PROVENANCE (0.5.2 BLOCKER 1 fix, 2026-09-04 review — a harvested roster used verbatim as
+   * `sendFile`'s permission-grant list silently omitted real, silent chat members, and a departed
+   * member's file grant never expired because every merge used to restamp `fetchedAt`, the SAME
+   * field a real `/members` fetch stamps): a merge into an entry that is already COMPLETE (a real
+   * `/members` fetch, or no `complete` flag at all — a legacy 0.5.1 entry, which can only ever
+   * have come from `set()`) keeps it complete and — critically — keeps its ORIGINAL `fetchedAt`
+   * untouched; traffic augments a complete roster's member list (a genuinely new member Graph
+   * hasn't been asked about yet, say) but never re-certifies it as freshly fetched. A merge into
+   * no entry, or an already-PARTIAL one, produces/extends a PARTIAL entry: `fetchedAt: 0` (the
+   * 0.5.1-compatible "instantly expired" marker — see `MembersCacheEntry.fetchedAt`'s own doc
+   * comment for why 0, not omitted), `complete: false`. Either way `harvestedAt` is stamped with
+   * now() — that field alone is what "refreshes from traffic alone" now means, and get() (never
+   * getComplete()) is the only reader that honours it. A merge with nothing valid to add never
    * touches the disk at all.
    */
   merge(chatId: string, harvested: ReadonlyArray<{ id: string; displayName: string }>): void {
@@ -122,11 +221,17 @@ export class MembersCache {
     }
     const file = this.readFile();
     const existing = file[chatId];
+    const wasComplete = existing !== undefined && existing.complete !== false;
     const byId = new Map((existing?.members ?? []).flatMap((member) => (member.id ? [[member.id, member] as const] : [])));
     for (const { id, displayName } of valid) {
       byId.set(id, { id, displayName });
     }
-    file[chatId] = { members: [...byId.values()], fetchedAt: this.now() };
+    file[chatId] = {
+      members: [...byId.values()],
+      fetchedAt: wasComplete ? (existing as MembersCacheEntry).fetchedAt : 0,
+      harvestedAt: this.now(),
+      complete: wasComplete,
+    };
     this.writeFile(file);
   }
 
@@ -141,7 +246,11 @@ export class MembersCache {
    */
   set(chatId: string, members: ChatMember[]): void {
     const file = this.readFile();
-    file[chatId] = { members, fetchedAt: this.now() };
+    // A real /members fetch is always fully authoritative — complete: true (and no harvestedAt:
+    // any prior traffic evidence is superseded, not merged with, since this IS the ground truth
+    // that evidence was only ever a substitute for). See merge()'s own doc comment for the
+    // PARTIAL/COMPLETE distinction this entry now carries (0.5.2 BLOCKER 1 fix).
+    file[chatId] = { members, fetchedAt: this.now(), complete: true };
     this.writeFile(file);
   }
 
