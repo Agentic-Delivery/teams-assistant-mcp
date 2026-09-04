@@ -206,13 +206,20 @@ triggers the same remedy as a last resort, because the actual live incident's ow
 remedy fires once per failing streak and logs what actually happened at each step (requested, then
 still failing, or recovered), not just the initial intent.
 
-A failing poll appends `{"error": "...", "at": "..."}` to the same file. That line is the
-difference between "the chats are quiet" and "auth is dead" — a watcher must never have to
-guess which silence it is looking at. An identical failure repeating poll after poll is written
-once, not once per poll. When *everything* fails (auth death, network gone) the interval backs
-off, doubling to a 10-minute cap and snapping back on recovery; a single failing chat — usually
-one the account has not been added to yet — is surfaced but does not slow the healthy chats
-down. The poller never crashes the server; every poll is fully caught.
+A failing poll appends `{"error": "...", "at": "...", "consecutiveFailures": N}` to the same file.
+That line is the difference between "the chats are quiet" and "auth is dead" — a watcher must
+never have to guess which silence it is looking at. An identical failure repeating poll after poll
+is written once, not once per poll — re-surfacing only at 10 and 50 consecutive failures with a
+running count (`"still failing after N polls: ..."`), so a five-hour outage does not hide behind
+one stale line and a watcher reading only the file's tail can still tell it is ongoing. A recovery
+after ten or more failed polls writes `{"recovered": true, "at": "...", "afterFailures": N}`; a
+short blip (fewer than ten) stays quiet, same as before. When *everything* fails (auth death,
+network gone) the interval backs off, doubling to a 10-minute cap and snapping back on recovery —
+a 429's `Retry-After`, when Graph names one, floors the next delay instead of the doubled guess,
+so the poller never comes back sooner than Graph itself asked and feeds the penalty window it is
+trying to back off from. A single failing chat — usually one the account has not been added to
+yet — is surfaced but does not slow the healthy chats down. The poller never crashes the server;
+every poll is fully caught.
 
 The recommended consumption pattern: arm a file watcher (Claude Code's `Monitor`, `tail -F`,
 inotify) on the inbox path at session start and react per line. Do not poll the tools for new
@@ -224,7 +231,55 @@ of the per-mailbox Graph read budget — see "Downloading attachments" for the m
 consequences), and `TEAMS_INBOX_DISABLED=1` switches the poller off entirely for consumers that
 only post. The poller also honours the quota-yield file the attachment tools write — while it
 stands, cycles are skipped (logged once per yield, not per cycle) and the backoff does not
-double, so polling resumes at the normal cadence the moment the yield lifts.
+double, so polling resumes at the normal cadence the moment the yield lifts. A yielded cycle is
+recorded in the health file below as `yielded: true`, not as a fresh success.
+
+## Supervising the daemon
+
+On 2026-08-21 two Claude Code sessions running the server at once meant two pollers on the same
+default inbox path, duplicating lines and racing on `inbox-state.json`; a related incident killed
+one project's poller in a host reboot while a second project's daemon (same `dist/index.js` path,
+different env) survived, and a pgrep-based liveness check matched the survivor — the dead pipeline
+read as "up" and an allowlisted chat sat undelivered for 1.5 hours. pgrep is the wrong tool here on
+principle: it answers "does some process matching this pattern exist", when the question is "is
+THIS inbox's pipeline delivering". Two files beside the inbox answer that properly:
+
+```
+~/.teams-assistant/poller-health.json   liveness snapshot, rewritten after every poll
+~/.teams-assistant/poller.lock          single-instance lock, one poller per inbox
+```
+
+**The health file** is the liveness contract. After every poll — clean, failed, or skipped for the
+quota yield — the poller atomically rewrites it (tmp + rename, so a reader never sees a torn
+snapshot):
+
+```json
+{ "pid": 1234, "inboxPath": "...", "lastAttemptAt": "...", "lastSuccessAt": "...",
+  "ok": true, "consecutiveFailures": 0, "backoffMs": 30000 }
+```
+
+How a watcher should judge it: `lastAttemptAt` older than a couple of `backoffMs` (the delay the
+poller itself announced before its next attempt) means the poller is dead or wedged, whatever the
+process table says. A fresh `lastAttemptAt` with `ok: false` means the opposite failure: the
+process is up but its polls are failing — process-up and pipeline-up are different claims, and the
+file distinguishes them where pgrep cannot. `lastSuccessAt` survives failures (and yields), so it
+also says how long an outage has run. A cycle skipped for the quota yield carries `yielded: true`
+and does NOT advance `lastSuccessAt` — it is deliberate politeness, not a poll that actually ran,
+and a watcher must not read it as either a fresh success or a failure.
+
+**The lock** makes "one poller per inbox" checked instead of assumed. On start the server takes
+`poller.lock`, keyed to the resolved inbox path (`dirname(inboxPathFor(env))` — the same helper
+the poller and the CLIs use, so a `TEAMS_INBOX_PATH` override moves the lock with everything else
+it already moves). If a live pid already holds it, the newcomer says so loudly on stderr — naming
+the holder's pid and how long it has held the lock — and **exits non-zero** rather than lingering
+as a server that silently never polls; a dead holder's lock (the reboot case) is taken over
+automatically.
+
+**The trap**: the lock is keyed per inbox PATH, not per config directory. An instance that sets
+its own `TEAMS_MCP_CONFIG` / `TEAMS_MCP_TOKEN_CACHE` but leaves `TEAMS_INBOX_PATH` unset still
+falls back to the same default inbox path as any other such instance, and therefore silently
+contends for the same lock — from the losing instance's own environment, nothing looks shared. **A
+second instance for a second account MUST set its own `TEAMS_INBOX_PATH`** (see `env.example`).
 
 ## Downloading attachments
 
@@ -438,7 +493,7 @@ credential, an account name, or a tenant id, and nothing ever should.
 | `TEAMS_MCP_DOWNLOAD_DIR` | no | Where attachment downloads land (`get_chat_attachment`, `download_chat_attachments`, `teams-attachments`). Defaults to a temp directory |
 | `TEAMS_MCP_UPLOAD_DIR` | no | OneDrive folder where `send_chat_file` parks uploads. Defaults to `ai-test` |
 | `TEAMS_MCP_DISPLAY_NAME` | no | Overrides the expected display name for the probe |
-| `TEAMS_INBOX_PATH` | no | Where the background inbox JSONL lands. Defaults to `~/.teams-assistant/inbox.jsonl` |
+| `TEAMS_INBOX_PATH` | no | Where the background inbox JSONL lands. Defaults to `~/.teams-assistant/inbox.jsonl`. **Set this to a distinct path for every additional server instance on the same host** — the poller's single-instance lock (`poller.lock`) and health file (`poller-health.json`) are keyed to this path, not to `TEAMS_MCP_CONFIG`, so two instances that both leave it unset silently share one lock and only one of them polls (see "Supervising the daemon") |
 | `TEAMS_INBOX_POLL_SECONDS` | no | Inbox poll interval, default 30. Raising it frees per-mailbox Graph read budget for ad-hoc reads — see "Downloading attachments" |
 | `TEAMS_INBOX_DISABLED` | no | Set to `1` to not run the background inbox poller at all |
 

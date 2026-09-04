@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { dirname, join } from 'node:path';
 import { buildChats } from './build-chats.js';
 import { buildInboxPoller } from './build-inbox-poller.js';
 import { loadConfig } from './config.js';
 import { inboxPathFor, inboxYieldPathFor } from './inbox-yield.js';
+import { acquirePollerLock } from './poller-lock.js';
 import { buildServer } from './server.js';
 
 async function main(): Promise<void> {
@@ -42,6 +44,32 @@ async function main(): Promise<void> {
     return;
   }
   const inboxPath = inboxPathFor(process.env);
+
+  // One poller per inbox, enforced (carries the poller-supervision work from PR #8 onto 0.5.2):
+  // two daemons for different projects once raced on one shared account and fed each other's
+  // throttle penalty. The lock path is derived from the SAME inboxPathFor(env) helper the poller
+  // and the CLIs already use — not a second copy of the resolve logic — so it moves with
+  // TEAMS_INBOX_PATH exactly like the inbox and its sidecars do. Keyed per inbox PATH, not per
+  // config directory: an instance that sets its own TEAMS_MCP_CONFIG/TEAMS_MCP_TOKEN_CACHE but
+  // leaves TEAMS_INBOX_PATH unset still falls back to the same default inbox path as any other
+  // such instance, and therefore silently contends for the same lock — see env.example and the
+  // README's "Supervising the daemon" section for the operator-facing warning this requires. A
+  // live holder wins; the loser here logs why and exits non-zero (0.5.4) rather than lingering as
+  // a tools-only server, because a server that silently never polls is exactly the invisible
+  // failure this lock exists to prevent, and only a non-zero exit lets a process manager notice.
+  const lockPath = join(dirname(inboxPath), 'poller.lock');
+  const lock = await acquirePollerLock({ lockPath });
+  if (!lock.acquired) {
+    process.stderr.write(
+      `inbox poller NOT started: pid ${lock.holderPid} already polls ${inboxPath} ` +
+        `(holds ${lockPath}${lock.holderStartedAt ? `, since ${lock.holderStartedAt}` : ''}); ` +
+        'exiting rather than serving as a silent tools-only twin. If this is a second account ' +
+        'that legitimately needs its own poller, set TEAMS_INBOX_PATH to a distinct path for ' +
+        'this instance.\n',
+    );
+    process.exit(1);
+  }
+
   // The 30s default across N allowlisted chats consumes a real share of the per-mailbox Graph
   // read budget (measured 2026-09-02 — see inbox-yield.ts). This knob lets a deployment that
   // also does ad-hoc reads slow the poller down; garbage or non-positive values fall back to
