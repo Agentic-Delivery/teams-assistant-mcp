@@ -154,3 +154,17 @@ conduct/profile must carry the mandate — one line is enough:
 > `teams-styling` skill; agents load it before composing any such message.
 
 Without that line, expect agents to fall back to plain-text walls.
+
+**Where that line lives — and nothing of this package beside it.** No package artifact goes
+into a customer's repository: this skill is read from the plugin cache, and everything a
+project writes against it — the mandate line above, a project overlay of this skill, the
+project's own channel conventions (board wording, pinned-message ids, the mention roster),
+the settings that register this plugin — lives in the consumer's `.claude/` directory, which
+is the clone of the provider's private per-project repository and is never tracked by the
+consumer repository. The line names a plugin, so it is method, and it goes in the private
+`.claude/CLAUDE.md` or the profile, not in a customer-visible document. The check, before
+composing anything: `git ls-files .claude` in the consumer repository prints nothing and
+`.gitignore` carries `.claude/`; a hit is a blocker handled first, as the delivery package's
+consumer-repository hygiene reference describes (tip removal, history purge with the
+repository admin, both logged). Ruling of 2026-09-04, after one consumer was found carrying
+agent overlays, memory and profile in the customer's repository for two months.
