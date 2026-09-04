@@ -270,10 +270,15 @@ and a watcher must not read it as either a fresh success or a failure.
 **The lock** makes "one poller per inbox" checked instead of assumed. On start the server takes
 `poller.lock`, keyed to the resolved inbox path (`dirname(inboxPathFor(env))` — the same helper
 the poller and the CLIs use, so a `TEAMS_INBOX_PATH` override moves the lock with everything else
-it already moves). If a live pid already holds it, the newcomer says so loudly on stderr — naming
-the holder's pid and how long it has held the lock — and **exits non-zero** rather than lingering
-as a server that silently never polls; a dead holder's lock (the reboot case) is taken over
-automatically.
+it already moves). If a live pid already holds it, the newcomer logs one line on stderr — naming
+the lock path it lost — and **serves every other MCP tool normally, running no poller** for this
+process; a dead holder's lock (the reboot case) is taken over automatically. This matters because
+`dist/index.js` is also what an MCP tools registration runs (see "Installing into a
+project"), against the same daemon `.env` more often than not: exiting on a contended lock would
+silently drop every Teams tool for that session the moment a daemon was already polling, for a
+reason no MCP client surfaces. The lock's only job is "one poller per inbox", and not starting a
+second poller fully satisfies it — a process manager watching for a poller should watch the
+health file above, not this process's exit code.
 
 **The trap**: the lock is keyed per inbox PATH, not per config directory. An instance that sets
 its own `TEAMS_MCP_CONFIG` / `TEAMS_MCP_TOKEN_CACHE` but leaves `TEAMS_INBOX_PATH` unset still

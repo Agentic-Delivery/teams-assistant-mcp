@@ -335,18 +335,25 @@ Graph.
 **Closed 0.5.4** with the fix direction this entry originally named: a lock file next to the
 inbox (`poller.lock`, `src/poller-lock.ts`), keyed to the inbox path (`dirname(inboxPathFor(env))`
 — `src/inbox-yield.ts`'s own path helper, not a second copy of the resolve logic), acquired in
-`index.ts` before the poller starts. A live holder wins; the newcomer logs the holder's pid and
-lock path on stderr and **exits non-zero** rather than lingering as a tools-only server — a
-process that silently never polls is the same invisible-failure shape this whole entry describes,
-and only a non-zero exit lets a process manager (systemd, pm2, a supervisor script) notice and
-restart or alert. A dead holder's lock (a reboot, a crash) is taken over automatically.
+`index.ts` before the poller starts. A live holder wins; the newcomer logs the lock path it lost
+on stderr and **serves every other MCP tool normally, running no poller** — not a non-zero exit
+(that was this fix's own first draft, corrected before merge in the PR #20 review: this same
+`dist/index.js` entrypoint is what an MCP tools registration runs, against the same daemon `.env`
+more often than not, so exiting on a contended lock would have silently dropped every Teams tool
+for that session the moment a daemon was already polling). A process that silently never polls is
+the invisible-failure shape this whole entry describes, but the poller's own liveness is already
+covered by `poller-health.json` below — a process manager or watcher should watch that file, not
+this process's exit code. A dead holder's lock (a reboot, a crash) is taken over automatically.
+See `src/inbox-role.ts` for the pure decision (`decideInboxRole`) and `src/inbox-startup.ts` for
+the wiring that acts on it.
 
 **The trap this creates**: the lock is keyed per inbox PATH, not per config directory. Two
 instances that each set their own `TEAMS_MCP_CONFIG`/`TEAMS_MCP_TOKEN_CACHE` but both leave
 `TEAMS_INBOX_PATH` unset still resolve to the SAME default inbox path, and therefore silently
-contend for the SAME lock — the second one to start exits non-zero for what looks, from its own
-env, like a completely independent instance. A second instance for a second account **must** set
-its own `TEAMS_INBOX_PATH` (see `env.example` and the README's "Supervising the daemon" section).
+contend for the SAME lock — the second one to start simply never polls, for what looks, from its
+own env, like a completely independent instance. A second instance for a second account **must**
+set its own `TEAMS_INBOX_PATH` (see `env.example` and the README's "Supervising the daemon"
+section).
 
 Same release also adds `poller-health.json` beside the inbox (rewritten after every poll, clean,
 failed, or yielded) so a watcher can tell "the pipeline is alive" from process existence alone —

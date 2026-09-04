@@ -17,17 +17,19 @@ import { dirname } from 'node:path';
  * TEAMS_INBOX_PATH values correctly keep two independent pollers. The trap this creates: an
  * instance that sets TEAMS_MCP_CONFIG/TEAMS_MCP_TOKEN_CACHE to its own directory but leaves
  * TEAMS_INBOX_PATH unset falls back to the SAME default inbox path as any other instance that
- * also left it unset, and therefore silently contends for the SAME lock — see index.ts's own
- * comment at the acquirePollerLock call site, and the "Supervising the daemon" section of the
+ * also left it unset, and therefore silently contends for the SAME lock — see inbox-startup.ts's
+ * own comment at the acquirePollerLock call site, and the "Supervising the daemon" section of the
  * README, for the operator-facing warning this requires (env.example says it too).
  *
  * The lock is advisory, pid-based, and deliberately simple: a JSON file naming the holder. A
- * holder whose pid is dead (the reboot case) is taken over; a live holder wins, and — since
- * 0.5.4 — the loser logs why and exits non-zero rather than lingering as a tools-only server: a
- * server that silently never polls is exactly the invisible failure mode this lock exists to
- * prevent, and a process manager needs a non-zero exit to notice and alert on. The read-then-
- * write window is not atomic across processes, but the failure mode this guards against is a
- * long-lived daemon meeting a newcomer, not two processes starting in the same millisecond.
+ * holder whose pid is dead (the reboot case) is taken over; a live holder wins, and the loser
+ * serves every other MCP tool normally, running no poller of its own — NOT a non-zero exit
+ * (0.5.4's first draft did exit here, but this entrypoint is also what an MCP tools registration
+ * runs against the same daemon .env, so exiting on a contended lock silently drops every Teams
+ * tool for that session; fixed in the PR #20 review before merge). See inbox-role.ts's
+ * decideInboxRole for the role decision this result feeds. The read-then-write window is not
+ * atomic across processes, but the failure mode this guards against is a long-lived daemon
+ * meeting a newcomer, not two processes starting in the same millisecond.
  */
 
 export interface PollerLockDeps {
