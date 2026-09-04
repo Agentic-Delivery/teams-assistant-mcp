@@ -12,18 +12,31 @@ const stubToken: TokenProvider = { kind: 'stub', getAccessToken: async () => 'th
 // trivial no-op double — the member-cache behaviour itself is covered in teams-chats.test.ts.
 // (sendFile is the one method here that DOES read this cache, for its 0.4.2 permission grant —
 // its own tests below wire a warmed double instead; see warmMembersCache.)
-const noMembersCache: MembersCachePort = { get: () => undefined, set: () => {}, getStale: () => undefined };
+const noMembersCache: MembersCachePort = {
+  get: () => undefined,
+  set: () => {},
+  getStale: () => undefined,
+  getComplete: () => undefined,
+  getStaleComplete: () => undefined,
+};
 
 /** A pre-warmed double for the two sendFile tests below — sendFile now reads the member cache
  *  (0.4.2, to grant chat members read access on the uploaded item) the same way resolveMentions
  *  always has; these two tests are otherwise entirely about the upload/eTag mechanics, so this
- *  just needs to be a stable, non-empty roster with one other AAD id to invite. */
+ *  just needs to be a stable, non-empty COMPLETE roster (0.5.2: membersForInvite reads getComplete,
+ *  not get() — see teams-chats.ts) with one other AAD id to invite. */
 function warmMembersCache(): MembersCachePort {
   const members = [
     { id: 'self-aad-id', displayName: 'Assistant (AI)' },
     { id: 'aad-bob', displayName: 'Bob Brown' },
   ];
-  return { get: () => members, set: () => {}, getStale: () => ({ members, fetchedAt: 0 }) };
+  return {
+    get: () => members,
+    set: () => {},
+    getStale: () => ({ members, fetchedAt: 0 }),
+    getComplete: () => members,
+    getStaleComplete: () => ({ members, fetchedAt: 0 }),
+  };
 }
 
 function json(body: unknown, status = 200): Response {

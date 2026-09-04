@@ -72,7 +72,13 @@ async function main(): Promise<void> {
     // The probe never resolves mentions, so a real disk-backed cache would be pure overhead —
     // membersCache is a required GraphTeamsChats dependency, so a trivial no-op stands in.
     const chats = await new GraphTeamsChats(graph, {
-      membersCache: { get: () => undefined, set: () => {}, getStale: () => undefined },
+      membersCache: {
+        get: () => undefined,
+        set: () => {},
+        getStale: () => undefined,
+        getComplete: () => undefined,
+        getStaleComplete: () => undefined,
+      },
     }).listChats();
     console.log(`GET /me/chats ok — ${chats.length} chat(s)`);
     for (const chat of chats) {

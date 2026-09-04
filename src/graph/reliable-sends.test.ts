@@ -8,7 +8,13 @@ import { toChatMessage, type ChatMessage, type ReadResult } from '../messages.js
 // None of this file's "real assembly" describe blocks touch mention resolution; membersCache is
 // a required GraphTeamsChats dependency (0.4.1 review round 1), so a trivial no-op double stands
 // in everywhere below, module-scoped so every describe block can see it.
-const noMembersCache: MembersCachePort = { get: () => undefined, set: () => {}, getStale: () => undefined };
+const noMembersCache: MembersCachePort = {
+  get: () => undefined,
+  set: () => {},
+  getStale: () => undefined,
+  getComplete: () => undefined,
+  getStaleComplete: () => undefined,
+};
 
 function message(overrides: Partial<ChatMessage>): ChatMessage {
   return {

@@ -1423,6 +1423,246 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
   });
 });
 
+// 2026-09-04 review, BLOCKER 1 & 2: a PARTIAL (traffic-harvested-only) roster used verbatim as
+// sendFile's permission-grant list silently omitted real, silent chat members, and — because the
+// old merge() restamped the SAME fetchedAt a real fetch does — that partial entry never expired,
+// so a departed member's file grant never lapsed either. The roster-membership self-id re-check
+// then also forced a live /me on every send into such a chat, resurrecting the throttled-/me
+// incident 0.5.1 closed. Fixed via MembersCache's PARTIAL/COMPLETE provenance (members-cache.ts):
+// membersForInvite now reads getComplete()/getStaleComplete(), never get()/getStale().
+describe('GraphTeamsChats.sendFile — a PARTIAL (traffic-harvested) roster is never used verbatim for the permission grant (0.5.2 BLOCKER-1/BLOCKER-2 fix)', () => {
+  let dir: string;
+  let path: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'teams-chats-partial-roster-'));
+    path = join(dir, 'members-cache.json');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function subject(fetchFn: typeof fetch, cache: MembersCache) {
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn });
+    return new GraphTeamsChats(graph, { membersCache: cache });
+  }
+
+  function selfIdResponse() {
+    return json({ id: 'aad-self' });
+  }
+
+  const uploadResponse = () =>
+    json({
+      id: 'drive-item-partial',
+      eTag: '"{ABCDEF12-3456-7890-ABCD-EF1234567890},1"',
+      webUrl: 'https://contoso.sharepoint.com/personal/assistant/report.pdf',
+      name: 'report.pdf',
+    });
+
+  function grantsFor(objectIds: readonly string[]) {
+    return json({ value: objectIds.map((id) => ({ grantedToV2: { user: { id } } })) });
+  }
+
+  // BLOCKER-1, TRIGGERING: reproduces the review's own repro — a chat whose real membership is
+  // Bob + Carol + self, but the on-disk roster only knows Bob because that is all traffic ever
+  // harvested (Carol has never spoken). The grant must cover EVERYONE Graph's own /members
+  // reports, not just the harvested subset.
+  it('BLOCKER-1 TRIGGERING: a partial roster (harvested Bob only) forces one /members refresh and grants the FULL live roster (Bob AND Carol), not just the harvested subset', async () => {
+    const cache = new MembersCache({ path });
+    cache.merge(CHAT, [{ id: 'aad-bob', displayName: 'Bob Brown' }]); // PARTIAL: Carol never harvested
+
+    let membersCalls = 0;
+    let inviteBody: unknown;
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) return selfIdResponse();
+      if (u.includes('/members')) {
+        membersCalls += 1;
+        return json({
+          value: [
+            { userId: 'aad-self', displayName: 'Assistant (AI)' },
+            { userId: 'aad-bob', displayName: 'Bob Brown' },
+            { userId: 'aad-carol', displayName: 'Carol White' },
+          ],
+        });
+      }
+      if (u.includes('/root:') && method === 'PUT') return uploadResponse();
+      if (u.includes('/invite')) {
+        inviteBody = JSON.parse(String(init?.body));
+        return grantsFor(['aad-bob', 'aad-carol']);
+      }
+      if (u.includes('/messages') && method === 'POST') {
+        return json({
+          id: 'msg-partial-roster',
+          chatId: CHAT,
+          createdDateTime: '2026-09-04T10:00:00Z',
+          body: { contentType: 'html', content: '' },
+        });
+      }
+      throw new Error(`unexpected call in this test: ${method} ${u}`);
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    const sent = await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
+
+    expect(membersCalls).toBe(1);
+    expect(inviteBody).toEqual({
+      recipients: [{ objectId: 'aad-bob' }, { objectId: 'aad-carol' }],
+      requireSignIn: true,
+      sendInvitation: false,
+      roles: ['read'],
+    });
+    expect(sent.id).toBe('msg-partial-roster');
+    // The refresh persisted a genuinely COMPLETE entry — a fresh MembersCache instance over the
+    // same file confirms it via getComplete(), never possible for a merely-merged entry.
+    expect(new MembersCache({ path }).getComplete(CHAT)).toEqual(
+      expect.arrayContaining([
+        { id: 'aad-self', displayName: 'Assistant (AI)' },
+        { id: 'aad-bob', displayName: 'Bob Brown' },
+        { id: 'aad-carol', displayName: 'Carol White' },
+      ]),
+    );
+  });
+
+  // BLOCKER-1, NON-TRIGGERING (the refusal side): the SAME partial roster, but the refresh it
+  // forces is throttled — no complete roster has EVER existed for this chat, so there is nothing
+  // honest to stale-serve. Must refuse loudly, and nothing may be uploaded before that refusal
+  // (the existing "refuse BEFORE the upload" ordering, preserved).
+  it('BLOCKER-1 NON-TRIGGERING: a partial-only roster + a throttled /members refresh refuses the send with THROTTLED — no partial grant, nothing uploaded', async () => {
+    const cache = new MembersCache({ path });
+    cache.merge(CHAT, [{ id: 'aad-bob', displayName: 'Bob Brown' }]); // PARTIAL only, no prior /members ever
+
+    const fetchFn = vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes('/me?') && u.includes('select=id')) return selfIdResponse();
+      if (u.includes('/members')) {
+        return json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
+          'retry-after': '100',
+        });
+      }
+      throw new Error(`unexpected call — upload/invite/message must never be reached: ${u}`);
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    const error = await chats
+      .sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(GraphError);
+    expect((error as GraphError).status).toBe(429);
+    expect((error as GraphError).message).toMatch(/THROTTLED/);
+  });
+
+  // BLOCKER-2: the self-id roster-membership re-check must not force a live /me merely because a
+  // PARTIAL roster (harvested before self ever spoke) happens to lack self — the /members refresh
+  // membersForInvite forces on a partial roster returns a REAL, complete roster that (like any
+  // real /members response) already includes self, so the persisted self-id cache is trusted as
+  // is and zero /me calls are made.
+  it('BLOCKER-2: a harvested-only (partial) roster does not force a live /me when the self-id cache is valid', async () => {
+    const cache = new MembersCache({ path });
+    cache.merge(CHAT, [{ id: 'aad-bob', displayName: 'Bob Brown' }]); // self never harvested here
+    const warmSelfIdCache = {
+      read: () => ({ id: 'aad-self', resolvedAt: 1 }),
+      write: vi.fn(),
+    };
+
+    let meCalls = 0;
+    let membersCalls = 0;
+    let inviteBody: unknown;
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) {
+        meCalls += 1;
+        return selfIdResponse();
+      }
+      if (u.includes('/members')) {
+        membersCalls += 1;
+        return json({
+          value: [
+            { userId: 'aad-self', displayName: 'Assistant (AI)' },
+            { userId: 'aad-bob', displayName: 'Bob Brown' },
+          ],
+        });
+      }
+      if (u.includes('/root:') && method === 'PUT') return uploadResponse();
+      if (u.includes('/invite')) {
+        inviteBody = JSON.parse(String(init?.body));
+        return grantsFor(['aad-bob']);
+      }
+      if (u.includes('/messages') && method === 'POST') {
+        return json({
+          id: 'msg-partial-self',
+          chatId: CHAT,
+          createdDateTime: '2026-09-04T10:00:00Z',
+          body: { contentType: 'html', content: '' },
+        });
+      }
+      throw new Error(`unexpected call in this test: ${method} ${u}`);
+    });
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch });
+    const chats = new GraphTeamsChats(graph, { membersCache: cache, selfIdCache: warmSelfIdCache });
+
+    const sent = await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
+
+    expect(membersCalls).toBe(1); // the partial roster forced exactly one live refresh
+    expect(meCalls).toBe(0); // self-id cache trusted — never resurrects the throttled-/me incident
+    expect(inviteBody).toEqual({
+      recipients: [{ objectId: 'aad-bob' }],
+      requireSignIn: true,
+      sendInvitation: false,
+      roles: ['read'],
+    });
+    expect(sent.id).toBe('msg-partial-self');
+  });
+
+  // membersForInvite's own stale-serve fallback (mirrors resolveMentions's, mitigation 1): an
+  // EXPIRED but genuinely COMPLETE roster, under a throttled refresh, is still served (logged
+  // once) rather than failing the send — the partial-roster refusal above is a DIFFERENT case
+  // (never-complete, nothing honest to serve stale).
+  it('an expired COMPLETE roster + a throttled /members refresh serves the STALE complete roster and logs one line, rather than refusing', async () => {
+    let clock = 0;
+    const cache = new MembersCache({ path, ttlMs: 1000, now: () => clock });
+    cache.set(CHAT, [
+      { id: 'aad-self', displayName: 'Assistant (AI)' },
+      { id: 'aad-bob', displayName: 'Bob Brown' },
+    ]);
+    clock = 5000; // well past the TTL
+
+    const lines: string[] = [];
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) return selfIdResponse();
+      if (u.includes('/members')) {
+        return json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
+          'retry-after': '100',
+        });
+      }
+      if (u.includes('/root:') && method === 'PUT') return uploadResponse();
+      if (u.includes('/invite')) return grantsFor(['aad-bob']);
+      if (u.includes('/messages') && method === 'POST') {
+        return json({
+          id: 'msg-stale-complete',
+          chatId: CHAT,
+          createdDateTime: '2026-09-04T10:00:00Z',
+          body: { contentType: 'html', content: '' },
+        });
+      }
+      throw new Error(`unexpected call in this test: ${method} ${u}`);
+    });
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch, nowFn: () => clock });
+    const chats = new GraphTeamsChats(graph, { membersCache: cache, log: (line) => lines.push(line) });
+
+    const sent = await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
+
+    expect(sent.id).toBe('msg-stale-complete');
+    expect(lines.some((line) => line.includes('STALE cached COMPLETE roster'))).toBe(true);
+  });
+});
+
 describe('GraphTeamsChats.sendImage — hosted content, no OneDrive item, no grant applies here', () => {
   it('never touches OneDrive or /invite — only the plain message-with-hostedContents POST', async () => {
     const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
