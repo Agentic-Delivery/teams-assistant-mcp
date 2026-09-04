@@ -9,6 +9,17 @@ export class GraphError extends Error {
     readonly code?: string,
     /** Seconds the server asked us to wait (Retry-After), when it named one. */
     readonly retryAfterSeconds?: number,
+    /**
+     * The leading segment of Graph's `x-ms-throttle-scope` header on a 429 — one of
+     * `Tenant_Application`, `Tenant`, `Application` (the full header is
+     * `<Scope>/<Limit>/<ApplicationId>/<TenantId|UserId|ResourceId>`; only the scope word itself
+     * is carried structurally here, see `fail()` in this file). Mitigation 3
+     * (docs/throttling-mitigation.md §4, stage 1 item 1): this is what turned "which of Graph's
+     * four throttle keys is closing" from an inference into a measured fact. Undefined for a
+     * non-429, a locally-simulated `LocallyThrottled` gate (no live header to read), or a 429
+     * Graph answered without the header.
+     */
+    readonly throttleScope?: string,
   ) {
     super(message);
     this.name = 'GraphError';
@@ -48,6 +59,22 @@ export interface GraphClientOptions {
   /** Extra attempts after the first for throttled/unavailable READS. Writes never auto-retry. Default 1. */
   readRetries?: number;
   nowFn?: () => number;
+  /**
+   * Low-volume operational line, same shape as GraphTeamsChats's own `log` option — defaults to
+   * a no-op so no test needs to wire one. Mitigation 3 (docs/throttling-mitigation.md §4, stage 1
+   * item 1): every 429 this client sees logs one line naming `x-ms-throttle-scope`,
+   * `x-ms-throttle-information` (when present) and `retry-after`, regardless of whether the read
+   * loop goes on to retry successfully — "the next incident is measured, not inferred" only holds
+   * if this fires on every 429, not just the ones that end in a thrown error.
+   */
+  log?: (line: string) => void;
+}
+
+/** The leading segment of Graph's `x-ms-throttle-scope` header — see GraphError.throttleScope's
+ *  own doc comment for the full header shape this is deliberately NOT keeping in full. */
+function throttleScopeOf(response: Response): string | undefined {
+  const raw = response.headers.get('x-ms-throttle-scope');
+  return raw ? raw.split('/')[0] : undefined;
 }
 
 /** When a 429 names no Retry-After, close the gate for this long rather than for nothing. */
@@ -91,6 +118,7 @@ export class GraphClient {
   private readonly sleepFn: (ms: number) => Promise<void>;
   private readonly readRetries: number;
   private readonly nowFn: () => number;
+  private readonly log: (line: string) => void;
   /**
    * The throttle gates. Graph ESCALATES its penalty window when a caller keeps sending while
    * throttled — and on 2026-08-25 this client's own retries, stacked under a poller and a
@@ -111,6 +139,7 @@ export class GraphClient {
     this.sleepFn = options.sleepFn ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.readRetries = options.readRetries ?? 1;
     this.nowFn = options.nowFn ?? (() => Date.now());
+    this.log = options.log ?? (() => {});
   }
 
   /**
@@ -184,6 +213,17 @@ export class GraphClient {
       .catch(() => undefined);
     const key = code && GLOBAL_THROTTLE_CODES.has(code) ? GLOBAL_GATE_KEY : GraphClient.gateKeyFor(path);
     this.throttledUntil.set(key, Math.max(this.throttledUntil.get(key) ?? 0, this.nowFn() + windowMs));
+    // Mitigation 3 (docs/throttling-mitigation.md §4, stage 1 item 1): fires on EVERY 429 this
+    // client sees, whether or not the read loop above goes on to retry successfully — a throttle
+    // that clears on retry is still evidence of which of Graph's four keys is being hit, and
+    // section 2 of that document exists because we had been guessing instead of measuring this.
+    const rawScope = response.headers.get('x-ms-throttle-scope');
+    const info = response.headers.get('x-ms-throttle-information');
+    this.log(
+      `Graph 429 on ${GraphClient.gateKeyFor(path)}: x-ms-throttle-scope=${rawScope ?? '(none)'}` +
+        (info ? ` x-ms-throttle-information=${info}` : '') +
+        ` retry-after=${named !== undefined ? `${named}s` : '(none)'}`,
+    );
   }
 
   private url(path: string): string {
@@ -213,6 +253,7 @@ export class GraphClient {
       response.status,
       body?.error?.code,
       retryAfterSecondsOf(response),
+      response.status === 429 ? throttleScopeOf(response) : undefined,
     );
   }
 
