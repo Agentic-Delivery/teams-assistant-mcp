@@ -26,10 +26,12 @@ export interface SignedInAccount {
  * needs to implement get()/set()/getStale() to exercise the poller. Mitigation 2
  * (docs/throttling-mitigation.md §4, stage 1 item 2): every message this poller already reads
  * carries its sender's AAD id and display name at zero MARGINAL Graph cost — merging those into
- * the persisted roster is what lets a chat's roster fill and refresh from traffic alone, taking
- * `/members` off the mention-resolution send path for the common case (see
- * GraphTeamsChats.resolveMentions's stale-serve fallback, teams-chats.ts, for what still happens
- * on the rarer miss).
+ * the persisted roster is what lets a chat's roster fill from traffic alone, taking `/members` off
+ * the mention-resolution send path for the common case (see GraphTeamsChats.resolveMentions's
+ * stale-serve fallback, teams-chats.ts, for what still happens on the rarer miss). What this
+ * builds is always a PARTIAL roster (MembersCache.merge's own doc comment) — it never drives
+ * `send_chat_file`'s permission grant, which requires a COMPLETE roster from a real `/members`
+ * fetch (0.5.2 BLOCKER 1 fix, see membersForInvite in teams-chats.ts).
  */
 export interface RosterHarvestPort {
   merge(chatId: string, members: ReadonlyArray<{ id: string; displayName: string }>): void;

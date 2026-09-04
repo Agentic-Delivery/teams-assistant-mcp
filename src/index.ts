@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { dirname, join } from 'node:path';
 import { buildChats } from './build-chats.js';
+import { buildInboxPoller } from './build-inbox-poller.js';
 import { loadConfig } from './config.js';
-import { InboxPoller, type SignedInAccount } from './inbox.js';
 import { inboxPathFor, inboxYieldPathFor } from './inbox-yield.js';
 import { buildServer } from './server.js';
 
@@ -48,26 +47,21 @@ async function main(): Promise<void> {
   // also does ad-hoc reads slow the poller down; garbage or non-positive values fall back to
   // the default, same posture as every other best-effort env knob.
   const pollSeconds = Number(process.env['TEAMS_INBOX_POLL_SECONDS']);
-  const poller = new InboxPoller({
+  // buildInboxPoller (build-inbox-poller.ts) is the ONE place the roster harvest wire
+  // (`roster: membersCache`) is set — extracted so a composition test can drive the real
+  // InboxPoller against a real MembersCache through the exact same wiring this call uses,
+  // rather than a wire that could silently drop out of THIS file alone (MAJOR 3, 2026-09-04
+  // review).
+  const poller = buildInboxPoller({
     chats,
+    graph,
+    tokenProvider,
+    membersCache,
     allowlist: config.allowlist,
-    self: () => graph.get<SignedInAccount>('/me?$select=id,displayName'),
     inboxPath,
-    // The state sidecar follows the inbox file, so a TEAMS_INBOX_PATH override moves both —
-    // and the yield file with them (inboxYieldPathFor derives from the same inbox path).
-    statePath: join(dirname(inboxPath), 'inbox-state.json'),
-    yieldPath: inboxYieldPath,
-    // Mitigation 2 (docs/throttling-mitigation.md §4, stage 1 item 2): the SAME MembersCache
-    // instance GraphTeamsChats resolves mentions against — every message this poller reads
-    // harvests its sender into it, at zero Graph cost, which is what lets a chat's roster fill
-    // and refresh from traffic alone.
-    roster: membersCache,
+    inboxYieldPath,
     ...(Number.isFinite(pollSeconds) && pollSeconds > 0 ? { pollMs: pollSeconds * 1000 } : {}),
     log: (line) => process.stderr.write(`${line}\n`),
-    // 0.4.1 stuck-auth self-healing: a token that goes bad without the local cache's own expiry
-    // catching up needs an external nudge to drop it — see InboxPoller.trackAuthHealth's doc
-    // comment for the live diagnosis this closes.
-    onAuthStuck: () => tokenProvider.invalidate?.(),
   });
   poller.start();
   process.stderr.write(`inbox poller on: ${inboxPath}\n`);
