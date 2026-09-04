@@ -218,6 +218,12 @@ Run that inside the project that should get the tools. One thing to understand a
 absolute path) has to be part of the command. It is also why paths *inside* `.env` must be
 absolute: the agent starts the server from your project's directory, not from this repo.
 
+Registering this same command more than once against the same `.env` (a second Claude Code
+session, or a standalone daemon already running) is safe: every registration gets the tools, and
+only the first one to start ends up running the background inbox poller — the rest log one line
+and serve tools with no poller of their own (see the README's "Supervising the daemon" section).
+Nothing exits or fails to connect because of this.
+
 The equivalent for a project-scoped `.mcp.json` (install-local prints this too):
 
 ```json

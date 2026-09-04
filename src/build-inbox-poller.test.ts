@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -91,6 +91,17 @@ describe('buildInboxPoller — the real composition, driven end to end (MAJOR 3,
       // /members fetch — getComplete() must refuse it exactly as membersForInvite (sendFile's
       // permission-grant path) needs it to (0.5.2 BLOCKER 1 fix).
       expect(freshCache.getComplete(CHAT)).toBeUndefined();
+
+      // Carried over from PR #8 (0.5.4): the health file is written by InboxPoller itself, not
+      // by a wire buildInboxPoller could drop — but it is still worth proving through the REAL
+      // composition, same reasoning as the roster assertion above: a hand-built double in
+      // inbox.test.ts proves the class writes it, not that the real wiring this process actually
+      // uses produces a file a watcher could read.
+      const health = JSON.parse(
+        await readFile(join(dir, 'poller-health.json'), 'utf8'),
+      ) as Record<string, unknown>;
+      expect(health['ok']).toBe(true);
+      expect(health['inboxPath']).toBe(join(dir, 'inbox.jsonl'));
     } finally {
       globalThis.fetch = originalFetch;
     }

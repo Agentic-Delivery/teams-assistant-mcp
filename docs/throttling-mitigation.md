@@ -338,9 +338,13 @@ consistent with how we already work — nothing here gets done without If knowin
    throttled rather than failing the send; make TTL expiry mean "refresh opportunistically", never
    "the cache is empty". This is the direct fix for the 2026-09-04 incident *and* the prerequisite
    for stage 2's consent-free scope set.
-3. **Merge PR #8 (poller supervision).** It is written, reviewed and unmerged, and it carries the
-   Retry-After-as-backoff-floor change plus the health file that this work needs for evidence.
-   Landing it is the cheapest capability gain on the board.
+3. **Poller supervision, landed 0.5.4.** PR #8 predated the 0.5.2 poller rewrite (quota yield,
+   roster harvest, auth-health tracking) and no longer merged cleanly, so the work landed as a
+   rebased branch carrying the same behaviour onto current `main` instead of a literal merge of
+   that PR: the Retry-After-as-backoff-floor change, the escalating error lines, the health file
+   (`poller-health.json`, `src/inbox.ts`), and the single-instance lock (`poller-lock.ts`,
+   `poller.lock`, keyed per inbox path via `inboxPathFor(env)`). This is the evidence source this
+   plan's later stages read from.
 4. **Two knobs, immediately, while the above ships**: give the CTP and SRP daemons distinct
    `TEAMS_MCP_CLIENT_ID` values (they are identical today — both `d3590ed6…`), and raise the CTP
    poll interval to 180 s. Neither is a fix; both are free insurance against the sustained-83 %

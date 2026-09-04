@@ -1,7 +1,7 @@
 {
   "name": "teams-assistant-mcp",
   "private": true,
-  "version": "0.5.3",
+  "version": "0.5.4",
   "type": "module",
   "description": "Stdio MCP server that lets a Claude Code agent read and post in a fixed allowlist of Microsoft Teams group chats.",
   "license": "Elastic-2.0",
