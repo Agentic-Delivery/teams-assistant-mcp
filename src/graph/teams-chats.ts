@@ -174,6 +174,12 @@ interface GraphInviteResult {
 export interface MembersCachePort {
   get(chatId: string): ChatMember[] | undefined;
   set(chatId: string, members: ChatMember[]): void;
+  /**
+   * The TTL-ignoring read resolveMentions falls back to ONLY when a live refresh itself failed
+   * (mitigation 1, docs/throttling-mitigation.md §4) — see MembersCache.getStale's own doc
+   * comment for the incident this exists to close.
+   */
+  getStale(chatId: string): { members: ChatMember[]; fetchedAt: number } | undefined;
 }
 
 export interface GraphTeamsChatsOptions {
@@ -354,12 +360,19 @@ export class GraphTeamsChats implements TeamsChatsPort {
   ): Promise<ChatMember[]> {
     return this.membersOf(chatId).catch((caught: unknown) => {
       if (caught instanceof GraphError && caught.status === 429) {
+        // Mitigation 3 (docs/throttling-mitigation.md §4, stage 1 item 1): the scope is stated
+        // in the message text (not just carried structurally on the error) because THIS is the
+        // exact "THROTTLED: ..." string both CLIs and the MCP tool path print verbatim — an
+        // operator staring at a terminal on the next incident sees which of Graph's four keys
+        // closed without having to inspect the error object.
+        const scopeClause = caught.throttleScope ? ` [throttle scope: ${caught.throttleScope}]` : '';
         throw new GraphError(
           `THROTTLED: the member list refresh ${reason} was throttled; nothing was done. Wait ` +
-            `and try again.${extraOnThrottle}`,
+            `and try again.${scopeClause}${extraOnThrottle}`,
           429,
           'MembersRefreshThrottled',
           caught.retryAfterSeconds,
+          caught.throttleScope,
         );
       }
       throw caught;
@@ -379,14 +392,29 @@ export class GraphTeamsChats implements TeamsChatsPort {
     }
   }
 
+  /** 429 (including our own locally-simulated `LocallyThrottled` gate) or a 503/504 the read
+   *  loop already retried once and gave up on — the shapes worth falling back to a stale roster
+   *  for, per mitigation 1 (docs/throttling-mitigation.md §4). Anything else (a genuine 4xx, a
+   *  network failure with no status at all) is not "the endpoint is temporarily unavailable" and
+   *  must not be masked by silently serving old data. */
+  private static isTransientRefreshFailure(error: unknown): boolean {
+    return error instanceof GraphError && (error.status === 429 || error.status === 503 || error.status === 504);
+  }
+
   /**
    * Cache-first: a hit resolves every name against the on-disk roster with ZERO Graph calls. A
    * miss — no cache, an expired entry, or a name the cached roster does not have — refreshes ONCE
    * (a single `/members` call, never a retry loop) and re-checks against the fresh roster; a name
-   * still unresolved after that gets resolveMentionTargets's own clear error. A 429 on that
-   * refresh is never swallowed into "no match" — it surfaces as its own THROTTLED error naming
-   * Retry-After, so a caller sees a throttle, not a false "no such member" (0.4.1, live-diagnosed:
-   * this endpoint shares a throttle budget with another daemon on the same first-party client id).
+   * still unresolved after that gets resolveMentionTargets's own clear error.
+   *
+   * Mitigation 1 (docs/throttling-mitigation.md §4, stage 1 item 2; root-caused live 2026-09-04
+   * — see KNOWN-ISSUES.md): when that refresh itself fails with a throttled/transiently-
+   * unavailable status, a cache hit must never become a hard dependency on the endpoint that just
+   * refused us. Falling through to whatever this chat's stale (past-TTL) roster still holds on
+   * disk lets the send succeed anyway — logged once, so the fallback is visible, never silent —
+   * and ONLY fails the post when the requested name is absent from the stale roster too, in which
+   * case the ORIGINAL throttled error still surfaces (never swallowed into a false "no such
+   * member": a throttle is a throttle, not evidence the name does not exist).
    */
   async resolveMentions(chatId: string, names: readonly string[]): Promise<MentionTarget[]> {
     const cache = this.membersCache;
@@ -401,13 +429,37 @@ export class GraphTeamsChats implements TeamsChatsPort {
         // Fall through to a single refresh — see doc comment above.
       }
     }
-    const fresh = await this.refreshMembers(
-      chatId,
-      'for mention resolution',
-      ' This does not mean the name does not exist.',
-    );
-    this.cacheIfNonEmpty(chatId, fresh);
-    return resolveMentionTargets(names, fresh);
+    try {
+      const fresh = await this.refreshMembers(
+        chatId,
+        'for mention resolution',
+        ' This does not mean the name does not exist.',
+      );
+      this.cacheIfNonEmpty(chatId, fresh);
+      return resolveMentionTargets(names, fresh);
+    } catch (error) {
+      if (GraphTeamsChats.isTransientRefreshFailure(error)) {
+        const stale = cache.getStale(chatId);
+        if (stale && stale.members.length > 0) {
+          try {
+            const resolved = resolveMentionTargets(names, stale.members);
+            const ageS = Math.round((Date.now() - stale.fetchedAt) / 1000);
+            this.log(
+              `mention resolution: /members refresh for ${chatId} failed ` +
+                `(${(error as GraphError).code ?? (error as GraphError).status}); served from the ` +
+                `STALE cached roster instead of failing the post (roster age ${ageS}s).`,
+            );
+            return resolved;
+          } catch {
+            // The requested name is absent from the stale roster too — the throttle/transient
+            // failure is the real, more useful error here, so fall through and rethrow it below
+            // rather than surface a "no such member" that would be indistinguishable from the
+            // name genuinely not existing.
+          }
+        }
+      }
+      throw error;
+    }
   }
 
   /**

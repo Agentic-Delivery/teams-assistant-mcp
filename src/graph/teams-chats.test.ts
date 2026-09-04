@@ -144,6 +144,26 @@ describe('GraphTeamsChats.resolveMentions — member cache (0.4.1, live-diagnose
     expect(calls).toHaveLength(1);
   });
 
+  // Mitigation 3 (docs/throttling-mitigation.md §4, stage 1 item 1): "include the scope in the
+  // THROTTLED error text the CLIs print" — the exact error the 2026-09-04 incident's transcript
+  // showed an operator staring at, now naming WHICH of Graph's four throttle keys closed instead
+  // of leaving that to be inferred after the fact.
+  it('a 429 on the refresh carries x-ms-throttle-scope through into both the THROTTLED message text and the error structurally', async () => {
+    const cache = new MembersCache({ path });
+    const { fetchFn } = countingMembersFetch(() =>
+      json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
+        'retry-after': '100',
+        'x-ms-throttle-scope': 'Tenant_Application/Chat.GetAllMembers/app-id/tenant-id',
+      }),
+    );
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    const error = await chats.resolveMentions(CHAT, ['Shiv']).catch((caught: unknown) => caught);
+
+    expect((error as GraphError).throttleScope).toBe('Tenant_Application');
+    expect((error as GraphError).message).toContain('Tenant_Application');
+  });
+
   // 0.4.1 review round 1: the catch around a cache hit used to be unconditional, so an AMBIGUOUS
   // or EMPTY-NAME caller error (which a refresh cannot fix) silently spent a Graph call and only
   // then surfaced the same error — or, worse, a different one if the refresh happened to fail.
@@ -168,6 +188,81 @@ describe('GraphTeamsChats.resolveMentions — member cache (0.4.1, live-diagnose
 
     await expect(chats.resolveMentions(CHAT, ['   '])).rejects.toThrow(/cannot be empty/);
     expect(calls).toHaveLength(0);
+  });
+});
+
+// Mitigation 1 (docs/throttling-mitigation.md §4, stage 1 item 2; root-caused live 2026-09-04,
+// KNOWN-ISSUES.md): a TTL-expired members cache used to convert a throttled `/members` refresh
+// into a PERMANENT hard dependency on that endpoint — the cache could never heal itself, because
+// healing required the very call being refused. A cache hit (even a stale one) must never become
+// a hard dependency on the throttled endpoint.
+describe('GraphTeamsChats.resolveMentions — stale-serve on a throttled/unavailable refresh (mitigation 1, 2026-09-04)', () => {
+  let dir: string;
+  let path: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'teams-chats-stale-'));
+    path = join(dir, 'members-cache.json');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function subjectWithLog(fetchFn: typeof fetch, cache: MembersCache) {
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn });
+    const lines: string[] = [];
+    const chats = new GraphTeamsChats(graph, { membersCache: cache, log: (line) => lines.push(line) });
+    return { chats, lines };
+  }
+
+  function throttled429(): Response {
+    return json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
+      'retry-after': '100',
+    });
+  }
+
+  it('TRIGGERING: an expired cache entry + a 429 on the refresh resolves the mention from the stale roster and logs one line saying so', async () => {
+    let clock = 0;
+    const cache = new MembersCache({ path, ttlMs: 1000, now: () => clock });
+    cache.set(CHAT, [{ id: 'aad-shiv', displayName: 'Garg, Shivankit' }]);
+    clock = 5000; // well past the TTL — cache.get(CHAT) is now a miss
+    const { fetchFn, calls } = countingMembersFetch(throttled429);
+    const { chats, lines } = subjectWithLog(fetchFn as unknown as typeof fetch, cache);
+
+    const resolved = await chats.resolveMentions(CHAT, ['Shiv']);
+
+    expect(resolved).toEqual([{ name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' }]);
+    expect(calls).toHaveLength(1); // the one refresh attempt that came back throttled
+    expect(lines.some((line) => /stale/i.test(line) && line.includes(CHAT))).toBe(true);
+  });
+
+  it('NON-TRIGGERING: an expired cache entry + a 429 on the refresh still fails the post when the name is absent from the stale roster too', async () => {
+    let clock = 0;
+    const cache = new MembersCache({ path, ttlMs: 1000, now: () => clock });
+    cache.set(CHAT, [{ id: 'aad-shiv', displayName: 'Garg, Shivankit' }]); // no "Nobody" in the stale roster
+    clock = 5000;
+    const { fetchFn } = countingMembersFetch(throttled429);
+    const { chats, lines } = subjectWithLog(fetchFn as unknown as typeof fetch, cache);
+
+    const error = await chats.resolveMentions(CHAT, ['Nobody']).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(GraphError);
+    expect((error as GraphError).code).toBe('MembersRefreshThrottled');
+    // Never silently swallowed into "no such member" — still the throttle, named.
+    expect((error as GraphError).message).toMatch(/THROTTLED/);
+    expect(lines.some((line) => /stale/i.test(line))).toBe(false); // nothing WAS served from stale
+  });
+
+  it('a cache with no entry at all (never cached) still fails as plain THROTTLED — there is no stale roster to fall back to', async () => {
+    const cache = new MembersCache({ path }); // never set
+    const { fetchFn } = countingMembersFetch(throttled429);
+    const { chats } = subjectWithLog(fetchFn as unknown as typeof fetch, cache);
+
+    const error = await chats.resolveMentions(CHAT, ['Shiv']).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(GraphError);
+    expect((error as GraphError).code).toBe('MembersRefreshThrottled');
   });
 });
 
@@ -235,6 +330,67 @@ describe('buildChats — the composition actually wires the members cache (0.4.1
       expect(calls).toHaveLength(0);
     } finally {
       globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+// Mitigation 3 (docs/throttling-mitigation.md §4, stage 1 item 1): an unwired GraphClient `log`
+// would leave production silent on every 429 with the unit-level GraphClient tests still green
+// (they inject their own log spy directly) — this drives the REAL composition buildChats returns
+// so a dropped wire here can only pass by process.stderr actually receiving the throttle-scope
+// line.
+describe('buildChats — the composition wires GraphClient throttle-scope diagnostics to stderr (mitigation 3)', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'build-chats-throttle-log-'));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('a live 429 with x-ms-throttle-scope on the /members refresh reaches process.stderr with the scope named', async () => {
+    const { loadConfig } = await import('../config.js');
+    const { buildChats } = await import('../build-chats.js');
+    const configPath = join(dir, 'teams-mcp.config.json');
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(
+      configPath,
+      JSON.stringify({ allowedChats: [{ id: CHAT, label: 'pilot', canPost: true }] }),
+    );
+    const config = loadConfig({
+      TEAMS_MCP_CONFIG: configPath,
+      TEAMS_MCP_TENANT_ID: 'tenant',
+      TEAMS_MCP_USERNAME: 'assistant@example.com',
+      TEAMS_MCP_PASSWORD: 'secret',
+      TEAMS_MCP_TOKEN_CACHE: join(dir, '.token-cache.json'),
+    });
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string) => {
+      if (String(url).includes('/members')) {
+        return json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
+          'retry-after': '100',
+          'x-ms-throttle-scope': 'Tenant_Application/Chat.GetAllMembers/app-id/tenant-id',
+        });
+      }
+      throw new Error(`unexpected call: ${String(url)}`);
+    }) as typeof fetch;
+    const stderrWrite = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const { chats, tokenProvider } = buildChats(config);
+      vi.spyOn(tokenProvider, 'getAccessToken').mockResolvedValue('fake-token');
+
+      await chats.resolveMentions(CHAT, ['Shiv']).catch(() => undefined);
+
+      const lines = stderrWrite.mock.calls.map((call) => String(call[0]));
+      expect(lines.some((line) => line.includes('x-ms-throttle-scope') && line.includes('Tenant_Application'))).toBe(
+        true,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      stderrWrite.mockRestore();
     }
   });
 });

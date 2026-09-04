@@ -28,6 +28,16 @@ export interface ChatsStack {
   /** Exposed so a caller (the inbox poller's stuck-auth recovery, 0.4.1) can force a re-mint
    *  without reaching back into this module's private wiring. */
   tokenProvider: TokenProvider;
+  /**
+   * The SAME MembersCache instance GraphTeamsChats resolves mentions against — exposed (mitigation
+   * 2, docs/throttling-mitigation.md §4) so the inbox poller (index.ts) can harvest
+   * (senderId, senderDisplayName) pairs from every polled message straight into it via
+   * MembersCache.merge, at zero Graph cost. Deliberately the real class, not a narrower port: the
+   * poller only ever calls .merge(), but this module's whole reason to construct the cache once
+   * and share it is so both callers (mention resolution and roster harvest) read/write the exact
+   * same on-disk file.
+   */
+  membersCache: MembersCache;
 }
 
 export function buildChats(
@@ -41,7 +51,15 @@ export function buildChats(
     password: config.password,
     cache: new FileTokenCache(config.tokenCachePath),
   });
-  const graph = new GraphClient({ tokenProvider });
+  // Mitigation 3 (docs/throttling-mitigation.md §4, stage 1 item 1): every 429 this client sees
+  // logs its x-ms-throttle-scope/x-ms-throttle-information/retry-after on one line — the same
+  // stderr sink GraphTeamsChats's own `log` below already writes to, so "the next incident is
+  // measured, not inferred" holds for every Graph call this stack makes, not only mention
+  // resolution's own THROTTLED text.
+  const graph = new GraphClient({
+    tokenProvider,
+    log: (line) => process.stderr.write(`[teams-assistant-mcp] ${line}\n`),
+  });
   // Always THIS module's own cache — membersCache is deliberately excluded from
   // BuildChatsOptions so nothing calling buildChats can accidentally unwire it (0.4.1 review).
   const membersCache = new MembersCache({ path: config.membersCachePath, ttlMs: config.membersTtlMs });
@@ -64,5 +82,5 @@ export function buildChats(
     }),
     { selfDisplayName: config.assistantDisplayName },
   );
-  return { chats, graph, tokenProvider };
+  return { chats, graph, tokenProvider, membersCache };
 }

@@ -12,7 +12,7 @@ const stubToken: TokenProvider = { kind: 'stub', getAccessToken: async () => 'th
 // trivial no-op double — the member-cache behaviour itself is covered in teams-chats.test.ts.
 // (sendFile is the one method here that DOES read this cache, for its 0.4.2 permission grant —
 // its own tests below wire a warmed double instead; see warmMembersCache.)
-const noMembersCache: MembersCachePort = { get: () => undefined, set: () => {} };
+const noMembersCache: MembersCachePort = { get: () => undefined, set: () => {}, getStale: () => undefined };
 
 /** A pre-warmed double for the two sendFile tests below — sendFile now reads the member cache
  *  (0.4.2, to grant chat members read access on the uploaded item) the same way resolveMentions
@@ -23,7 +23,7 @@ function warmMembersCache(): MembersCachePort {
     { id: 'self-aad-id', displayName: 'Assistant (AI)' },
     { id: 'aad-bob', displayName: 'Bob Brown' },
   ];
-  return { get: () => members, set: () => {} };
+  return { get: () => members, set: () => {}, getStale: () => ({ members, fetchedAt: 0 }) };
 }
 
 function json(body: unknown, status = 200): Response {
@@ -826,6 +826,104 @@ describe('graph client — throttle handling on reads', () => {
 
     await expect(client.post('/chats/x/messages', {})).rejects.toThrow();
     expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Mitigation 3 (docs/throttling-mitigation.md §4, stage 1 item 1): "the next incident is measured,
+// not inferred" — every 429 must log which of Graph's four throttle keys actually closed, since
+// the whole point of section 2 of that document is that we had been guessing.
+describe('graph client — throttle-scope diagnostics on every 429 (mitigation 3)', () => {
+  it('TRIGGERING: logs scope, throttle-information (when present) and retry-after on one line for every 429 response, even ones the retry loop later recovers from', async () => {
+    const lines: string[] = [];
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'throttled' } }), {
+          status: 429,
+          headers: {
+            'retry-after': '62',
+            'x-ms-throttle-scope': 'Tenant_Application/Chat.GetAllMessages/app-id/tenant-id',
+            'x-ms-throttle-information': 'RateLimitPolicy0064',
+            'content-type': 'application/json',
+          },
+        }),
+      )
+      .mockResolvedValueOnce(json({ id: 'fine' }));
+    let now = 0;
+    const client = new GraphClient({
+      tokenProvider: stubToken,
+      fetchFn: fetchFn as never,
+      sleepFn: async (ms) => {
+        now += ms;
+      },
+      nowFn: () => now,
+      log: (line) => lines.push(line),
+    });
+
+    await client.get('/chats/19:x@thread.v2/members');
+
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('429');
+    expect(lines[0]).toContain('Tenant_Application/Chat.GetAllMessages/app-id/tenant-id');
+    expect(lines[0]).toContain('RateLimitPolicy0064');
+    expect(lines[0]).toContain('62');
+  });
+
+  it('NON-TRIGGERING: a healthy 200 response logs nothing', async () => {
+    const lines: string[] = [];
+    const fetchFn = vi.fn().mockResolvedValueOnce(json({ id: 'fine' }));
+    const client = new GraphClient({
+      tokenProvider: stubToken,
+      fetchFn: fetchFn as never,
+      log: (line) => lines.push(line),
+    });
+
+    await client.get('/me');
+
+    expect(lines).toHaveLength(0);
+  });
+
+  it('omits the throttle-information segment entirely when Graph did not send that header (never prints "undefined")', async () => {
+    const lines: string[] = [];
+    const fetchFn = vi.fn(async () =>
+      new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'throttled' } }), {
+        status: 429,
+        headers: { 'retry-after': '3', 'x-ms-throttle-scope': 'Tenant', 'content-type': 'application/json' },
+      }),
+    );
+    let now = 0;
+    const client = new GraphClient({
+      tokenProvider: stubToken,
+      fetchFn: fetchFn as never,
+      sleepFn: async (ms) => {
+        now += ms;
+      },
+      nowFn: () => now,
+      log: (line) => lines.push(line),
+    });
+
+    await client.get('/me').catch(() => undefined);
+
+    expect(lines[0]).not.toContain('undefined');
+  });
+
+  it('a GraphError thrown on a 429 carries the throttle scope structurally, not just in the log line', async () => {
+    const fetchFn = vi.fn(async () =>
+      new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 'throttled' } }), {
+        status: 429,
+        headers: {
+          'retry-after': '100',
+          'x-ms-throttle-scope': 'Tenant_Application/Members.Read/app-id/tenant-id',
+          'content-type': 'application/json',
+        },
+      }),
+    );
+    const client = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never });
+
+    const error = (await client.get('/chats/19:x@thread.v2/members').catch((c: unknown) => c)) as GraphError;
+
+    expect(error).toBeInstanceOf(GraphError);
+    expect(error.throttleScope).toBe('Tenant_Application');
   });
 });
 
