@@ -2,7 +2,7 @@ import { mkdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_MEMBERS_TTL_MS, MembersCache } from './members-cache.js';
 
 const CHAT = '19:pilot@thread.v2';
@@ -112,6 +112,107 @@ describe('MembersCache — disk-persisted, per-chat, TTL-bounded (0.4.1)', () =>
 
     expect(cache.get(CHAT)).toBeUndefined();
     expect(cache.get('19:other@thread.v2')).toEqual(members);
+  });
+
+  // Mitigation 1 (docs/throttling-mitigation.md §4, stage 1 item 2): a cache hit must never
+  // become a hard dependency on the throttled /members endpoint. get() answers undefined past
+  // TTL by design (existing behaviour above) — getStale() is the escape hatch a caller reaches
+  // for ONLY when a live refresh itself failed, so a throttled refresh can still be served from
+  // what's on disk instead of failing the whole mention resolution.
+  describe('getStale — the TTL-ignoring read used only when a live refresh fails (mitigation 1)', () => {
+    it('returns the entry past its TTL, unlike get()', () => {
+      let clock = 0;
+      const cache = new MembersCache({ path, ttlMs: 1000, now: () => clock });
+      cache.set(CHAT, members);
+      clock = 5000; // well past the TTL
+
+      expect(cache.get(CHAT)).toBeUndefined(); // still the old, TTL-bound contract
+      expect(cache.getStale(CHAT)).toEqual({ members, fetchedAt: 0 });
+    });
+
+    it('returns undefined for a chat never cached, same as get()', () => {
+      const cache = new MembersCache({ path });
+
+      expect(cache.getStale(CHAT)).toBeUndefined();
+    });
+
+    it('a corrupt cache file degrades to undefined rather than throwing', async () => {
+      const { writeFile } = await import('node:fs/promises');
+      await writeFile(path, 'not json at all');
+      const cache = new MembersCache({ path });
+
+      expect(cache.getStale(CHAT)).toBeUndefined();
+    });
+  });
+
+  // Mitigation 2 (docs/throttling-mitigation.md §4, stage 1 item 2): the inbox poller hands every
+  // polled message's (senderId, senderDisplayName) here at zero Graph cost — merge() is how that
+  // traffic actually fills/refreshes the roster the throttled /members endpoint used to be the
+  // only source of.
+  describe('merge — harvesting a roster from message traffic at zero Graph cost (mitigation 2)', () => {
+    it('adds harvested members to an empty cache and stamps fetchedAt with now()', () => {
+      let clock = 123;
+      const cache = new MembersCache({ path, now: () => clock });
+
+      cache.merge(CHAT, [{ id: 'aad-1', displayName: 'Garg, Shivankit' }]);
+
+      expect(cache.get(CHAT)).toEqual([{ id: 'aad-1', displayName: 'Garg, Shivankit' }]);
+      expect(cache.getStale(CHAT)).toEqual({
+        members: [{ id: 'aad-1', displayName: 'Garg, Shivankit' }],
+        fetchedAt: 123,
+      });
+    });
+
+    it('adds a newly-seen sender to an existing roster without dropping the members already cached', () => {
+      const cache = new MembersCache({ path });
+      cache.set(CHAT, [{ id: 'aad-1', displayName: 'Garg, Shivankit' }]);
+
+      cache.merge(CHAT, [{ id: 'aad-2', displayName: 'Spännare, Johan' }]);
+
+      expect(cache.get(CHAT)).toEqual(
+        expect.arrayContaining([
+          { id: 'aad-1', displayName: 'Garg, Shivankit' },
+          { id: 'aad-2', displayName: 'Spännare, Johan' },
+        ]),
+      );
+    });
+
+    it('refreshes fetchedAt on a merge that only re-confirms an already-known sender — traffic keeps the roster alive past the TTL clock', () => {
+      let clock = 0;
+      const cache = new MembersCache({ path, ttlMs: 1000, now: () => clock });
+      cache.set(CHAT, [{ id: 'aad-1', displayName: 'Garg, Shivankit' }]);
+      clock = 999; // just inside the TTL
+
+      cache.merge(CHAT, [{ id: 'aad-1', displayName: 'Garg, Shivankit' }]);
+      clock = 1500; // would be expired against the ORIGINAL fetchedAt of 0, not against the merge's
+
+      expect(cache.get(CHAT)).toEqual([{ id: 'aad-1', displayName: 'Garg, Shivankit' }]);
+    });
+
+    // Violating-double coverage: a message sender Graph (or our own mapping) failed to name
+    // properly must never corrupt the persisted roster with a junk entry — the poller's harvest
+    // is untrusted input reaching this cache directly, with no /members validation in between.
+    it('ignores a harvested pair with no id or no displayName rather than persisting junk', () => {
+      const cache = new MembersCache({ path });
+
+      cache.merge(CHAT, [
+        { id: '', displayName: 'Nobody' } as { id: string; displayName: string },
+        { id: 'aad-1', displayName: '' } as { id: string; displayName: string },
+      ]);
+
+      expect(cache.get(CHAT)).toBeUndefined();
+    });
+
+    it('a harvest with nothing valid never touches the disk (no write, no rename)', () => {
+      const writeFileFn = vi.fn(writeFileSync);
+      const renameFn = vi.fn(renameSync);
+      const cache = new MembersCache({ path, writeFileFn, renameFn });
+
+      cache.merge(CHAT, []);
+
+      expect(writeFileFn).not.toHaveBeenCalled();
+      expect(renameFn).not.toHaveBeenCalled();
+    });
   });
 
   // MAJOR 4 (review round 1): the previous version of this test only asserted no leftover

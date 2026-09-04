@@ -88,6 +88,49 @@ export class MembersCache {
   }
 
   /**
+   * The TTL-ignoring twin of get() — reads whatever is on disk for `chatId`, expired or not.
+   * Mitigation 1 (docs/throttling-mitigation.md §4, stage 1 item 2, live-diagnosed 2026-09-04):
+   * a `/members` refresh 429ing on an expired cache used to mean the cache could never be
+   * rewritten, converting a working cached path into a PERMANENT hard dependency on the
+   * throttled endpoint. This method is the caller's ONLY escape hatch, and it is deliberately
+   * not what get() itself does — a normal cache hit must still honour the TTL; only a caller
+   * that has ALREADY tried and failed a live refresh has any business reaching for stale data.
+   */
+  getStale(chatId: string): { members: ChatMember[]; fetchedAt: number } | undefined {
+    const entry = this.readFile()[chatId];
+    return entry ? { members: entry.members, fetchedAt: entry.fetchedAt } : undefined;
+  }
+
+  /**
+   * Merges harvested (id, displayName) pairs into `chatId`'s roster at zero Graph cost — the
+   * inbox poller's own doc comment names the incident this exists for (mitigation 2,
+   * docs/throttling-mitigation.md §4, stage 1 item 2): every polled message already carries its
+   * sender's AAD id and display name, and that traffic is exactly the population worth
+   * @mentioning. A harvested pair missing either field is dropped rather than persisted — this
+   * is untrusted data reaching the cache directly, with no `/members` validation in between, and
+   * a junk entry (an id with no name, or vice versa) would otherwise corrupt real mention
+   * resolution later. `fetchedAt` is stamped with now() on every merge that persists anything, not
+   * just a brand-new sender: traffic from an ALREADY-known member is still live evidence the
+   * roster is current, which is the whole point of "refreshes from traffic alone" — a chat that
+   * stays busy never needs a live `/members` call again. A merge with nothing valid to add never
+   * touches the disk at all.
+   */
+  merge(chatId: string, harvested: ReadonlyArray<{ id: string; displayName: string }>): void {
+    const valid = harvested.filter((entry) => entry.id.trim() !== '' && entry.displayName.trim() !== '');
+    if (valid.length === 0) {
+      return;
+    }
+    const file = this.readFile();
+    const existing = file[chatId];
+    const byId = new Map((existing?.members ?? []).flatMap((member) => (member.id ? [[member.id, member] as const] : [])));
+    for (const { id, displayName } of valid) {
+      byId.set(id, { id, displayName });
+    }
+    file[chatId] = { members: [...byId.values()], fetchedAt: this.now() };
+    this.writeFile(file);
+  }
+
+  /**
    * Concurrent writers (two processes on the same instance dir, e.g. a stray second server —
    * see KNOWN-ISSUES.md's "two server instances race" entry) are NOT coordinated here: this is a
    * read-modify-write over the whole file with no lock, so two near-simultaneous set() calls for
