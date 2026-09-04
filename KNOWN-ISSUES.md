@@ -1,3 +1,82 @@
+## teams-post --html --mention posting raw markup instead of refusing on an orphaned placeholder — investigated, not reproducible against 0.5.2, closed by hardening test coverage (reported live 2026-09-02, closed 2026-09-04, GH-14)
+
+Reported: `teams-post --html --mention "Kleivdal, Celine"` with the name written plainly in the
+html (no `@{Kleivdal, Celine}` token) reportedly posted the message as raw HTML text instead of
+refusing per the documented orphaned-mention contract (see the `@mentions` section above).
+
+**Investigated 2026-09-04, per pragmatic-tdd's "reproduce before theorising" rule — could not
+reproduce against HEAD (0.5.2), at any of the four surfaces the report could plausibly implicate.**
+`renderHtmlWithMentions` (`src/graph/mentions.ts`) throws on a resolved-but-unplaced mention; that
+call sits directly inline in the POST/PATCH request body construction inside
+`GraphTeamsChats.sendHtmlMessage`/`editHtmlMessage` (`src/graph/teams-chats.ts`), unchanged since
+`@mentions` first shipped (0.4.0) through today — so it fires and throws BEFORE the argument
+expression finishes evaluating, meaning before `GraphClient.post`/`.patch` is even called. Verified
+end-to-end (real `ReliableTeamsChats` wrapping the real `GraphTeamsChats`, only the Graph HTTP
+transport mocked — never the whole `TeamsChatsPort`) for all four paths: `teams-post`, `teams-edit`,
+the MCP `send_chat_message` and `edit_chat_message` tools, format html, mention resolved but no
+`@{Name}` token anywhere — every path refuses before any network call, naming the missing
+placeholder. The positive side (token present) was verified too: the mention is placed and the
+send/edit proceeds normally.
+
+**What WAS real: none of the existing tests at the CLI or MCP boundary exercised this contract.**
+`cli.test.ts`'s `doPost`/`doEdit` tests mock the whole `TeamsChatsPort` (a fake `sendHtmlMessage`
+that just records `html` verbatim), and `server.test.ts`'s `FakeTeamsChats` did the same — neither
+fake called `renderHtmlWithMentions`, so neither would have caught a REAL regression that deleted
+the guard inside `GraphTeamsChats`. This is exactly the "unverified fake" hazard the pragmatic-tdd
+skill's seam rule 1 names: green tests around a fake that doesn't enforce the real adapter's
+contract prove nothing about production. Closed by: (1) `FakeTeamsChats.sendHtmlMessage`/
+`editHtmlMessage` now render through the real `renderHtmlWithMentions`, so every existing and
+future html+mention test in `server.test.ts` is faithful to the real contract; (2) permanent
+regression tests at three boundaries — the adapter itself (`teams-chats.test.ts`, HTTP mocked),
+the CLI composition (`cli.test.ts`, HTTP mocked, real send chain), and the MCP tool boundary
+(`server.test.ts`) — covering both decision sides (orphaned mention refuses, placed mention
+sends), named `GH-14*`. Each was proven load-bearing by a kill (mutating the guard call site to
+bypass rendering; the corresponding test failed for the stated reason; reverted, green again).
+
+One asymmetry worth recording: `ReliableTeamsChats.sendHtmlMessage` happens to recompute
+`renderHtmlWithMentions` itself (for its own send/retry match-key, unrelated to this guard),
+which means the send path is defended twice (once in `ReliableTeamsChats`, once in the real
+`GraphTeamsChats` it wraps); `ReliableTeamsChats.editHtmlMessage` is a pure passthrough, so the
+edit path is defended only by `GraphTeamsChats.editHtmlMessage`'s own inline call — still
+correct, but with no redundancy if that one call site were ever moved or removed.
+
+**Genuinely unresolved**: what actually reached the chat on 2026-09-02. The report is taken at
+face value (a Teams user did see "HTML tecken"), but nothing in this repository's history —
+checked from 0.4.0 through HEAD — contains a code path that would produce it. Plausible explanations
+outside this repo's source (a daemon serving a stale build, a wrapper script around the CLI not
+part of this package) were not investigated further; if this recurs, capture the exact daemon
+version/build and the literal argv used, not just the reported symptom.
+
+## teams-attachments / download_chat_attachments / get_chat_attachment reporting size as null for completed downloads — investigated, not reproducible against 0.5.2, closed by hardening test coverage (reported 2026-09-02, closed 2026-09-04, GH-13)
+
+Reported: after downloading four files (49MB total) via `teams-attachments` (v0.5.0), every entry
+in the result JSON showed a null byte count where an operator would check that the download
+actually completed.
+
+**Investigated 2026-09-04 — could not reproduce against HEAD (0.5.2), or against the 0.5.0 commit
+the report names.** The byte-count field (`bytes`, not literally `size` — no field of that literal
+name has ever existed in this package's JSON output or its README) has been populated from the
+in-memory `Uint8Array` actually returned by `GraphClient.getBinary` (`bytes.byteLength`, computed
+from the SAME array `writeDownload` then writes to disk byte-for-byte) since the attachment-
+download feature's very first commit (0.5.0, `8e8005c`), on every one of the four surfaces that
+report it: `get_chat_attachment` and `download_chat_attachments` (MCP tools, `src/server.ts`) and
+`doListAttachments`'s download sibling `doDownloadAttachments` (the `teams-attachments` CLI,
+`src/cli/common.ts`). `--list`/`list_chat_attachments` never carry it, by design — no bytes are
+downloaded there.
+
+**What WAS real: only ONE of the four surfaces had a test asserting the value.**
+`get_chat_attachment`'s test already asserted `payload.bytes === 3`; `download_chat_attachments`
+(the batch tool — the one the reported incident actually used) and the CLI's
+`doDownloadAttachments` had no such assertion, despite both already computing and returning the
+correct value. Closed by adding the missing permanent assertions (`GH-13` in `cli.test.ts` and
+`server.test.ts`), each proven load-bearing by a kill (mutating the `bytes: payload.bytes.byteLength`
+line at its call site to `null`; the test failed for the stated reason; reverted, green again).
+
+**Genuinely unresolved**: what the reporter actually saw on 2026-09-02. As with GH-14 above, taken
+at face value, but no code path in this repository's history produces a null byte count on this
+family of calls; if it recurs, capture the exact daemon build and the raw JSON, not just the
+symptom.
+
 ## A TTL-expired members cache under a throttled /members refresh converted a working cache into a permanent hard dependency on the throttled endpoint (live 2026-09-04, closed 0.5.2)
 
 The 24h members-cache TTL (`DEFAULT_MEMBERS_TTL_MS`, `src/graph/members-cache.ts`) does not bound

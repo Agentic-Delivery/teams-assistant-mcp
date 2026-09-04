@@ -1687,3 +1687,60 @@ describe('GraphTeamsChats.sendImage — hosted content, no OneDrive item, no gra
     expect(sent.id).toBe('img-1');
   });
 });
+
+// GH-14 (https://github.com/Agentic-Delivery/teams-assistant-mcp/issues/14): observed 2026-09-02,
+// `teams-post --html --mention "Kleivdal, Celine"` with the name written plainly (no `@{Kleivdal,
+// Celine}` token) reportedly posted raw markup instead of refusing. Reproduced against HEAD first
+// (per pragmatic-tdd doctrine): the orphaned-mention throw inside renderHtmlWithMentions is called
+// directly inline in the POST/PATCH body construction below, so it already fires before any
+// network call reaches Graph — this file had no adapter-level test proving that wiring, only
+// mentions.test.ts's pure-function unit test of renderHtmlWithMentions itself. These are the
+// permanent regression tests closing that gap at the boundary that actually owns the contract.
+describe('GraphTeamsChats.sendHtmlMessage / editHtmlMessage — the orphaned-mention refusal actually reaches the Graph call site (GH-14)', () => {
+  function subject(fetchFn: typeof fetch) {
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn });
+    return new GraphTeamsChats(graph, { membersCache: new MembersCache({ path: '/dev/null/unused' }) });
+  }
+
+  const celine = { name: 'Kleivdal, Celine', id: 'aad-celine', displayName: 'Kleivdal, Celine' };
+
+  it('GH-14a: sendHtmlMessage refuses BEFORE any POST when a resolved mention has no @{Name} token in the html', async () => {
+    const fetchFn = vi.fn(async () => {
+      throw new Error('must never be called — the refusal must happen before any Graph request');
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch);
+
+    await expect(
+      chats.sendHtmlMessage(CHAT, '<p>Please review Kleivdal, Celine</p>', [celine]),
+    ).rejects.toThrow(/no @\{Name\}-style placeholder/);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('GH-14b: sendHtmlMessage posts and places the mention when the @{Name} token IS present (the other decision side)', async () => {
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      expect(init?.method).toBe('POST');
+      const body = JSON.parse(String(init?.body)) as { body: { content: string }; mentions?: unknown[] };
+      expect(body.body.content).toContain('<at id="0">Kleivdal, Celine</at>');
+      expect(body.mentions).toHaveLength(1);
+      return json({ id: 'sent-1', chatId: CHAT, createdDateTime: '2026-09-04T10:00:00Z', body: { contentType: 'html', content: body.body.content } });
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch);
+
+    const sent = await chats.sendHtmlMessage(CHAT, '<p>Please review @{Kleivdal, Celine}</p>', [celine]);
+
+    expect(sent.id).toBe('sent-1');
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('GH-14c: editHtmlMessage refuses BEFORE any PATCH when a resolved mention has no @{Name} token in the html (the edit path, same guard)', async () => {
+    const fetchFn = vi.fn(async () => {
+      throw new Error('must never be called — the refusal must happen before any Graph request');
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch);
+
+    await expect(
+      chats.editHtmlMessage(CHAT, 'msg-1', '<p>Please review Kleivdal, Celine</p>', [celine]),
+    ).rejects.toThrow(/no @\{Name\}-style placeholder/);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+});
