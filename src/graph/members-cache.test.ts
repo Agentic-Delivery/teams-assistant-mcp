@@ -2,7 +2,7 @@ import { mkdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_MEMBERS_TTL_MS, MembersCache } from './members-cache.js';
 
 const CHAT = '19:pilot@thread.v2';
@@ -112,6 +112,185 @@ describe('MembersCache — disk-persisted, per-chat, TTL-bounded (0.4.1)', () =>
 
     expect(cache.get(CHAT)).toBeUndefined();
     expect(cache.get('19:other@thread.v2')).toEqual(members);
+  });
+
+  // Mitigation 1 (docs/throttling-mitigation.md §4, stage 1 item 2): a cache hit must never
+  // become a hard dependency on the throttled /members endpoint. get() answers undefined past
+  // TTL by design (existing behaviour above) — getStale() is the escape hatch a caller reaches
+  // for ONLY when a live refresh itself failed, so a throttled refresh can still be served from
+  // what's on disk instead of failing the whole mention resolution.
+  describe('getStale — the TTL-ignoring read used only when a live refresh fails (mitigation 1)', () => {
+    it('returns the entry past its TTL, unlike get()', () => {
+      let clock = 0;
+      const cache = new MembersCache({ path, ttlMs: 1000, now: () => clock });
+      cache.set(CHAT, members);
+      clock = 5000; // well past the TTL
+
+      expect(cache.get(CHAT)).toBeUndefined(); // still the old, TTL-bound contract
+      expect(cache.getStale(CHAT)).toEqual({ members, fetchedAt: 0 });
+    });
+
+    it('returns undefined for a chat never cached, same as get()', () => {
+      const cache = new MembersCache({ path });
+
+      expect(cache.getStale(CHAT)).toBeUndefined();
+    });
+
+    it('a corrupt cache file degrades to undefined rather than throwing', async () => {
+      const { writeFile } = await import('node:fs/promises');
+      await writeFile(path, 'not json at all');
+      const cache = new MembersCache({ path });
+
+      expect(cache.getStale(CHAT)).toBeUndefined();
+    });
+  });
+
+  // Mitigation 2 (docs/throttling-mitigation.md §4, stage 1 item 2): the inbox poller hands every
+  // polled message's (senderId, senderDisplayName) here at zero Graph cost — merge() is how that
+  // traffic actually fills/refreshes the roster the throttled /members endpoint used to be the
+  // only source of.
+  //
+  // BLOCKER-1 (2026-09-04 review): merge() used to stamp `fetchedAt` — the SAME field a real
+  // /members fetch stamps — on every call, so a harvested-only roster never expired and
+  // `membersForInvite` (teams-chats.ts) trusted it verbatim as sendFile's permission-grant list.
+  // These tests now pin the PROVENANCE distinction that fixes it: get()/getComplete() answer
+  // differently for a PARTIAL (harvest-only) vs COMPLETE (real-fetch) entry, and merge() never
+  // extends a COMPLETE entry's own fetchedAt.
+  describe('merge — harvesting a roster from message traffic at zero Graph cost (mitigation 2; PARTIAL/COMPLETE provenance, BLOCKER-1 fix)', () => {
+    it('BLOCKER-1: a merge into an empty cache creates a PARTIAL entry — get() serves it (mention resolution may), getComplete() refuses it (sendFile\'s grant path must not)', () => {
+      let clock = 123;
+      const cache = new MembersCache({ path, now: () => clock });
+
+      cache.merge(CHAT, [{ id: 'aad-1', displayName: 'Garg, Shivankit' }]);
+
+      expect(cache.get(CHAT)).toEqual([{ id: 'aad-1', displayName: 'Garg, Shivankit' }]);
+      expect(cache.getComplete(CHAT)).toBeUndefined();
+      expect(cache.getStaleComplete(CHAT)).toBeUndefined();
+      // fetchedAt: 0, not omitted — the 0.5.1-compatible "instantly expired, but shape-valid"
+      // marker (MembersCacheEntry.fetchedAt's own doc comment); harvestedAt carries the real time.
+      expect(cache.getStale(CHAT)).toEqual({
+        members: [{ id: 'aad-1', displayName: 'Garg, Shivankit' }],
+        fetchedAt: 0,
+      });
+    });
+
+    it('adds a newly-seen sender to an existing roster without dropping the members already cached', () => {
+      const cache = new MembersCache({ path });
+      cache.set(CHAT, [{ id: 'aad-1', displayName: 'Garg, Shivankit' }]);
+
+      cache.merge(CHAT, [{ id: 'aad-2', displayName: 'Spännare, Johan' }]);
+
+      expect(cache.get(CHAT)).toEqual(
+        expect.arrayContaining([
+          { id: 'aad-1', displayName: 'Garg, Shivankit' },
+          { id: 'aad-2', displayName: 'Spännare, Johan' },
+        ]),
+      );
+    });
+
+    it('BLOCKER-1: a merge into an already-COMPLETE (set()) roster keeps it COMPLETE and keeps its ORIGINAL fetchedAt — traffic does not extend the grant-path freshness window', () => {
+      let clock = 0;
+      const cache = new MembersCache({ path, ttlMs: 1000, now: () => clock });
+      cache.set(CHAT, [{ id: 'aad-1', displayName: 'Garg, Shivankit' }]); // fetchedAt stamped at clock=0
+      clock = 999; // just inside the TTL
+
+      cache.merge(CHAT, [{ id: 'aad-1', displayName: 'Garg, Shivankit' }]);
+      clock = 1500; // past the TTL measured from the ORIGINAL fetchedAt (0) — merge must not have moved it
+
+      // Before the fix this stayed fresh forever (merge() restamped fetchedAt to 999). Now the
+      // COMPLETE roster expires on its OWN real-fetch schedule, unaffected by the reconfirming merge.
+      expect(cache.getComplete(CHAT)).toBeUndefined();
+      // get() (mention resolution) DOES still count the merge's harvestedAt as fresh evidence.
+      expect(cache.get(CHAT)).toEqual([{ id: 'aad-1', displayName: 'Garg, Shivankit' }]);
+    });
+
+    it('a departed member is not kept in a PARTIAL roster\'s grant path forever: getComplete() never serves a partial entry regardless of how recently traffic confirmed it', () => {
+      let clock = 0;
+      const cache = new MembersCache({ path, now: () => clock });
+      cache.merge(CHAT, [{ id: 'aad-1', displayName: 'Garg, Shivankit' }]);
+      clock = 1; // freshly harvested a moment ago — get() would happily serve this
+
+      expect(cache.get(CHAT)).toEqual([{ id: 'aad-1', displayName: 'Garg, Shivankit' }]);
+      expect(cache.getComplete(CHAT)).toBeUndefined();
+    });
+
+    // Violating-double coverage: a message sender Graph (or our own mapping) failed to name
+    // properly must never corrupt the persisted roster with a junk entry — the poller's harvest
+    // is untrusted input reaching this cache directly, with no /members validation in between.
+    it('ignores a harvested pair with no id or no displayName rather than persisting junk', () => {
+      const cache = new MembersCache({ path });
+
+      cache.merge(CHAT, [
+        { id: '', displayName: 'Nobody' } as { id: string; displayName: string },
+        { id: 'aad-1', displayName: '' } as { id: string; displayName: string },
+      ]);
+
+      expect(cache.get(CHAT)).toBeUndefined();
+    });
+
+    it('a harvest with nothing valid never touches the disk (no write, no rename)', () => {
+      const writeFileFn = vi.fn(writeFileSync);
+      const renameFn = vi.fn(renameSync);
+      const cache = new MembersCache({ path, writeFileFn, renameFn });
+
+      cache.merge(CHAT, []);
+
+      expect(writeFileFn).not.toHaveBeenCalled();
+      expect(renameFn).not.toHaveBeenCalled();
+    });
+  });
+
+  // getComplete/getStaleComplete: the reads membersForInvite (sendFile's permission-grant roster,
+  // teams-chats.ts) uses instead of get()/getStale() — BLOCKER-1 fix, 2026-09-04 review.
+  describe('getComplete / getStaleComplete — COMPLETE-only reads for the permission-grant path (BLOCKER-1 fix)', () => {
+    it('a fresh set() entry is served by getComplete()', () => {
+      const cache = new MembersCache({ path });
+      cache.set(CHAT, members);
+
+      expect(cache.getComplete(CHAT)).toEqual(members);
+    });
+
+    it('a legacy entry with no complete flag at all (pre-0.5.2 on-disk shape) reads as COMPLETE', async () => {
+      const { writeFile } = await import('node:fs/promises');
+      await writeFile(path, JSON.stringify({ [CHAT]: { members, fetchedAt: Date.now() } }));
+      const cache = new MembersCache({ path });
+
+      expect(cache.getComplete(CHAT)).toEqual(members);
+    });
+
+    it('getComplete() honours the same TTL as get() against fetchedAt', () => {
+      let clock = 0;
+      const cache = new MembersCache({ path, ttlMs: 1000, now: () => clock });
+      cache.set(CHAT, members);
+      clock = 1001;
+
+      expect(cache.getComplete(CHAT)).toBeUndefined();
+    });
+
+    it('getStaleComplete() serves a COMPLETE entry past its TTL, unlike getComplete()', () => {
+      let clock = 0;
+      const cache = new MembersCache({ path, ttlMs: 1000, now: () => clock });
+      cache.set(CHAT, members);
+      clock = 5000;
+
+      expect(cache.getComplete(CHAT)).toBeUndefined();
+      expect(cache.getStaleComplete(CHAT)).toEqual({ members, fetchedAt: 0 });
+    });
+
+    it('getStaleComplete() refuses a PARTIAL (harvest-only) entry even though getStale() would serve it', () => {
+      const cache = new MembersCache({ path });
+      cache.merge(CHAT, [{ id: 'aad-1', displayName: 'Garg, Shivankit' }]);
+
+      expect(cache.getStale(CHAT)).toBeDefined();
+      expect(cache.getStaleComplete(CHAT)).toBeUndefined();
+    });
+
+    it('returns undefined for a chat never cached', () => {
+      const cache = new MembersCache({ path });
+
+      expect(cache.getComplete(CHAT)).toBeUndefined();
+      expect(cache.getStaleComplete(CHAT)).toBeUndefined();
+    });
   });
 
   // MAJOR 4 (review round 1): the previous version of this test only asserted no leftover

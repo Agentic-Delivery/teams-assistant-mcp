@@ -698,3 +698,158 @@ describe('inbox poller — the quota yield (0.5.0: the poller starved ad-hoc rea
     expect(reads).toBe(2);
   });
 });
+
+// Mitigation 2 (docs/throttling-mitigation.md §4, stage 1 item 2): every message the poller
+// already reads carries its sender's AAD id and display name at zero MARGINAL Graph cost — this
+// is exactly the population worth @mentioning, and harvesting it is what lets a chat's roster
+// fill and refresh from traffic alone, taking `/members` off the mention-resolution send path
+// for good (see teams-chats.test.ts's stale-serve tests for the other half of this mitigation).
+describe('inbox poller — roster harvest from poll results (mitigation 2)', () => {
+  let dir: string;
+  let inboxPath: string;
+  let statePath: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'inbox-roster-test-'));
+    inboxPath = join(dir, 'inbox.jsonl');
+    statePath = join(dir, 'inbox-state.json');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  async function inboxLines(): Promise<Array<Record<string, unknown>>> {
+    const raw = await readFile(inboxPath, 'utf8').catch(() => '');
+    return raw
+      .split('\n')
+      .filter((line) => line.trim() !== '')
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+  }
+
+  function poller(chats: Pick<ReturnType<typeof chatStore>, 'readMessages'>, chatIds = [CHAT]) {
+    return new InboxPoller({
+      chats,
+      allowlist: new ChatAllowlist(chatIds.map((id) => ({ id, label: id, canPost: true }))),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+    });
+  }
+
+  function rosterSink() {
+    const merged: Array<{ chatId: string; members: ReadonlyArray<{ id: string; displayName: string }> }> = [];
+    return {
+      merged,
+      merge: (chatId: string, members: ReadonlyArray<{ id: string; displayName: string }>) => {
+        merged.push({ chatId, members: [...members] });
+      },
+    };
+  }
+
+  function pollerWithRoster(
+    chats: Pick<ReturnType<typeof chatStore>, 'readMessages'>,
+    roster: { merge: (chatId: string, members: ReadonlyArray<{ id: string; displayName: string }>) => void },
+    chatIds = [CHAT],
+  ) {
+    return new InboxPoller({
+      chats,
+      allowlist: new ChatAllowlist(chatIds.map((id) => ({ id, label: id, canPost: true }))),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+      roster,
+    });
+  }
+
+  it('TRIGGERING: harvests (fromId, from) from every new message into the roster sink for that chat, at zero extra Graph calls', async () => {
+    const store = chatStore({});
+    const roster = rosterSink();
+    await pollerWithRoster(store, roster).pollOnce(); // settle
+    store.add(
+      CHAT,
+      message({ id: 'a', from: 'Alice', fromId: 'alice-id', createdDateTime: '2026-08-21T10:00:00Z' }),
+      message({ id: 'b', from: 'Bob', fromId: 'bob-id', createdDateTime: '2026-08-21T10:01:00Z' }),
+    );
+
+    await pollerWithRoster(store, roster).pollOnce();
+
+    const forChat = roster.merged.filter((entry) => entry.chatId === CHAT);
+    expect(forChat).toHaveLength(1);
+    expect(forChat[0]?.members).toEqual(
+      expect.arrayContaining([
+        { id: 'alice-id', displayName: 'Alice' },
+        { id: 'bob-id', displayName: 'Bob' },
+      ]),
+    );
+  });
+
+  it('NON-TRIGGERING: an inbox poller with no roster sink configured never throws — harvest is optional, not a hard dependency', async () => {
+    const store = chatStore({});
+    await poller(store).pollOnce(); // settle, no `roster` in deps at all
+    store.add(CHAT, message({ id: 'a', from: 'Alice', fromId: 'alice-id' }));
+
+    const clean = await poller(store).pollOnce();
+
+    expect(clean).toBe(true);
+  });
+
+  it('harvests from a BOOTSTRAP (settling) poll too — the very message the settling poll intentionally does not deliver to the inbox is still worth learning the sender of', async () => {
+    const roster = rosterSink();
+    const store = chatStore({
+      [CHAT]: [message({ id: 'ancient', from: 'Ancient Sender', fromId: 'ancient-id' })],
+    });
+
+    await pollerWithRoster(store, roster).pollOnce(); // the settling poll itself
+
+    expect(await inboxLines()).toEqual([]); // still never backfills (0.4.1 contract, unchanged)
+    const forChat = roster.merged.filter((entry) => entry.chatId === CHAT);
+    expect(forChat.some((entry) => entry.members.some((m) => m.id === 'ancient-id'))).toBe(true);
+  });
+
+  // Violating-double coverage: a message whose sender Graph could not fully identify (an id with
+  // no real display name — toChatMessage's own 'unknown'/'system' fallback, see messages.ts) must
+  // never be merged into the roster as if 'unknown' were a real person's name. This is untrusted
+  // data (Graph's own response shape) reaching the roster cache directly, with no `/members`
+  // validation in between.
+  it('VIOLATING DOUBLE: a message with no resolvable sender name (fromId present, from is the "unknown" fallback) is never harvested', async () => {
+    const roster = rosterSink();
+    const store = chatStore({});
+    await pollerWithRoster(store, roster).pollOnce(); // settle
+    store.add(
+      CHAT,
+      // Simulates toChatMessage's own fallback shape for a sender Graph reported an id for but no
+      // displayName — see messages.ts's `from: sender?.displayName ?? (... : 'unknown')`.
+      { ...message({ id: 'weird' }), from: 'unknown', fromId: 'has-id-no-name' },
+    );
+
+    await pollerWithRoster(store, roster).pollOnce();
+
+    const harvestedIds = roster.merged.flatMap((entry) => entry.members.map((m) => m.id));
+    expect(harvestedIds).not.toContain('has-id-no-name');
+  });
+
+  it('a system message (no fromId at all) is never harvested', async () => {
+    const roster = rosterSink();
+    const store = chatStore({});
+    await pollerWithRoster(store, roster).pollOnce(); // settle
+    store.add(CHAT, { ...message({ id: 'sys' }), from: 'system', fromId: undefined });
+
+    await pollerWithRoster(store, roster).pollOnce();
+
+    expect(roster.merged.filter((entry) => entry.chatId === CHAT)).toHaveLength(0);
+  });
+
+  it("the assistant's own posted messages ARE still harvested (isSelf only filters what gets DELIVERED to the inbox, not the roster) — self is a real chat member", async () => {
+    const roster = rosterSink();
+    const store = chatStore({});
+    await pollerWithRoster(store, roster).pollOnce(); // settle
+    store.add(CHAT, message({ id: 'self-msg', from: me.displayName, fromId: me.id }));
+
+    await pollerWithRoster(store, roster).pollOnce();
+
+    expect(await inboxLines()).toEqual([]); // never delivered as an inbox event (unchanged 0.4.1 rule)
+    const harvestedIds = roster.merged.flatMap((entry) => entry.members.map((m) => m.id));
+    expect(harvestedIds).toContain(me.id);
+  });
+});

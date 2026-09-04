@@ -167,13 +167,37 @@ interface GraphInviteResult {
 }
 
 /**
- * The narrow shape resolveMentions actually needs from a members cache — deliberately an
- * interface, not the concrete `MembersCache` class, so a test that has no reason to touch mention
- * resolution can wire a trivial in-memory double instead of a real disk-backed cache.
+ * The narrow shape resolveMentions and membersForInvite actually need from a members cache —
+ * deliberately an interface, not the concrete `MembersCache` class, so a test that has no reason
+ * to touch mention resolution can wire a trivial in-memory double instead of a real disk-backed
+ * cache. Since 0.5.2 (BLOCKER 1 fix, 2026-09-04 review) this port distinguishes a roster that MAY
+ * be PARTIAL (traffic-harvested-only — `get`/`getStale`, used only by resolveMentions) from one
+ * that is GUARANTEED COMPLETE (a real `/members` fetch — `getComplete`/`getStaleComplete`, used
+ * only by membersForInvite/sendFile's permission grant). See MembersCache's own doc comments for
+ * the full PARTIAL/COMPLETE reasoning.
  */
 export interface MembersCachePort {
   get(chatId: string): ChatMember[] | undefined;
   set(chatId: string, members: ChatMember[]): void;
+  /**
+   * The TTL-ignoring read resolveMentions falls back to ONLY when a live refresh itself failed
+   * (mitigation 1, docs/throttling-mitigation.md §4) — see MembersCache.getStale's own doc
+   * comment for the incident this exists to close.
+   */
+  getStale(chatId: string): { members: ChatMember[]; fetchedAt: number } | undefined;
+  /**
+   * COMPLETE-only fresh read — membersForInvite requires this, NEVER get(), since get() also
+   * serves a PARTIAL roster resolveMentions may safely use but sendFile must not (0.5.2 BLOCKER 1
+   * fix) — see MembersCache.getComplete's own doc comment.
+   */
+  getComplete(chatId: string): ChatMember[] | undefined;
+  /**
+   * COMPLETE-only stale read — membersForInvite's equivalent of getStale, used ONLY when a live
+   * `/members` refresh itself failed with a throttled/transient status AND a previously-COMPLETE
+   * roster exists to fall back to (0.5.2 BLOCKER 1 fix) — see MembersCache.getStaleComplete's own
+   * doc comment.
+   */
+  getStaleComplete(chatId: string): { members: ChatMember[]; fetchedAt: number } | undefined;
 }
 
 export interface GraphTeamsChatsOptions {
@@ -354,12 +378,19 @@ export class GraphTeamsChats implements TeamsChatsPort {
   ): Promise<ChatMember[]> {
     return this.membersOf(chatId).catch((caught: unknown) => {
       if (caught instanceof GraphError && caught.status === 429) {
+        // Mitigation 3 (docs/throttling-mitigation.md §4, stage 1 item 1): the scope is stated
+        // in the message text (not just carried structurally on the error) because THIS is the
+        // exact "THROTTLED: ..." string both CLIs and the MCP tool path print verbatim — an
+        // operator staring at a terminal on the next incident sees which of Graph's four keys
+        // closed without having to inspect the error object.
+        const scopeClause = caught.throttleScope ? ` [throttle scope: ${caught.throttleScope}]` : '';
         throw new GraphError(
           `THROTTLED: the member list refresh ${reason} was throttled; nothing was done. Wait ` +
-            `and try again.${extraOnThrottle}`,
+            `and try again.${scopeClause}${extraOnThrottle}`,
           429,
           'MembersRefreshThrottled',
           caught.retryAfterSeconds,
+          caught.throttleScope,
         );
       }
       throw caught;
@@ -379,14 +410,29 @@ export class GraphTeamsChats implements TeamsChatsPort {
     }
   }
 
+  /** 429 (including our own locally-simulated `LocallyThrottled` gate) or a 503/504 the read
+   *  loop already retried once and gave up on — the shapes worth falling back to a stale roster
+   *  for, per mitigation 1 (docs/throttling-mitigation.md §4). Anything else (a genuine 4xx, a
+   *  network failure with no status at all) is not "the endpoint is temporarily unavailable" and
+   *  must not be masked by silently serving old data. */
+  private static isTransientRefreshFailure(error: unknown): boolean {
+    return error instanceof GraphError && (error.status === 429 || error.status === 503 || error.status === 504);
+  }
+
   /**
    * Cache-first: a hit resolves every name against the on-disk roster with ZERO Graph calls. A
    * miss — no cache, an expired entry, or a name the cached roster does not have — refreshes ONCE
    * (a single `/members` call, never a retry loop) and re-checks against the fresh roster; a name
-   * still unresolved after that gets resolveMentionTargets's own clear error. A 429 on that
-   * refresh is never swallowed into "no match" — it surfaces as its own THROTTLED error naming
-   * Retry-After, so a caller sees a throttle, not a false "no such member" (0.4.1, live-diagnosed:
-   * this endpoint shares a throttle budget with another daemon on the same first-party client id).
+   * still unresolved after that gets resolveMentionTargets's own clear error.
+   *
+   * Mitigation 1 (docs/throttling-mitigation.md §4, stage 1 item 2; root-caused live 2026-09-04
+   * — see KNOWN-ISSUES.md): when that refresh itself fails with a throttled/transiently-
+   * unavailable status, a cache hit must never become a hard dependency on the endpoint that just
+   * refused us. Falling through to whatever this chat's stale (past-TTL) roster still holds on
+   * disk lets the send succeed anyway — logged once, so the fallback is visible, never silent —
+   * and ONLY fails the post when the requested name is absent from the stale roster too, in which
+   * case the ORIGINAL throttled error still surfaces (never swallowed into a false "no such
+   * member": a throttle is a throttle, not evidence the name does not exist).
    */
   async resolveMentions(chatId: string, names: readonly string[]): Promise<MentionTarget[]> {
     const cache = this.membersCache;
@@ -401,37 +447,106 @@ export class GraphTeamsChats implements TeamsChatsPort {
         // Fall through to a single refresh — see doc comment above.
       }
     }
-    const fresh = await this.refreshMembers(
-      chatId,
-      'for mention resolution',
-      ' This does not mean the name does not exist.',
-    );
-    this.cacheIfNonEmpty(chatId, fresh);
-    return resolveMentionTargets(names, fresh);
+    try {
+      const fresh = await this.refreshMembers(
+        chatId,
+        'for mention resolution',
+        ' This does not mean the name does not exist.',
+      );
+      this.cacheIfNonEmpty(chatId, fresh);
+      return resolveMentionTargets(names, fresh);
+    } catch (error) {
+      if (GraphTeamsChats.isTransientRefreshFailure(error)) {
+        const stale = cache.getStale(chatId);
+        if (stale && stale.members.length > 0) {
+          try {
+            const resolved = resolveMentionTargets(names, stale.members);
+            const ageS = Math.round((Date.now() - stale.fetchedAt) / 1000);
+            this.log(
+              `mention resolution: /members refresh for ${chatId} failed ` +
+                `(${(error as GraphError).code ?? (error as GraphError).status}); served from the ` +
+                `STALE cached roster instead of failing the post (roster age ${ageS}s).`,
+            );
+            return resolved;
+          } catch {
+            // The requested name is absent from the stale roster too — the throttle/transient
+            // failure is the real, more useful error here, so fall through and rethrow it below
+            // rather than surface a "no such member" that would be indistinguishable from the
+            // name genuinely not existing.
+          }
+        }
+      }
+      throw error;
+    }
   }
 
   /**
-   * The chat's current member roster for sendFile's permission grant — the SAME cache-first,
-   * refresh-once-on-miss path resolveMentions uses (see its doc comment for the full rationale):
-   * a cache hit costs zero Graph calls, a miss refreshes ONCE via membersOf and persists it (via
-   * cacheIfNonEmpty — see its own doc comment for why an empty result is never persisted). Never
-   * calls `/chats/{id}/members` directly on the send path — that endpoint shares a Graph throttle
-   * budget across every process signed in with the same client id, and the 0.4.1 incident that
-   * starved mention resolution on it applies identically to a file share.
+   * The chat's current member roster for sendFile's permission grant — cache-first,
+   * refresh-once-on-miss, SIMILAR to resolveMentions's path (see its doc comment for the shared
+   * rationale) but deliberately NOT the same read: this method requires a COMPLETE roster (a real
+   * `/members` fetch), NEVER a PARTIAL, traffic-harvested-only one (0.5.2 BLOCKER 1 fix,
+   * 2026-09-04 review, reproduced live against the Guidewire Management chat — see
+   * docs/throttling-mitigation.md §1.2 — which had no `/members` entry, ever, only harvested
+   * traffic from whoever happened to speak). A harvested roster used verbatim here silently
+   * omitted real, silent chat members from the grant — exactly the "no dead cards, ever" contract
+   * sendFile's own doc comment names — and, because the old merge() restamped the SAME
+   * `fetchedAt` a real fetch does, that partial entry never expired, so a departed member kept
+   * their grant indefinitely too. `getComplete`/`getStaleComplete` (members-cache.ts) are how this
+   * is now enforced: a PARTIAL entry reads as a plain miss, forcing exactly the fetch that used to
+   * be skipped.
+   *
+   * Read order:
+   *  1. `getComplete` — a fresh COMPLETE roster, zero Graph calls.
+   *  2. A live `/members` fetch (`refreshMembers`/`membersOf`), persisted via `cacheIfNonEmpty`
+   *     (as a fresh COMPLETE entry — see MembersCache.set's own doc comment) — covers both a
+   *     genuine miss and a PARTIAL-only entry, so a chat whose roster is known only from traffic
+   *     still gets a real, complete grant list. If THIS throws THROTTLED (no prior COMPLETE
+   *     entry to fall back to — see step 3), the send fails loudly: no partial grants, no dead
+   *     cards, ever.
+   *  3. On a throttled/transient failure of step 2, `getStaleComplete` — the SAME roster,
+   *     ignoring its TTL, but ONLY if it was once COMPLETE; a PARTIAL-only roster has nothing
+   *     honest to fall back to here and the throttled error surfaces instead (logged once when it
+   *     IS used, naming the fallback and the roster's age — the sendFile analogue of
+   *     resolveMentions's own stale-serve log line).
    *
    * Deliberately does NOT treat "empty" as "nobody to invite": an empty roster — whether the
    * cache never had one, or a fresh call to Graph itself reports nobody — is read as "we do not
    * reliably know who is in this chat" and left for sendFile to fail loudly on, never silently
    * skipped as if the file were being shared into an empty room.
+   *
+   * A side effect worth naming: because this method now ALWAYS returns a genuinely COMPLETE
+   * roster (never partial), sendFile's roster-membership self-id re-check (that method's own doc
+   * comment) naturally stopped forcing a live `/me` on a chat where the assistant merely hadn't
+   * spoken — a real `/members` response always includes self, so the "resolved self id absent
+   * from the roster" branch that check guards no longer fires on a harvested-only roster (0.5.2
+   * BLOCKER 2 fix, same review: this was previously resurrecting the throttled-`/me` incident
+   * 0.5.1 closed, since a partial roster missing self used to be trusted verbatim).
    */
   private async membersForInvite(chatId: string): Promise<ChatMember[]> {
-    const cached = this.membersCache.get(chatId);
-    if (cached && cached.length > 0) {
-      return cached;
+    const complete = this.membersCache.getComplete(chatId);
+    if (complete && complete.length > 0) {
+      return complete;
     }
-    const fresh = await this.refreshMembers(chatId, 'needed to grant file access');
-    this.cacheIfNonEmpty(chatId, fresh);
-    return fresh;
+    try {
+      const fresh = await this.refreshMembers(chatId, 'needed to grant file access');
+      this.cacheIfNonEmpty(chatId, fresh);
+      return fresh;
+    } catch (error) {
+      if (GraphTeamsChats.isTransientRefreshFailure(error)) {
+        const stale = this.membersCache.getStaleComplete(chatId);
+        if (stale && stale.members.length > 0) {
+          const ageS = Math.round((Date.now() - stale.fetchedAt) / 1000);
+          this.log(
+            `sendFile: /members refresh for ${chatId} failed ` +
+              `(${(error as GraphError).code ?? (error as GraphError).status}); served from the ` +
+              `STALE cached COMPLETE roster instead of failing the send (roster age ${ageS}s). ` +
+              'A partial (traffic-harvested-only) roster is never served here.',
+          );
+          return stale.members;
+        }
+      }
+      throw error;
+    }
   }
 
   /**
@@ -618,8 +733,10 @@ export class GraphTeamsChats implements TeamsChatsPort {
    * `requireSignIn: true`, `sendInvitation: false`, `roles: ['read']`) BEFORE the chat message is
    * posted — Teams' own native upload does this implicitly; we have to do it explicitly. See
    * KNOWN-ISSUES.md for the live-verified wire-shape snapshot this contract is anchored to. The
-   * roster comes from membersForInvite, the SAME cache-backed path resolveMentions uses — never a
-   * direct call to the throttled `/chats/{id}/members` endpoint on the send path (see that
+   * roster comes from membersForInvite, which shares the SAME on-disk cache resolveMentions uses
+   * but reads it through the COMPLETE-only side (never the possibly-PARTIAL, traffic-harvested
+   * side resolveMentions may use — see membersForInvite's own doc comment, 0.5.2 BLOCKER 1 fix) —
+   * never a direct call to the throttled `/chats/{id}/members` endpoint on the send path (see that
    * method's doc comment for why: the 0.4.1 mention-429 incident is the same shared throttle
    * budget).
    *

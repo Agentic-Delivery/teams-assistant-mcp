@@ -1,3 +1,82 @@
+## A TTL-expired members cache under a throttled /members refresh converted a working cache into a permanent hard dependency on the throttled endpoint (live 2026-09-04, closed 0.5.2)
+
+The 24h members-cache TTL (`DEFAULT_MEMBERS_TTL_MS`, `src/graph/members-cache.ts`) does not bound
+staleness risk at the cost of one refresh under contention — it converts a working cached mention
+path into a PERMANENT hard dependency on the very endpoint it exists to avoid. Root-caused live
+(CTP daemon, `docs/throttling-mitigation.md` §1.2): the CTP agent-team chat's roster
+(`fetchedAt` 2026-09-03T07:34:05Z) expired at 07:34:05Z the next day; the first throttled mention
+came ~07:45Z, eleven minutes later. The mechanism: TTL expiry turns `MembersCache.get()` into a
+miss → the miss triggers a `/members` refresh, the one endpoint sharing the crowded per-tenant
+default-GET throttle bucket (§2 of that document) → the refresh 429s, so the fresh roster that
+would have rewritten the cache is never obtained → every subsequent `--mention` post repeats the
+same three steps forever, because healing the cache requires the very call being refused. Every
+`--mention` post into that chat between ~07:45Z and ~08:05Z failed with `THROTTLED: the member
+list refresh for mention resolution was throttled; nothing was done ... retry after 62s` while
+UNTAGGED posts into the same chat succeeded throughout — proof this was never an account- or
+tenant-wide block, only `/members` sharing a bucket `/chats/{id}/messages` does not.
+
+**Closed 0.5.2**, two changes (`docs/throttling-mitigation.md` §4, stage 1 item 2):
+
+1. **Stale-serve on a throttled/transiently-failing refresh.** `MembersCache.getStale()` is a new
+   TTL-ignoring read `GraphTeamsChats.resolveMentions` (`teams-chats.ts`) falls back to ONLY after
+   a live refresh itself fails with a 429/503/504 — never on an ordinary miss, which still refreshes
+   as before. A cache hit resolves from the stale roster (logged once, naming the fallback and the
+   roster's age) and only fails the post when the requested name is absent from the stale roster
+   too, in which case the original THROTTLED error (naming Retry-After and, since 0.5.2, the
+   throttle scope — see the entry below) still surfaces, never swallowed into a false "no such
+   member".
+2. **The roster now fills and refreshes itself from ordinary chat traffic, at zero Graph cost.**
+   Every message the poller already reads carries its sender's AAD id and display name
+   (`ChatMessage.fromId`/`from`, sourced from Graph's `from.user.id`/`from.user.displayName` —
+   `messages.ts`'s `toChatMessage`); the poller merges those into the same on-disk roster
+   (`MembersCache.merge`) as a PARTIAL roster (`complete: false`, `fetchedAt: 0`, `harvestedAt`
+   stamped) — `merge()` never touches `fetchedAt`. Mention resolution may use a partial roster, so
+   a chat that stays busy rarely needs a live `/members` call for a mention; the explicit refresh
+   is the fallback for a name never seen in traffic. File sends are different: a permission grant
+   requires a COMPLETE roster (a real `/members` fetch, fresh or stale-served), never a partial one. A message whose sender Graph
+   could not fully identify (`from: 'unknown'`, no real displayName) is never merged, so a gap in
+   Graph's own response cannot poison the roster with a junk entry.
+
+Together these mean the 2026-09-04 incident's own mechanism cannot recur: TTL expiry no longer
+forces a throttled call onto the hot path at all in a chat with any recent traffic, and even a
+cold/silent chat degrades to "served from stale data, logged" rather than "hard failure until the
+throttle happens to clear on its own." See the README's "@mentions" section for the consumer-
+facing description.
+
+## A partial (traffic-harvested) roster was trusted verbatim for send_chat_file's permission grant, and never expired (found and closed the same day, 0.5.2 review round 2, 2026-09-04)
+
+The traffic-harvest mechanism above (mitigation 2) merges (senderId, senderDisplayName) pairs into
+the on-disk members cache without any `/members` validation — deliberate, since the whole point is
+zero Graph cost. A same-day review found the first cut of that mechanism let `membersForInvite`
+(`src/graph/teams-chats.ts`, `send_chat_file`'s permission-grant roster) read that SAME cache entry
+as if it were authoritative: a chat member who had never spoken (only harvested from OTHERS'
+traffic, or never harvested at all) never appeared in the grant, so `send_chat_file` shared a card
+they could not open — exactly the "no dead cards, ever" contract that method's own doc comment
+names. Worse, because `merge()` used to stamp `fetchedAt` (the SAME field a real `/members` fetch
+stamps) on every call, a harvested-only entry never expired, so a member who later LEFT the chat
+kept their file-read grant indefinitely — the 24h TTL that used to force a periodic re-check never
+fired for a roster that had never been fetched to begin with. The same partial roster also
+resurrected the throttled-`/me` incident (entry below): `send_chat_file`'s self-id
+roster-membership re-check saw the assistant absent from a roster that had simply never harvested
+its own messages, and forced a live `/me` on every send into such a chat regardless of a valid
+persisted self-id cache.
+
+**Closed same-day, 0.5.2 (`src/graph/members-cache.ts`):** every cache entry now carries explicit
+PROVENANCE — `complete: true` (and a real `fetchedAt`) for a roster confirmed by an actual
+`/members` fetch, `complete: false` (`fetchedAt: 0`, `harvestedAt` instead) for one assembled only
+from traffic. `membersForInvite` now reads the COMPLETE-only side of the cache
+(`getComplete`/`getStaleComplete`) — a PARTIAL entry reads as a plain miss, forcing exactly the
+`/members` call that used to be skipped (refusing the send loudly, THROTTLED, if that call itself
+is throttled — no partial grants, ever). Mention resolution is unaffected: `resolveMentions` still
+reads `get`/`getStale`, which serve a PARTIAL roster exactly as before, since a harvested-only
+roster missing a name simply falls through to a live refresh there too — the hazard was specific
+to a PERMISSION GRANT trusting incomplete data, not to mentions. On-disk shape stays
+0.5.1-compatible: `fetchedAt: 0` (not omitted) on a partial entry keeps it shape-valid for an old
+daemon's own `isValidEntry` check, which then reads it as instantly expired via its own TTL
+arithmetic — never trusted as complete by an older process either. No operator action needed on
+upgrade: a harvested-only entry already on disk simply reads as a miss on the next
+`send_chat_file`, which pays one real `/members` call and moves on.
+
 ## send_chat_file: a throttled /me refused every CLI attempt, one process at a time (live 2026-09-03, mitigated 0.5.1)
 
 `resolveSelfId`'s in-memory memo (`teams-chats.ts`) protects nothing across process boundaries,
@@ -84,7 +163,9 @@ was repeated per chat member.
 
 **Fixed 0.4.2**: `GraphTeamsChats.sendFile` now grants each OTHER chat member read access on the
 uploaded item (that same `/invite` call) BEFORE posting the chat message, resolved through the
-same cache-backed member roster resolveMentions already uses — never a direct call to the
+same on-disk cache resolveMentions uses, but read through its COMPLETE-only side — see the
+"A partial (traffic-harvested) roster..." entry below for why sendFile never trusts the same
+PARTIAL roster mention resolution may use — never a direct call to the
 throttled `/chats/{id}/members` endpoint on the send path (see README's "@mentions" section for
 why that endpoint is avoided on sends). The assistant's own id is excluded from the grant when it
 can be determined (it already owns the item as uploader) — since 0.5.1, via the persisted self-id
@@ -195,6 +276,9 @@ resolution. 0.4.1 adds a disk-persisted per-chat member cache (default TTL 24h,
 common path; see the README's "@mentions" and "Throttle budgets are per client id" sections. The
 underlying per-process gate limitation above is unchanged and still applies to every other
 endpoint and to a `/members` cache miss itself.
+
+(Cross-reference, added 2026-09-04: the "cache miss itself" residual risk this paragraph names is
+what the 2026-09-04 incident actually hit — see the top entry of this file for the 0.5.2 close.)
 
 ## Retry-After was silent on the CLI send path (fixed 0.4.1)
 
