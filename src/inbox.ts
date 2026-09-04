@@ -3,6 +3,7 @@ import { dirname } from 'node:path';
 import type { ChatAllowlist } from './allowlist.js';
 import type { TeamsChatsPort } from './graph/teams-chats.js';
 import { readYield } from './inbox-yield.js';
+import type { ChatMessage } from './messages.js';
 
 /**
  * Background inbox poller. Runs inside the MCP server process and appends every new message from
@@ -17,6 +18,21 @@ import { readYield } from './inbox-yield.js';
 export interface SignedInAccount {
   id?: string;
   displayName?: string;
+}
+
+/**
+ * Narrow sink the poller hands harvested (id, displayName) pairs to — deliberately just the
+ * `merge` slice of MembersCache (members-cache.ts), not the full cache, so a test double never
+ * needs to implement get()/set()/getStale() to exercise the poller. Mitigation 2
+ * (docs/throttling-mitigation.md §4, stage 1 item 2): every message this poller already reads
+ * carries its sender's AAD id and display name at zero MARGINAL Graph cost — merging those into
+ * the persisted roster is what lets a chat's roster fill and refresh from traffic alone, taking
+ * `/members` off the mention-resolution send path for the common case (see
+ * GraphTeamsChats.resolveMentions's stale-serve fallback, teams-chats.ts, for what still happens
+ * on the rarer miss).
+ */
+export interface RosterHarvestPort {
+  merge(chatId: string, members: ReadonlyArray<{ id: string; displayName: string }>): void;
 }
 
 export interface InboxPollerDeps {
@@ -35,6 +51,14 @@ export interface InboxPollerDeps {
    * it the poller never yields, which is the pre-0.5.0 behaviour.
    */
   yieldPath?: string;
+  /**
+   * Where harvested (senderId, senderDisplayName) pairs go — see RosterHarvestPort's own doc
+   * comment (mitigation 2). Optional: a poller with no roster wired simply does not harvest,
+   * exactly the pre-mitigation-2 behaviour — there is no throttled endpoint a missing wire falls
+   * back to here, only a missed optimisation (same posture as GraphTeamsChatsOptions.selfIdCache,
+   * self-id-cache.ts).
+   */
+  roster?: RosterHarvestPort;
   pollMs?: number;
   /** Injectable clock for the 403 park; defaults to Date.now. */
   nowFn?: () => number;
@@ -230,6 +254,19 @@ export class InboxPoller {
         const isBootstrap = known === undefined;
         try {
           const result = await this.deps.chats.readMessages(entry.id, known?.watermark);
+          // Mitigation 2 (docs/throttling-mitigation.md §4, stage 1 item 2): every message this
+          // poll already fetched carries its sender's AAD id and display name at zero MARGINAL
+          // Graph cost, whether or not that particular message goes on to be DELIVERED as an
+          // inbox event below — a bootstrap/settling poll's messages are never delivered (0.4.1
+          // contract, unchanged) but their senders are still real chat members worth learning.
+          // Harvested BEFORE the isBootstrap/isSelf/isDeleted filters below, which govern inbox
+          // delivery only, not roster membership.
+          if (this.deps.roster) {
+            const harvested = result.messages.flatMap((message) => this.harvestable(message));
+            if (harvested.length > 0) {
+              this.deps.roster.merge(entry.id, harvested);
+            }
+          }
           for (const message of result.messages) {
             if (isBootstrap) {
               continue;
@@ -358,6 +395,21 @@ export class InboxPoller {
       return true;
     }
     return this.me?.displayName !== undefined && from === this.me.displayName;
+  }
+
+  /**
+   * Violating-double guard (mitigation 2): `message.from` degrades to the literal string
+   * 'unknown' (or 'system' for a system event) when toChatMessage (messages.ts) could not map a
+   * real sender — a shape Graph itself can produce (an id with no displayName reported). Neither
+   * sentinel is a real person's name, and merging one into the roster would poison mention
+   * resolution with junk. Real display names are never expected to collide with these two exact
+   * strings, so a straight equality check is enough — no heuristics needed. The self account IS
+   * harvested (it is a real chat member); only isSelf-DELIVERY to the inbox skips it, above.
+   */
+  private harvestable(message: ChatMessage): Array<{ id: string; displayName: string }> {
+    return message.fromId && message.from !== 'unknown' && message.from !== 'system'
+      ? [{ id: message.fromId, displayName: message.from }]
+      : [];
   }
 
   private async loadState(): Promise<Record<string, ChatState>> {

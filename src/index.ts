@@ -11,7 +11,7 @@ async function main(): Promise<void> {
   const config = loadConfig();
 
   const uploadDir = process.env['TEAMS_MCP_UPLOAD_DIR'];
-  const { chats, graph, tokenProvider } = buildChats(config, uploadDir ? { uploadDir } : {});
+  const { chats, graph, tokenProvider, membersCache } = buildChats(config, uploadDir ? { uploadDir } : {});
 
   // The yield file is passed even when THIS process runs no poller: the download tools write it
   // to quiet whichever poller shares the mailbox — possibly a daemon in another process — and a
@@ -57,6 +57,11 @@ async function main(): Promise<void> {
     // and the yield file with them (inboxYieldPathFor derives from the same inbox path).
     statePath: join(dirname(inboxPath), 'inbox-state.json'),
     yieldPath: inboxYieldPath,
+    // Mitigation 2 (docs/throttling-mitigation.md §4, stage 1 item 2): the SAME MembersCache
+    // instance GraphTeamsChats resolves mentions against — every message this poller reads
+    // harvests its sender into it, at zero Graph cost, which is what lets a chat's roster fill
+    // and refresh from traffic alone.
+    roster: membersCache,
     ...(Number.isFinite(pollSeconds) && pollSeconds > 0 ? { pollMs: pollSeconds * 1000 } : {}),
     log: (line) => process.stderr.write(`${line}\n`),
     // 0.4.1 stuck-auth self-healing: a token that goes bad without the local cache's own expiry
