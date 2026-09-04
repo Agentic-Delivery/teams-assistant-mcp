@@ -143,6 +143,9 @@ export class MembersCache {
    * whole point: a chat member who has never spoken must still be found and granted access, and a
    * departed member who stops speaking must still fall out of the grant once this roster's OWN
    * `fetchedAt` (never extended by traffic — see merge()'s own doc comment) goes past the TTL.
+   * Note: `merge()` into a COMPLETE entry adds a demonstrated speaker's id to `members` while
+   * keeping `complete: true` — COMPLETE therefore means "at least everything `/members` returned"; it
+   * can gain a speaker, never lose a silent member, so the no-dead-cards contract holds.
    * Freshness is judged against `fetchedAt` ONLY, deliberately ignoring `harvestedAt`: traffic
    * reconfirming who is still around is good enough evidence for a mention, but not for a file
    * permission grant, which re-verifies against the authoritative endpoint on its own schedule.

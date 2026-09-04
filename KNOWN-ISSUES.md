@@ -29,9 +29,11 @@ tenant-wide block, only `/members` sharing a bucket `/chats/{id}/messages` does 
    Every message the poller already reads carries its sender's AAD id and display name
    (`ChatMessage.fromId`/`from`, sourced from Graph's `from.user.id`/`from.user.displayName` —
    `messages.ts`'s `toChatMessage`); the poller merges those into the same on-disk roster
-   (`MembersCache.merge`), refreshing `fetchedAt` on every merge that lands something. A chat that
-   stays busy therefore never needs a live `/members` call again — the explicit refresh is the
-   fallback for a name never seen in traffic, not the primary path. A message whose sender Graph
+   (`MembersCache.merge`) as a PARTIAL roster (`complete: false`, `fetchedAt: 0`, `harvestedAt`
+   stamped) — `merge()` never touches `fetchedAt`. Mention resolution may use a partial roster, so
+   a chat that stays busy rarely needs a live `/members` call for a mention; the explicit refresh
+   is the fallback for a name never seen in traffic. File sends are different: a permission grant
+   requires a COMPLETE roster (a real `/members` fetch, fresh or stale-served), never a partial one. A message whose sender Graph
    could not fully identify (`from: 'unknown'`, no real displayName) is never merged, so a gap in
    Graph's own response cannot poison the roster with a junk entry.
 
