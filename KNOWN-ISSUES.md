@@ -323,7 +323,7 @@ snapshots above (both used one recipient per permission entry), but `sendFile`'s
 it as an equivalent echo defensively, so that shape alone degrades to acceptance rather than a false
 outage if a future capture shows Graph choosing it.
 
-## Inbox poller: two server instances race on the same inbox (found 2026-08-21)
+## Inbox poller: two server instances race on the same inbox (found 2026-08-21, closed 0.5.4)
 
 Every session that starts the server gets its own inbox poller, and they all default to the same
 `~/.teams-assistant/inbox.jsonl`. Two Claude Code sessions at once means two pollers appending
@@ -332,9 +332,34 @@ jumping backwards, and extra Graph load. A mild version showed up during a smoke
 older standalone polling daemon and the new in-process poller polling together earned a 429 from
 Graph.
 
-Fix direction: a lock file next to the inbox (first server takes it, later ones skip the poller
-and say so on stderr), or a per-session `TEAMS_INBOX_PATH`. Until then, keep one session per
-account, or set `TEAMS_INBOX_DISABLED=1` in the extra ones.
+**Closed 0.5.4** with the fix direction this entry originally named: a lock file next to the
+inbox (`poller.lock`, `src/poller-lock.ts`), keyed to the inbox path (`dirname(inboxPathFor(env))`
+— `src/inbox-yield.ts`'s own path helper, not a second copy of the resolve logic), acquired in
+`index.ts` before the poller starts. A live holder wins; the newcomer logs the lock path it lost
+on stderr and **serves every other MCP tool normally, running no poller** — not a non-zero exit
+(that was this fix's own first draft, corrected before merge in the PR #20 review: this same
+`dist/index.js` entrypoint is what an MCP tools registration runs, against the same daemon `.env`
+more often than not, so exiting on a contended lock would have silently dropped every Teams tool
+for that session the moment a daemon was already polling). A process that silently never polls is
+the invisible-failure shape this whole entry describes, but the poller's own liveness is already
+covered by `poller-health.json` below — a process manager or watcher should watch that file, not
+this process's exit code. A dead holder's lock (a reboot, a crash) is taken over automatically.
+See `src/inbox-role.ts` for the pure decision (`decideInboxRole`) and `src/inbox-startup.ts` for
+the wiring that acts on it.
+
+**The trap this creates**: the lock is keyed per inbox PATH, not per config directory. Two
+instances that each set their own `TEAMS_MCP_CONFIG`/`TEAMS_MCP_TOKEN_CACHE` but both leave
+`TEAMS_INBOX_PATH` unset still resolve to the SAME default inbox path, and therefore silently
+contend for the SAME lock — the second one to start simply never polls, for what looks, from its
+own env, like a completely independent instance. A second instance for a second account **must**
+set its own `TEAMS_INBOX_PATH` (see `env.example` and the README's "Supervising the daemon"
+section).
+
+Same release also adds `poller-health.json` beside the inbox (rewritten after every poll, clean,
+failed, or yielded) so a watcher can tell "the pipeline is alive" from process existence alone —
+see the README section above for the full contract. Together the lock and the health file replace
+the pgrep-style liveness checks that matched the wrong process across two projects sharing one
+`dist/index.js` path.
 
 ## The throttle gates are per process (0.2.0; per resource family since 0.2.1)
 

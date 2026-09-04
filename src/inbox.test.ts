@@ -1,9 +1,9 @@
-import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ChatAllowlist } from './allowlist.js';
-import { InboxPoller, PARK_FORBIDDEN_CHAT_MS } from './inbox.js';
+import { DEFAULT_POLL_MS, InboxPoller, PARK_FORBIDDEN_CHAT_MS } from './inbox.js';
 import { type ChatMessage, applyWatermark } from './messages.js';
 
 const CHAT = '19:pilot@thread.v2';
@@ -381,6 +381,288 @@ describe('inbox poller — behaviour under throttle (2026-08-25)', () => {
     await p.pollOnce();
 
     expect(asked).toEqual(['19:forbidden@thread.v2', '19:ok@thread.v2', '19:ok@thread.v2']);
+  });
+});
+
+describe('inbox poller — the health file (carried over from PR #8 onto 0.5.2)', () => {
+  // The incident this exists for: after a host reboot one project's poller was dead while a
+  // second project's daemon (same dist/index.js, different env) survived, and a pgrep-based
+  // check matched the survivor — the dead pipeline read as "up" for 1.5 hours. The health file
+  // is the liveness contract that replaces process-pattern guessing: its age answers "is THIS
+  // inbox's pipeline alive", whoever else happens to be running.
+  let dir: string;
+  let inboxPath: string;
+  let statePath: string;
+  let clock: number;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'inbox-health-'));
+    inboxPath = join(dir, 'inbox.jsonl');
+    statePath = join(dir, 'inbox-state.json');
+    clock = 1_756_700_000_000; // 2026-09-01-ish, so the ISO timestamps read like the incident
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function pollerWith(
+    readMessages: (chatId: string, since?: string) => Promise<ReturnType<typeof applyWatermark>>,
+    overrides: { healthPath?: string; yieldPath?: string } = {},
+  ) {
+    return new InboxPoller({
+      chats: { readMessages },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+      pid: 4242,
+      nowFn: () => clock,
+      ...overrides,
+    });
+  }
+
+  async function health(): Promise<Record<string, unknown>> {
+    return JSON.parse(await readFile(join(dir, 'poller-health.json'), 'utf8')) as Record<
+      string,
+      unknown
+    >;
+  }
+
+  it('writes poller-health.json beside the inbox after a clean poll', async () => {
+    const p = pollerWith((chatId, since) => Promise.resolve(applyWatermark([], since)));
+
+    await p.pollOnce();
+
+    expect(await health()).toEqual({
+      pid: 4242,
+      inboxPath,
+      lastAttemptAt: new Date(clock).toISOString(),
+      lastSuccessAt: new Date(clock).toISOString(),
+      ok: true,
+      consecutiveFailures: 0,
+      backoffMs: DEFAULT_POLL_MS,
+    });
+  });
+
+  it('keeps writing after a FAILED poll — a dead pipeline must age visibly, not freeze the file', async () => {
+    let alive = true;
+    const p = pollerWith((chatId, since) =>
+      alive ? Promise.resolve(applyWatermark([], since)) : Promise.reject(new Error('token expired')),
+    );
+
+    await p.pollOnce();
+    const successAt = new Date(clock).toISOString();
+    alive = false;
+    clock += 30_000;
+    await p.pollOnce();
+    clock += 30_000;
+    await p.pollOnce();
+
+    const snapshot = await health();
+    expect(snapshot['ok']).toBe(false);
+    expect(snapshot['consecutiveFailures']).toBe(2);
+    expect(snapshot['lastAttemptAt']).toBe(new Date(clock).toISOString());
+    // The last GOOD poll's stamp survives failures, so a watcher can say how long the outage is.
+    expect(snapshot['lastSuccessAt']).toBe(successAt);
+    // First failure waited the base interval; the second doubled it. backoffMs is the delay
+    // until the next attempt, so a watcher knows how stale the file may legitimately get.
+    expect(snapshot['backoffMs']).toBe(DEFAULT_POLL_MS * 2);
+  });
+
+  it('leaves no .tmp file behind — the write is tmp + rename, never a partial health file', async () => {
+    const p = pollerWith((chatId, since) => Promise.resolve(applyWatermark([], since)));
+
+    await p.pollOnce();
+
+    const leftovers = (await readdir(dir)).filter((name) => name.includes('.tmp'));
+    expect(leftovers).toEqual([]);
+  });
+
+  it('a health write failure never throws past pollOnce, and the inbox still gets its lines', async () => {
+    const store = chatStore();
+    // A health path in a directory that does not exist: every write attempt fails.
+    const p = pollerWith((chatId, since) => store.readMessages(chatId, since), {
+      healthPath: join(dir, 'no-such-dir', 'poller-health.json'),
+    });
+    // 0.4.1: the first poll on an unknown chat only settles the watermark and delivers nothing —
+    // so the message this test cares about is added only AFTER that settling poll.
+    await p.pollOnce();
+    store.add(CHAT, message({ id: 'a' }));
+
+    await expect(p.pollOnce()).resolves.toBe(true);
+
+    const raw = await readFile(inboxPath, 'utf8');
+    expect(raw).toContain('"id":"a"');
+  });
+
+  it('a cycle skipped for the quota yield is marked distinctly — neither a fresh success nor a failure (0.5.4: PR #8 predates the yield)', async () => {
+    const yieldPath = join(dir, 'inbox-yield.json');
+    const p = pollerWith((chatId, since) => Promise.resolve(applyWatermark([], since)), { yieldPath });
+
+    await p.pollOnce(); // clean, no yield yet — establishes lastSuccessAt
+    const successAt = new Date(clock).toISOString();
+
+    clock += 30_000;
+    await writeFile(
+      yieldPath,
+      JSON.stringify({ pid: 999, reason: 'teams-attachments', until: clock + 60_000 }),
+    );
+    await p.pollOnce(); // yielded
+
+    const snapshot = await health();
+    expect(snapshot['ok']).toBe(true);
+    expect(snapshot['yielded']).toBe(true);
+    expect(snapshot['lastAttemptAt']).toBe(new Date(clock).toISOString());
+    // A fresh success would have bumped lastSuccessAt to NOW; a yielded cycle must not — it is
+    // politeness, not a poll that actually happened.
+    expect(snapshot['lastSuccessAt']).toBe(successAt);
+    // Nor may it look like a failure: no error line, no failure count.
+    expect(snapshot['consecutiveFailures']).toBe(0);
+  });
+});
+
+describe('inbox poller — escalating error lines and recovery (carried over from PR #8 onto 0.5.2)', () => {
+  // The forever-dedupe wrote ONE line for a five-hour outage. Correct against flooding, useless
+  // for a watcher asking "is this still going on?" — so the dedupe signature now carries an
+  // escalation bucket and the thresholds re-surface the failure with a running count.
+  let dir: string;
+  let inboxPath: string;
+  let statePath: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'inbox-escalate-'));
+    inboxPath = join(dir, 'inbox.jsonl');
+    statePath = join(dir, 'inbox-state.json');
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function pollerOver(readMessages: (chatId: string, since?: string) => Promise<ReturnType<typeof applyWatermark>>) {
+    return new InboxPoller({
+      chats: { readMessages },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+    });
+  }
+
+  async function lines(): Promise<Array<Record<string, unknown>>> {
+    const raw = await readFile(inboxPath, 'utf8').catch(() => '');
+    return raw
+      .split('\n')
+      .filter((line) => line.trim() !== '')
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+  }
+
+  it('an unchanged outage re-surfaces at the thresholds: first failure, then 10, then 50', async () => {
+    const p = pollerOver(() => Promise.reject(new Error('token expired')));
+
+    for (let i = 0; i < 60; i += 1) {
+      await p.pollOnce();
+    }
+
+    const errors = (await lines()).filter((line) => line['error'] !== undefined);
+    expect(errors).toHaveLength(3);
+    expect(errors.map((line) => line['consecutiveFailures'])).toEqual([1, 10, 50]);
+    expect(errors[1]?.['error']).toMatch(/still failing after 10 polls/);
+    expect(errors[2]?.['error']).toMatch(/still failing after 50 polls/);
+    expect(errors.every((line) => typeof line['at'] === 'string')).toBe(true);
+  });
+
+  it('recovery after a long outage is announced, so the watcher sees the pipeline come back', async () => {
+    let alive = false;
+    const p = pollerOver((chatId, since) =>
+      alive ? Promise.resolve(applyWatermark([], since)) : Promise.reject(new Error('token expired')),
+    );
+
+    for (let i = 0; i < 12; i += 1) {
+      await p.pollOnce();
+    }
+    alive = true;
+    await p.pollOnce();
+
+    const recovered = (await lines()).filter((line) => line['recovered'] !== undefined);
+    expect(recovered).toEqual([
+      { recovered: true, at: expect.stringMatching(/T/) as unknown, afterFailures: 12 },
+    ]);
+  });
+
+  it('a short blip stays quiet: recovery after fewer than 10 failures writes no recovered line', async () => {
+    let alive = false;
+    const p = pollerOver((chatId, since) =>
+      alive ? Promise.resolve(applyWatermark([], since)) : Promise.reject(new Error('token expired')),
+    );
+
+    await p.pollOnce();
+    await p.pollOnce();
+    alive = true;
+    await p.pollOnce();
+
+    expect((await lines()).filter((line) => line['recovered'] !== undefined)).toEqual([]);
+  });
+});
+
+describe('inbox poller — Retry-After as the backoff floor (carried over from PR #8 onto 0.5.2)', () => {
+  // When two daemons raced on one shared account, Graph named waits the blind doubling ignored:
+  // the poller came back sooner than asked and fed the penalty window. GraphError already
+  // carries retryAfterSeconds, so the next delay honours it as a floor over the doubled backoff.
+  let dir: string;
+  let inboxPath: string;
+  let statePath: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'inbox-retry-after-'));
+    inboxPath = join(dir, 'inbox.jsonl');
+    statePath = join(dir, 'inbox-state.json');
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  async function backoffMs(): Promise<number> {
+    const raw = JSON.parse(await readFile(join(dir, 'poller-health.json'), 'utf8')) as {
+      backoffMs: number;
+    };
+    return raw.backoffMs;
+  }
+
+  it('a 429 naming Retry-After lifts the next delay to at least that wait', async () => {
+    const p = new InboxPoller({
+      chats: {
+        readMessages: () =>
+          Promise.reject(
+            Object.assign(new Error('Too many requests'), { status: 429, retryAfterSeconds: 120 }),
+          ),
+      },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+    });
+
+    await p.pollOnce();
+
+    // Blind doubling alone would wait DEFAULT_POLL_MS (30s); Graph asked for 120s.
+    expect(await backoffMs()).toBe(120_000);
+  });
+
+  it('a 429 without Retry-After keeps the plain doubling', async () => {
+    const p = new InboxPoller({
+      chats: {
+        readMessages: () =>
+          Promise.reject(Object.assign(new Error('Too many requests'), { status: 429 })),
+      },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+    });
+
+    await p.pollOnce();
+
+    expect(await backoffMs()).toBe(DEFAULT_POLL_MS);
   });
 });
 
