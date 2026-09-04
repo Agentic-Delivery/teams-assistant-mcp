@@ -250,6 +250,12 @@ sanitized before writing (path components stripped, reserved and control charact
 prefixed with the message id), and an existing file is NEVER silently overwritten — a collision
 gets a `-1`/`-2`/… suffix (`src/downloads.ts`).
 
+Each downloaded entry's result carries `bytes` — the number of bytes actually downloaded and
+written, never null — so a caller can verify a download completed without re-stat-ing the file
+itself (`get_chat_attachment`, `download_chat_attachments`, and the `teams-attachments` CLI all
+report it the same way). `list_chat_attachments`/`--list` stay metadata-only, as before: nothing
+is downloaded, so there is no byte count to report.
+
 Permissions: with the shipped setup — a Microsoft first-party client id and the
 `https://graph.microsoft.com/.default` scope — SharePoint downloads work out of the box, no extra
 scope, no app registration, no admin consent (live-verified 2026-09-02 with this package's own

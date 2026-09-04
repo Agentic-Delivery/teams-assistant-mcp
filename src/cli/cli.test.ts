@@ -1,13 +1,14 @@
 import { execFile } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { buildChats } from '../build-chats.js';
 import { ChatAllowlist } from '../allowlist.js';
-import { GraphError } from '../graph/graph-client.js';
+import { GraphClient, GraphError } from '../graph/graph-client.js';
+import { MembersCache } from '../graph/members-cache.js';
 import { ReliableTeamsChats } from '../graph/reliable-sends.js';
-import type { TeamsChatsPort } from '../graph/teams-chats.js';
+import { GraphTeamsChats, type TeamsChatsPort } from '../graph/teams-chats.js';
 import type { ChatMessage, ReadResult } from '../messages.js';
 import { loadConfig } from '../config.js';
 import {
@@ -1052,6 +1053,32 @@ describe('teams-attachments — the do* routing (in-process, fake port, real tmp
     expect([...readFileSync(result.files[1]!.path)]).toEqual([2, 2]);
   });
 
+  // GH-13 (https://github.com/Agentic-Delivery/teams-assistant-mcp/issues/13): the teams-attachments
+  // CLI's result JSON reported `bytes: null` for completed downloads in the field an operator uses
+  // to verify a download actually completed. On HEAD the field is already populated from the bytes
+  // ACTUALLY WRITTEN (writeDownload receives this exact array), but nothing asserted the value —
+  // this is the permanent regression test closing that gap, per differently-sized payloads so a
+  // stub returning a fixed length could never pass it by accident.
+  it('GH-13: doDownloadAttachments reports each file\'s actual downloaded byte count, never null', async () => {
+    const getAttachments = vi.fn(async () => [
+      { bytes: new Uint8Array(5), contentType: 'application/pdf', name: 'five.pdf' },
+      { bytes: new Uint8Array(12), contentType: 'image/png', name: 'twelve.png' },
+    ]);
+    const out = mkdtempSync(join(tmpdir(), 'teams-attachments-test-'));
+
+    const result = await doDownloadAttachments(
+      { chats: reliable({ getAttachments }), allowlist },
+      '19:r@thread.v2',
+      'msg-9',
+      { out },
+    );
+
+    expect(result.files.map((file) => file.bytes)).toEqual([5, 12]);
+    // The reported count matches what actually landed on disk, not just the in-memory claim.
+    expect(statSync(result.files[0]!.path).size).toBe(5);
+    expect(statSync(result.files[1]!.path).size).toBe(12);
+  });
+
   it('doDownloadAttachments never overwrites: the same message downloaded twice suffixes the second copy', async () => {
     const getAttachments = vi.fn(async () => [
       { bytes: new Uint8Array([9]), contentType: 'application/pdf', name: 'plan.pdf' },
@@ -1250,5 +1277,86 @@ describe('teams-attachments — the quota yield (0.5.0: a running daemon starved
 
     expect(stoodDuringRead).toBe(true);
     expect(existsSync(yieldPath)).toBe(false);
+  });
+});
+
+// GH-14 (https://github.com/Agentic-Delivery/teams-assistant-mcp/issues/14): the reported
+// incident was against `teams-post`. These tests exercise doPost/doEdit through the REAL
+// production chain (ReliableTeamsChats wrapping GraphTeamsChats, same composition buildChats
+// wires for every CLI — build-chats.ts), mocking only the Graph HTTP transport, per the
+// pragmatic-tdd mock-discipline boundary — never the whole TeamsChatsPort, which is where the
+// existing doPost/doEdit routing tests above mock and so never actually exercise this guard.
+describe('teams-post / teams-edit --html --mention — the orphaned-mention refusal through the real send chain (GH-14)', () => {
+  const stubToken = { kind: 'stub' as const, getAccessToken: async () => 'tok' };
+  const allowlist = new ChatAllowlist([{ id: '19:a@thread.v2', label: 'chat A', canPost: true }]);
+
+  function realChats(fetchFn: typeof fetch) {
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn });
+    const dir = mkdtempSync(join(tmpdir(), 'teams-gh14-members-'));
+    const cache = new MembersCache({ path: join(dir, 'members.json') });
+    cache.set('19:a@thread.v2', [{ id: 'aad-celine', displayName: 'Kleivdal, Celine' }]);
+    return new ReliableTeamsChats(new GraphTeamsChats(graph, { membersCache: cache }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+  }
+
+  it('GH-14d: doPost --html --mention "Kleivdal, Celine" (name written plainly, no @{} token) refuses BEFORE any send', async () => {
+    const fetchFn = vi.fn(async () => {
+      throw new Error('must never be called — the refusal must happen before any Graph request');
+    });
+    const chats = realChats(fetchFn as unknown as typeof fetch);
+
+    await expect(
+      doPost(
+        { chats, allowlist },
+        '19:a@thread.v2',
+        '<p>Please review Kleivdal, Celine</p>',
+        true,
+        ['Kleivdal, Celine'],
+      ),
+    ).rejects.toThrow(/no @\{Name\}-style placeholder/);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('GH-14e: doEdit --html --mention "Kleivdal, Celine" (name written plainly, no @{} token) refuses BEFORE any send — same guard on the edit path', async () => {
+    const fetchFn = vi.fn(async () => {
+      throw new Error('must never be called — the refusal must happen before any Graph request');
+    });
+    const chats = realChats(fetchFn as unknown as typeof fetch);
+
+    await expect(
+      doEdit(
+        { chats, allowlist },
+        '19:a@thread.v2',
+        'msg-1',
+        '<p>Please review Kleivdal, Celine</p>',
+        true,
+        ['Kleivdal, Celine'],
+      ),
+    ).rejects.toThrow(/no @\{Name\}-style placeholder/);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('GH-14f: doPost --html --mention with the @{Name} token present sends normally (the other decision side)', async () => {
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      expect(init?.method).toBe('POST');
+      return new Response(
+        JSON.stringify({ id: 'sent-1', chatId: '19:a@thread.v2', createdDateTime: '2026-09-04T10:00:00Z', body: { contentType: 'html', content: '' } }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    });
+    const chats = realChats(fetchFn as unknown as typeof fetch);
+
+    const result = await doPost(
+      { chats, allowlist },
+      '19:a@thread.v2',
+      '<p>Please review @{Kleivdal, Celine}</p>',
+      true,
+      ['Kleivdal, Celine'],
+    );
+
+    expect(result).toEqual({ action: 'post', id: 'sent-1', chat: 'chat A' });
+    expect(fetchFn).toHaveBeenCalledTimes(1);
   });
 });

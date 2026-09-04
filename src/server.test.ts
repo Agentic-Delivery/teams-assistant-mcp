@@ -18,7 +18,7 @@ import type {
   PinnedMessage,
   TeamsChatsPort,
 } from './graph/teams-chats.js';
-import { resolveMentionTargets } from './graph/mentions.js';
+import { renderHtmlWithMentions, resolveMentionTargets } from './graph/mentions.js';
 
 const PILOT = '19:pilot@thread.v2';
 const WATCHED = '19:watched@thread.v2';
@@ -95,7 +95,14 @@ class FakeTeamsChats implements TeamsChatsPort {
   readonly sentHtml: Array<{ chatId: string; html: string }> = [];
 
   async sendHtmlMessage(chatId: string, html: string, mentions: readonly MentionTarget[] = []) {
-    this.sentHtml.push({ chatId, html });
+    // GH-14 (issues/14, verified-fakes fix): rendered through the SAME renderHtmlWithMentions
+    // GraphTeamsChats.sendHtmlMessage actually calls before its POST — a fake that skipped this
+    // (as this one used to) always "succeeds" regardless of an orphaned @{Name} placeholder,
+    // which is exactly the doctrine's "unverified fake makes behaviour-test greenness
+    // self-referential" hazard: every send_chat_message html+mention test in this file would
+    // stay green even if the real adapter's guard were deleted.
+    const rendered = renderHtmlWithMentions(html, mentions);
+    this.sentHtml.push({ chatId, html: rendered });
     this.sentMentions.push(mentions);
     // contentType 'html' here so toChatMessage's htmlToText round-trip mirrors the real Graph
     // readback — the same shape a genuine sendHtmlMessage readback would return.
@@ -104,7 +111,7 @@ class FakeTeamsChats implements TeamsChatsPort {
         id: 'sent-html-1',
         chatId,
         createdDateTime: '2026-08-19T10:00:00Z',
-        body: { contentType: 'html', content: html },
+        body: { contentType: 'html', content: rendered },
       },
       chatId,
     );
@@ -135,7 +142,10 @@ class FakeTeamsChats implements TeamsChatsPort {
   }
 
   async editHtmlMessage(chatId: string, messageId: string, html: string, mentions: readonly MentionTarget[] = []) {
-    this.htmlEdits.push({ chatId, messageId, html });
+    // Same verified-fakes fix as sendHtmlMessage above — GraphTeamsChats.editHtmlMessage renders
+    // through renderHtmlWithMentions before its PATCH too.
+    const rendered = renderHtmlWithMentions(html, mentions);
+    this.htmlEdits.push({ chatId, messageId, html: rendered });
     this.sentMentions.push(mentions);
   }
 
@@ -440,6 +450,22 @@ describe('edit_chat_message', () => {
       [{ name: 'Alice', id: 'aad-alice', displayName: 'Alice Anderson' }],
     ]);
   });
+
+  // GH-14 (issues/14): same guard on the edit path, which the dispatch explicitly named
+  // (dispatch: "same guard on teams-edit --html --mention and on the MCP ... edit_chat_message").
+  it('GH-14: format "html" with a resolved mention but no @{Name} token refuses BEFORE any edit', async () => {
+    const result = await call(client, 'edit_chat_message', {
+      chatId: PILOT,
+      messageId: 'm1',
+      newText: '<p>Please review Alice Anderson</p>',
+      format: 'html',
+      mentions: ['Alice'],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.text).toMatch(/no @\{Name\}-style placeholder/);
+    expect(chats.htmlEdits).toEqual([]); // nothing recorded as sent — refused before the call
+  });
 });
 
 describe('delete_chat_message', () => {
@@ -702,6 +728,35 @@ describe('send_chat_message', () => {
     expect(result.text).toMatch(/No chat member matches/);
     expect(chats.sent).toEqual([]); // refused before ever reaching the send
   });
+
+  // GH-14 (https://github.com/Agentic-Delivery/teams-assistant-mcp/issues/14): observed
+  // 2026-09-02 on teams-post; this is the same guard exercised through the MCP tool boundary.
+  it('GH-14: format "html" with a resolved mention but no @{Name} token refuses BEFORE any send — never posts raw markup', async () => {
+    const result = await call(client, 'send_chat_message', {
+      chatId: PILOT,
+      text: '<p>Please review Alice Anderson</p>',
+      format: 'html',
+      mentions: ['Alice'],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.text).toMatch(/no @\{Name\}-style placeholder/);
+    expect(chats.sentHtml).toEqual([]); // nothing recorded as sent — refused before the call
+  });
+
+  it('GH-14: format "html" with the @{Name} token present sends normally (the other decision side)', async () => {
+    const result = await call(client, 'send_chat_message', {
+      chatId: PILOT,
+      text: '<p>Please review @{Alice}</p>',
+      format: 'html',
+      mentions: ['Alice'],
+    });
+
+    expect(result.isError).toBe(false);
+    expect(chats.sentHtml).toEqual([
+      { chatId: PILOT, html: '<p>Please review <at id="0">Alice Anderson</at></p>' },
+    ]);
+  });
 });
 
 describe('send_chat_image', () => {
@@ -890,6 +945,10 @@ describe('download_chat_attachments', () => {
     ]);
     for (const file of payload.files) {
       expect([...readFileSync(file.path)]).toEqual([1, 2, 3]);
+      // GH-13 (issues/13): the reported `bytes` must never be null and must match what actually
+      // landed on disk — get_chat_attachment already asserted this; download_chat_attachments
+      // (the batch tool, the one the reported incident actually used) never did.
+      expect(file.bytes).toBe(3);
     }
   });
 
