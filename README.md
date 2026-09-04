@@ -103,9 +103,27 @@ every send — that endpoint shares a throttle budget across every process signe
 client id (see "Throttle budgets are per client id" below), and a chat's membership in this fixed
 pilot allowlist effectively never changes. A cache hit resolves with zero Graph calls; a miss (no
 entry, an expired one, or a name the cached roster does not have) refreshes once and re-checks — a
-name still unresolved after that gets the usual clear error. A 429 on that one refresh call is
-never swallowed into a false "no such member": it surfaces as its own throttled error naming
-Graph's Retry-After.
+name still unresolved after that gets the usual clear error.
+
+**A cache hit never becomes a hard dependency on the throttled endpoint (0.5.2).** Live-diagnosed
+2026-09-04 (KNOWN-ISSUES.md): a `/members` refresh 429ing on an expired cache used to mean the
+cache could never be rewritten, since rewriting it needed the very call being refused — the roster
+was hostage to the throttle forever, not just for one bad attempt. So when a refresh answers 429
+(or any transient 503/504), resolution falls back to whatever this chat's stale (past-TTL) roster
+still holds on disk, logging one line naming the fallback, and only fails the post when the
+requested name is absent from that stale roster too — in which case the original throttled error
+still surfaces, naming Graph's Retry-After. A 429 is never swallowed into a false "no such member".
+
+**The roster also fills and refreshes itself from ordinary chat traffic, at zero Graph cost
+(0.5.2).** Every message the background inbox poller reads already carries its sender's AAD id and
+display name (`from.user.id`/`from.user.displayName` on the Graph chat message); the poller merges
+those straight into the same on-disk roster the cache above serves mentions from
+(`MembersCache.merge`, `src/graph/members-cache.ts`), refreshing that chat's `fetchedAt` on every
+merge that lands something. A chat that stays busy therefore never needs a live `/members` call at
+all — the explicit refresh above is the fallback for a name never seen in traffic, not the primary
+path. A message whose sender Graph could not fully identify (an id with no display name — the
+`from: 'unknown'` fallback below) is never merged, so a gap in Graph's own response can't poison
+the roster with a junk entry.
 
 ## Retry-After
 
@@ -116,6 +134,19 @@ output, and the MCP tools' error result text for whichever agent is driving the 
 `Too many requests (throttled, retry after 62s)`. One shared renderer (`retryAfterSuffix` in
 `src/graph/graph-client.ts`) backs both, so neither surface can drift out of sync or silently lose
 the wait time (0.4.1 review round 2: the MCP tool path originally missed it entirely).
+
+### Throttle-scope diagnostics (0.5.2)
+
+Graph's throttling is keyed by four independent, differently-scoped buckets (per app, per
+app-per-tenant, per resource, per user — `docs/throttling-mitigation.md` §2.1), and a 429 alone
+does not say which one closed. Every 429 `GraphClient` sees is now logged on one line naming
+`x-ms-throttle-scope`, `x-ms-throttle-information` (when Graph sent one) and `retry-after` —
+whether or not the read loop goes on to retry successfully, so a throttle that clears on its own
+retry is still measured, not just the ones that end in a thrown error. The scope also travels
+structurally on `GraphError.throttleScope` and is folded into the `THROTTLED: ...` text the
+mention-resolution error surfaces (the exact error both CLIs and the MCP tool path print
+verbatim), e.g. `THROTTLED: the member list refresh for mention resolution was throttled; ...
+[throttle scope: Tenant_Application]`. The next incident is measured, not inferred.
 
 ## Pinning
 

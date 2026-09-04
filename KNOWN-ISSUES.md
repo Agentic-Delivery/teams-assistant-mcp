@@ -1,3 +1,46 @@
+## A TTL-expired members cache under a throttled /members refresh converted a working cache into a permanent hard dependency on the throttled endpoint (live 2026-09-04, closed 0.5.2)
+
+The 24h members-cache TTL (`DEFAULT_MEMBERS_TTL_MS`, `src/graph/members-cache.ts`) does not bound
+staleness risk at the cost of one refresh under contention — it converts a working cached mention
+path into a PERMANENT hard dependency on the very endpoint it exists to avoid. Root-caused live
+(CTP daemon, `docs/throttling-mitigation.md` §1.2): the CTP agent-team chat's roster
+(`fetchedAt` 2026-09-03T07:34:05Z) expired at 07:34:05Z the next day; the first throttled mention
+came ~07:45Z, eleven minutes later. The mechanism: TTL expiry turns `MembersCache.get()` into a
+miss → the miss triggers a `/members` refresh, the one endpoint sharing the crowded per-tenant
+default-GET throttle bucket (§2 of that document) → the refresh 429s, so the fresh roster that
+would have rewritten the cache is never obtained → every subsequent `--mention` post repeats the
+same three steps forever, because healing the cache requires the very call being refused. Every
+`--mention` post into that chat between ~07:45Z and ~08:05Z failed with `THROTTLED: the member
+list refresh for mention resolution was throttled; nothing was done ... retry after 62s` while
+UNTAGGED posts into the same chat succeeded throughout — proof this was never an account- or
+tenant-wide block, only `/members` sharing a bucket `/chats/{id}/messages` does not.
+
+**Closed 0.5.2**, two changes (`docs/throttling-mitigation.md` §4, stage 1 item 2):
+
+1. **Stale-serve on a throttled/transiently-failing refresh.** `MembersCache.getStale()` is a new
+   TTL-ignoring read `GraphTeamsChats.resolveMentions` (`teams-chats.ts`) falls back to ONLY after
+   a live refresh itself fails with a 429/503/504 — never on an ordinary miss, which still refreshes
+   as before. A cache hit resolves from the stale roster (logged once, naming the fallback and the
+   roster's age) and only fails the post when the requested name is absent from the stale roster
+   too, in which case the original THROTTLED error (naming Retry-After and, since 0.5.2, the
+   throttle scope — see the entry below) still surfaces, never swallowed into a false "no such
+   member".
+2. **The roster now fills and refreshes itself from ordinary chat traffic, at zero Graph cost.**
+   Every message the poller already reads carries its sender's AAD id and display name
+   (`ChatMessage.fromId`/`from`, sourced from Graph's `from.user.id`/`from.user.displayName` —
+   `messages.ts`'s `toChatMessage`); the poller merges those into the same on-disk roster
+   (`MembersCache.merge`), refreshing `fetchedAt` on every merge that lands something. A chat that
+   stays busy therefore never needs a live `/members` call again — the explicit refresh is the
+   fallback for a name never seen in traffic, not the primary path. A message whose sender Graph
+   could not fully identify (`from: 'unknown'`, no real displayName) is never merged, so a gap in
+   Graph's own response cannot poison the roster with a junk entry.
+
+Together these mean the 2026-09-04 incident's own mechanism cannot recur: TTL expiry no longer
+forces a throttled call onto the hot path at all in a chat with any recent traffic, and even a
+cold/silent chat degrades to "served from stale data, logged" rather than "hard failure until the
+throttle happens to clear on its own." See the README's "@mentions" section for the consumer-
+facing description.
+
 ## send_chat_file: a throttled /me refused every CLI attempt, one process at a time (live 2026-09-03, mitigated 0.5.1)
 
 `resolveSelfId`'s in-memory memo (`teams-chats.ts`) protects nothing across process boundaries,
@@ -195,6 +238,9 @@ resolution. 0.4.1 adds a disk-persisted per-chat member cache (default TTL 24h,
 common path; see the README's "@mentions" and "Throttle budgets are per client id" sections. The
 underlying per-process gate limitation above is unchanged and still applies to every other
 endpoint and to a `/members` cache miss itself.
+
+(Cross-reference, added 2026-09-04: the "cache miss itself" residual risk this paragraph names is
+what the 2026-09-04 incident actually hit — see the top entry of this file for the 0.5.2 close.)
 
 ## Retry-After was silent on the CLI send path (fixed 0.4.1)
 
