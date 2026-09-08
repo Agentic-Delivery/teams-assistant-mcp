@@ -1899,14 +1899,26 @@ describe('GraphTeamsChats.sendFile — membersForInvite retries a throttled /mem
     });
     const chats = subjectWithSleep(fetchFn as unknown as typeof fetch, cache, waits);
 
+    // Review round 1 MAJOR 5/MINOR b (fresh-context re-review of PR #24): a SECOND sendFile call
+    // used to be made here purely to re-check the "Retry with --grant-to" suffix — but by then the
+    // GraphClient gate for this resource family is already closed from the FIRST call's last 429,
+    // so that second call's own /members attempt is refused LOCALLY (LocallyThrottled, zero
+    // network calls) and trivially reproduces the same message text; it proved nothing about the
+    // real retry-exhaustion path. Both assertions now run against the ONE call that actually
+    // exhausts the budget over the network, and the attempt count is pinned exactly (was
+    // `toBeLessThanOrEqual(6)` across two calls — raising LIVE_MEMBERS_REFRESH_RETRIES 2->5 left
+    // that bound green; `toBe(3)` on one call does not).
     await expect(chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' })).rejects.toMatchObject({
       message: expect.stringMatching(/^THROTTLED: the member list refresh needed to grant file access/),
     });
-    await expect(chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' })).rejects.toMatchObject({
-      message: expect.stringContaining('Retry with --grant-to <ids> or --no-grant'),
-    });
-    // Bounded, not infinite: the same budget as the successful-retry test above (1 + 2 retries).
-    expect(membersAttempts).toBeLessThanOrEqual(6); // two sendFile calls above, 3 attempts each
+    const error = await chats
+      .sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' })
+      .catch((caught: unknown) => caught);
+    expect((error as Error).message).toContain('Retry with --grant-to <ids> or --no-grant');
+    // The SECOND call's own /members attempt was refused locally (the gate the first call's last
+    // 429 closed is still closed) — proving the local-gate short-circuit does NOT itself carry
+    // the network-attempt count past the budget the first call already exhausted.
+    expect(membersAttempts).toBe(3); // exactly 1 + LIVE_MEMBERS_REFRESH_RETRIES(2), the first call only
   });
 });
 
