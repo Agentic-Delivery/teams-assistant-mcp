@@ -1135,3 +1135,81 @@ describe('inbox poller — roster harvest from poll results (mitigation 2)', () 
     expect(harvestedIds).toContain(me.id);
   });
 });
+
+// Behaviour 4, live 2026-09-08: when an allowlisted chat appears and its roster cache is cold,
+// warm it once (GraphTeamsChats.warmMembers, teams-chats.ts) so a later sendFile/mention
+// resolution does not pay the live call. `chats.warmMembers` is optional on the poller's own dep
+// type (TeamsChatsPort) — a double without it must not make the poller misbehave either.
+describe('inbox poller — daemon-side roster warm-up (0.6.0)', () => {
+  let dir: string;
+  let inboxPath: string;
+  let statePath: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'inbox-warmup-test-'));
+    inboxPath = join(dir, 'inbox.jsonl');
+    statePath = join(dir, 'inbox-state.json');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function pollerWithWarm(
+    chats: Pick<ReturnType<typeof chatStore>, 'readMessages'> & {
+      warmMembers: (chatId: string) => Promise<void>;
+    },
+    chatIds = [CHAT],
+  ) {
+    return new InboxPoller({
+      chats,
+      allowlist: new ChatAllowlist(chatIds.map((id) => ({ id, label: id, canPost: true }))),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+    });
+  }
+
+  it('TRIGGERING: warms each allowlisted chat exactly once, even across several poll cycles', async () => {
+    const store = chatStore({});
+    const warmed: string[] = [];
+    const chats = { ...store, warmMembers: async (chatId: string) => void warmed.push(chatId) };
+    const p = pollerWithWarm(chats);
+
+    await p.pollOnce();
+    await p.pollOnce();
+    await p.pollOnce();
+
+    expect(warmed).toEqual([CHAT]); // once, not once per cycle
+  });
+
+  it('NON-TRIGGERING: a chats double with no warmMembers at all does not throw and polls normally', async () => {
+    const store = chatStore({});
+    store.add(CHAT, message({ id: 'a', from: 'Alice', fromId: 'alice-id' }));
+    const poller = new InboxPoller({
+      chats: store, // deliberately no warmMembers property at all
+      allowlist: new ChatAllowlist([{ id: CHAT, label: CHAT, canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+    });
+
+    const clean = await poller.pollOnce();
+
+    expect(clean).toBe(true);
+  });
+
+  it("a throttled warmMembers never fails the poll cycle — it's exactly as best-effort here as inside GraphTeamsChats itself", async () => {
+    const store = chatStore({});
+    const chats = {
+      ...store,
+      warmMembers: async () => {
+        throw new Error('THROTTLED: the member list refresh for daemon warm-up was throttled');
+      },
+    };
+
+    const clean = await pollerWithWarm(chats).pollOnce();
+
+    expect(clean).toBe(true);
+  });
+});

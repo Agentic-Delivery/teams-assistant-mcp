@@ -49,7 +49,7 @@ export interface RosterHarvestPort {
 }
 
 export interface InboxPollerDeps {
-  chats: Pick<TeamsChatsPort, 'readMessages'>;
+  chats: Pick<TeamsChatsPort, 'readMessages' | 'warmMembers'>;
   allowlist: ChatAllowlist;
   /**
    * Resolves who the server is signed in as. The assistant's own posts must not come back as
@@ -219,6 +219,11 @@ export class InboxPoller {
   private authRemedyFired = false;
   /** The `until` of the yield last logged, so one yield episode logs once, not once per cycle. */
   private yieldLoggedUntil: number | undefined;
+  /** Chat ids already offered to `chats.warmMembers` THIS process lifetime — behaviour 4 (0.6.0,
+   *  live 2026-09-08): warm each allowlisted chat's roster cache ONCE, not once per poll cycle.
+   *  GraphTeamsChats.warmMembers is itself a no-op once the cache has any entry, so this Set is
+   *  only what keeps a PERSISTENTLY failing warm-up from retrying the live call every cycle. */
+  private readonly warmedChats = new Set<string>();
   private readonly writeFileFn: typeof writeFile;
   private readonly renameFn: typeof rename;
 
@@ -370,6 +375,15 @@ export class InboxPoller {
         continue; // a chat this account can't read (403) is re-tried on a slow cadence, not every cycle
       }
       attempted += 1;
+      // Behaviour 4 (0.6.0, live 2026-09-08): warm this chat's roster cache once — best-effort,
+      // GraphTeamsChats.warmMembers itself never throws, but a `.catch` here is cheap insurance
+      // against a differently-behaved TeamsChatsPort implementation (a test double, a future
+      // decorator) doing so instead, matching this poller's own "never take the server down"
+      // contract (class doc comment above).
+      if (this.deps.chats.warmMembers && !this.warmedChats.has(entry.id)) {
+        this.warmedChats.add(entry.id);
+        await this.deps.chats.warmMembers(entry.id).catch(() => {});
+      }
       const known = this.state[entry.id];
       // 0.4.1 (live-diagnosed: a restart was observed replaying ~40 old messages): no entry on
       // record for this chat means "history unknown to THIS process" — not "chat is empty" —
