@@ -487,12 +487,15 @@ export function buildServer(deps: ServerDeps): McpServer {
         'member read access on it, then shares it into an allowlisted chat with canPost ' +
         'enabled, as a normal Teams file attachment. Real people see this immediately and it ' +
         'cannot be unsent through this server. Can fail BEFORE any upload if the chat\'s member ' +
-        'list cannot be resolved, if any other member has no Microsoft account id on record ' +
-        '(nobody would be able to open the file for them), or if the assistant\'s own account ' +
-        'id cannot be looked up — and can fail AFTER a successful ' +
-        'upload if the permission grant itself does not go through, in which case the file is ' +
-        'left orphaned in the assistant\'s OneDrive rather than posted where recipients could ' +
-        'not open it.',
+        'list cannot be resolved after a bounded retry (if that happens, retry with grantTo or ' +
+        'noGrant instead of retrying blind), if any other member has no Microsoft account id on ' +
+        'record (nobody would be able to open the file for them), or if the assistant\'s own ' +
+        'account id cannot be looked up — and can fail AFTER a successful upload if the ' +
+        'permission grant itself does not go through, in which case the file is left orphaned in ' +
+        'the assistant\'s OneDrive rather than posted where recipients could not open it. Pass ' +
+        'grantTo to skip roster resolution and grant exactly those ids, or noGrant to post with ' +
+        'no permission grant at all (only the sender can open it) — both useful when the roster ' +
+        'is known to be unavailable.',
       inputSchema: {
         chatId: z.string().describe('Graph chat id, must be allowlisted with canPost: true'),
         path: z.string().describe('Local path of the file to share'),
@@ -500,15 +503,38 @@ export function buildServer(deps: ServerDeps): McpServer {
           .string()
           .optional()
           .describe('Caption shown above the file card; rendered like send_chat_message text'),
+        grantTo: z
+          .array(z.string())
+          .min(1)
+          .optional()
+          .describe(
+            'Explicit recipient AAD ids. Skips roster/self-id resolution entirely and grants ' +
+              'exactly these ids, trusted verbatim. Mutually exclusive with noGrant.',
+          ),
+        noGrant: z
+          .boolean()
+          .optional()
+          .describe(
+            'Upload and post with NO permission grant at all — only the sender can open the ' +
+              'file. Skips roster/self-id resolution entirely. Mutually exclusive with grantTo.',
+          ),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
-    ({ chatId, path, text }) =>
+    ({ chatId, path, text, grantTo, noGrant }) =>
       guard(async () => {
         allowlist.assertPostable(chatId);
+        if (grantTo !== undefined && noGrant) {
+          // Review round 1 MAJOR 3: this used to be resolved by silently preferring noGrant —
+          // sendFile's own mutually-exclusive guard was structurally unreachable from here, since
+          // the options object built below could never carry both keys. Refused here, before any
+          // upload, same as the CLI's own --grant-to/--no-grant exit-2 refusal (cli/common.ts).
+          throw new Error('grantTo and noGrant are mutually exclusive.');
+        }
         const bytes = new Uint8Array(await readFile(path));
         const name = basename(path);
-        const sent = await chats.sendFile(chatId, { bytes, name }, text);
+        const sendOptions = noGrant ? { noGrant: true as const } : grantTo ? { grantTo } : undefined;
+        const sent = await chats.sendFile(chatId, { bytes, name }, text, sendOptions);
         return ok({
           posted: true,
           chatId,
@@ -516,6 +542,10 @@ export function buildServer(deps: ServerDeps): McpServer {
           createdDateTime: sent.createdDateTime,
           name,
           bytes: bytes.byteLength,
+          granted: !noGrant,
+          ...(noGrant
+            ? { note: 'uploaded without a permission grant (noGrant) — only the sender can open this file' }
+            : {}),
         });
       }),
   );

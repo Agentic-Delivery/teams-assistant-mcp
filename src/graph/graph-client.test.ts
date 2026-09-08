@@ -1002,6 +1002,35 @@ describe('graph client — the throttle gate (2026-08-25: retries under 429 ampl
     expect(waits).toEqual([5000]);
   });
 
+  // getAll's own readRetries option (0.6.0, live 2026-09-08 — see teams-chats.ts's
+  // LIVE_MEMBERS_REFRESH_RETRIES): a caller with a higher tolerance for waiting out a 429 than
+  // the client default passes it through per-page, rather than getAll inventing its own retry
+  // loop on top of getResponse's existing one.
+  it('getAll(path, max, { readRetries }) overrides the client default for every page it fetches', async () => {
+    let now = 0;
+    const waits: number[] = [];
+    let attempts = 0;
+    const fetchFn = vi.fn(async () => {
+      attempts += 1;
+      if (attempts <= 3) {
+        return throttled('5');
+      }
+      return json({ value: [{ id: 'a' }] });
+    });
+    const client = new GraphClient({
+      tokenProvider: stubToken,
+      fetchFn: fetchFn as never,
+      sleepFn: async (ms) => { waits.push(ms); now += ms; },
+      nowFn: () => now,
+      readRetries: 1, // client default: only 1 retry (2 attempts) would exhaust before success
+    });
+
+    const result = await client.getAll<{ id: string }>('/me/chats', 200, { readRetries: 3 });
+
+    expect(result).toEqual([{ id: 'a' }]);
+    expect(attempts).toBe(4); // 1 original + 3 retries — beyond what the client default allows
+  });
+
   it('a 429 without Retry-After closes the gate for a default window, not zero', async () => {
     let now = 0;
     const fetchFn = vi.fn().mockResolvedValueOnce(

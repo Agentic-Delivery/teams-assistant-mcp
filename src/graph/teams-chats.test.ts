@@ -266,6 +266,101 @@ describe('GraphTeamsChats.resolveMentions — stale-serve on a throttled/unavail
   });
 });
 
+// Behaviour 4, live 2026-09-08: the daemon-side warm-up — when an allowlisted chat's roster cache
+// is cold, fetch it ONCE (subject to the same throttle/gate discipline as every other refresh) so
+// a later sendFile/mention resolution does not pay the live call. Best-effort: a throttled/failed
+// warm-up leaves the roster cold, exactly as if this method did not exist, never throws.
+describe('GraphTeamsChats.warmMembers — daemon-side cache warm-up on an empty roster (0.6.0, live 2026-09-08)', () => {
+  let dir: string;
+  let path: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'teams-chats-warm-'));
+    path = join(dir, 'members-cache.json');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function subject(fetchFn: typeof fetch, cache: MembersCache, log: (line: string) => void = () => {}) {
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn });
+    return new GraphTeamsChats(graph, { membersCache: cache, log });
+  }
+
+  it('a cold cache (no entry at all) fetches once, caches the result, and reports NOT throttled', async () => {
+    const cache = new MembersCache({ path });
+    const { fetchFn, calls } = countingMembersFetch(membersPage);
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    await expect(chats.warmMembers(CHAT)).resolves.toBe(false);
+
+    expect(calls).toHaveLength(1);
+    expect(cache.get(CHAT)).toEqual([
+      { id: 'aad-mika', displayName: 'Berggren, Mikael' },
+      { id: 'aad-johan', displayName: 'Spännare, Johan' },
+    ]);
+  });
+
+  it('a warm cache (already has an entry, complete OR partial) makes NO /members call, reports NOT throttled', async () => {
+    const cache = new MembersCache({ path });
+    cache.merge(CHAT, [{ id: 'aad-mika', displayName: 'Berggren, Mikael' }]); // partial is enough to skip
+    const { fetchFn, calls } = countingMembersFetch(membersPage);
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    await expect(chats.warmMembers(CHAT)).resolves.toBe(false);
+
+    expect(calls).toHaveLength(0);
+  });
+
+  it('a throttled warm-up never throws, leaves the roster cold, logs one line, and reports throttled: true', async () => {
+    const cache = new MembersCache({ path });
+    const { fetchFn } = countingMembersFetch(() =>
+      json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
+        'retry-after': '100', // past the sleep cap, fails fast — no real wait in this test
+      }),
+    );
+    const lines: string[] = [];
+    const chats = subject(fetchFn as unknown as typeof fetch, cache, (line) => lines.push(line));
+
+    await expect(chats.warmMembers(CHAT)).resolves.toBe(true);
+
+    expect(cache.get(CHAT)).toBeUndefined();
+    expect(lines.some((line) => line.includes('warm-up'))).toBe(true);
+  });
+
+  // Review round 1 MAJOR 4 (fresh-context re-review of PR #24): warmMembers used to call
+  // refreshMembers with the SAME bounded retry budget (LIVE_MEMBERS_REFRESH_RETRIES, up to 2
+  // real Retry-After sleeps) as membersForInvite/resolveMentions — but unlike those two, this is
+  // called from INSIDE the poller's per-chat loop and AWAITED there, so a real (honourable, under
+  // the 90s cap) Retry-After genuinely slept the whole poll cycle. One attempt, no retry, is the
+  // fix: this proves it with a retry-after (30s) that WOULD have triggered a real sleep under the
+  // old readRetries default — the injected sleepFn must never be called at all.
+  it('a single (honourable, under-cap) Retry-After never triggers a sleep — one attempt, no retry, ever', async () => {
+    const cache = new MembersCache({ path });
+    let attempts = 0;
+    const fetchFn = vi.fn(async (url: string) => {
+      if (String(url).includes('/members')) {
+        attempts += 1;
+        return json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
+          'retry-after': '30', // well under MAX_RETRY_SLEEP_MS (90s) — a retry loop WOULD sleep this
+        });
+      }
+      throw new Error(`unexpected call: ${String(url)}`);
+    });
+    const sleepFn = vi.fn(async () => {
+      throw new Error('warmMembers must never sleep — it runs inside the poller\'s awaited cycle');
+    });
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch, sleepFn });
+    const chats = new GraphTeamsChats(graph, { membersCache: cache });
+
+    await expect(chats.warmMembers(CHAT)).resolves.toBe(true);
+
+    expect(attempts).toBe(1); // exactly one live attempt — readRetries: 0, not the shared budget
+    expect(sleepFn).not.toHaveBeenCalled();
+  });
+});
+
 describe('buildChats — the composition actually wires the members cache (0.4.1 review round 1)', () => {
   // MAJOR 1: an optional membersCache let the wiring in build-chats.ts be silently dropped with
   // no test noticing (mutation-verified: deleting the wiring left the full suite green). This
@@ -328,6 +423,66 @@ describe('buildChats — the composition actually wires the members cache (0.4.1
 
       expect(resolved).toEqual([{ name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' }]);
       expect(calls).toHaveLength(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  // Live 2026-09-08 ~13:58Z: teams-post --mention failed on a chat that had traffic all day,
+  // which raised the question of whether a CLI invocation actually sees what the DAEMON'S poller
+  // harvested from that traffic into the members cache, or only ever sees its own process's
+  // writes. It does: both are `buildChats(config)` against the SAME env, which resolves to the
+  // SAME `config.membersCachePath` (config.ts) — this proves the daemon side (`MembersCache.merge`,
+  // the exact call inbox.ts's roster harvest makes) and a LATER, independently-constructed
+  // `buildChats(config)` (standing in for a fresh CLI process) read the identical on-disk file,
+  // with no other wiring needed.
+  it('a roster the DAEMON harvested via MembersCache.merge is visible to a LATER, independent buildChats() call — the CLI reads what the daemon wrote', async () => {
+    const { loadConfig } = await import('../config.js');
+    const { buildChats } = await import('../build-chats.js');
+    const configPath = join(dir, 'teams-mcp.config.json');
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(
+      configPath,
+      JSON.stringify({ allowedChats: [{ id: CHAT, label: 'pilot', canPost: true }] }),
+    );
+    const config = loadConfig({
+      TEAMS_MCP_CONFIG: configPath,
+      TEAMS_MCP_TENANT_ID: 'tenant',
+      TEAMS_MCP_USERNAME: 'assistant@example.com',
+      TEAMS_MCP_PASSWORD: 'secret',
+      TEAMS_MCP_TOKEN_CACHE: join(dir, '.token-cache.json'),
+    });
+
+    // The DAEMON side: buildChats() exposes the same MembersCache instance inbox.ts's poller
+    // merges harvested (senderId, displayName) pairs into on every poll cycle — simulated here
+    // directly rather than through the poller, since the poller's OWN wiring of this exact call
+    // is already covered elsewhere (build-inbox-poller.test.ts).
+    const daemonSide = buildChats(config);
+    daemonSide.membersCache.merge(CHAT, [{ id: 'aad-mika', displayName: 'Berggren, Mikael' }]);
+
+    // A LATER, INDEPENDENT construction — standing in for a fresh `teams-post` CLI process
+    // against the same .env, which is exactly what buildContext() in cli/common.ts does per
+    // invocation (loadConfig() then buildChats(config), no daemon reference passed between them).
+    const { calls } = countingMembersFetch(membersPage);
+    const failEverythingElse = vi.fn(async () => {
+      throw new Error('this test only exercises resolveMentions — nothing else should be called');
+    });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      if (String(url).includes('/members')) {
+        calls.push(String(url));
+        return membersPage();
+      }
+      return failEverythingElse(url, init);
+    }) as typeof fetch;
+    try {
+      const cliSide = buildChats(config);
+      vi.spyOn(cliSide.tokenProvider, 'getAccessToken').mockResolvedValue('fake-token');
+
+      const resolved = await cliSide.chats.resolveMentions(CHAT, ['Mika']);
+
+      expect(resolved).toEqual([{ name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' }]);
+      expect(calls).toHaveLength(0); // the CLI process never had to call /members itself
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -1660,6 +1815,266 @@ describe('GraphTeamsChats.sendFile — a PARTIAL (traffic-harvested) roster is n
 
     expect(sent.id).toBe('msg-stale-complete');
     expect(lines.some((line) => line.includes('STALE cached COMPLETE roster'))).toBe(true);
+  });
+});
+
+// Live 2026-09-08: teams-send-file failed 7/7 times over ~2 hours on a NEWLY CREATED chat with
+// "THROTTLED: the member list refresh needed to grant file access was throttled; nothing was
+// done" — a single 429 on /members, no prior COMPLETE or stale roster to fall back to (a brand
+// new chat has neither), and no retry within the attempt. Posts/replies/reactions in the same
+// window succeeded, confirming this was the members endpoint specifically, not an account-wide
+// block. See KNOWN-ISSUES.md's entry for this incident.
+describe('GraphTeamsChats.sendFile — membersForInvite retries a throttled /members refresh within a bounded budget instead of failing on the first 429 (live 2026-09-08)', () => {
+  let dir: string;
+  let path: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'teams-chats-sendfile-retry-'));
+    path = join(dir, 'members-cache.json');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  // Locally scoped, same convention as the "grants chat members read access" describe block
+  // above — each describe in this file builds its own tiny response fixtures rather than sharing
+  // module-level ones across unrelated scenarios.
+  function selfIdResponse() {
+    return json({ id: 'aad-self' });
+  }
+
+  function uploadResponse() {
+    return json({
+      id: 'drive-item-retry-1',
+      eTag: '"{ABCDEF12-3456-7890-ABCD-EF1234567891},1"',
+      webUrl: 'https://contoso.sharepoint.com/personal/assistant/report.pdf',
+      name: 'report.pdf',
+    });
+  }
+
+  function grantsFor(objectIds: readonly string[]) {
+    return json({ value: objectIds.map((id) => ({ grantedToV2: { user: { id } } })) });
+  }
+
+  function subjectWithSleep(fetchFn: typeof fetch, cache: MembersCache, waits: number[]) {
+    let clock = 0;
+    const graph = new GraphClient({
+      tokenProvider: stubToken,
+      fetchFn,
+      nowFn: () => clock,
+      sleepFn: async (ms: number) => {
+        waits.push(ms);
+        clock += ms;
+      },
+    });
+    return new GraphTeamsChats(graph, { membersCache: cache });
+  }
+
+  it('two 429s (a brand-new chat, no prior roster) followed by a 200 still grants the file — no manual retry needed', async () => {
+    const cache = new MembersCache({ path }); // cold: exactly the "newly created chat" shape
+    const waits: number[] = [];
+    let membersAttempts = 0;
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) return selfIdResponse();
+      if (u.includes('/members')) {
+        membersAttempts += 1;
+        if (membersAttempts <= 2) {
+          return json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
+            'retry-after': '62',
+          });
+        }
+        return membersPage();
+      }
+      if (u.includes('/root:') && method === 'PUT') return uploadResponse();
+      if (u.includes('/invite')) return grantsFor(['aad-mika', 'aad-johan']);
+      if (u.includes('/messages') && method === 'POST') {
+        return json({
+          id: 'msg-retried',
+          chatId: CHAT,
+          createdDateTime: '2026-09-08T10:00:00Z',
+          body: { contentType: 'html', content: '' },
+        });
+      }
+      throw new Error(`unexpected call in this test: ${method} ${u}`);
+    });
+    const chats = subjectWithSleep(fetchFn as unknown as typeof fetch, cache, waits);
+
+    const sent = await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
+
+    expect(sent.id).toBe('msg-retried');
+    expect(membersAttempts).toBe(3); // 1 original + 2 retries, within the bounded budget
+    // Honours Retry-After on each retry; total wait stays well under the 5-minute cap.
+    expect(waits.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(5 * 60 * 1000);
+    expect(waits.every((ms) => ms > 0)).toBe(true);
+  });
+
+  it('a persistently throttled /members exhausts the retry budget, still refuses BEFORE any upload, and names the concrete next step', async () => {
+    const cache = new MembersCache({ path });
+    const waits: number[] = [];
+    let membersAttempts = 0;
+    const fetchFn = vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes('/members')) {
+        membersAttempts += 1;
+        return json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
+          'retry-after': '62',
+        });
+      }
+      throw new Error(
+        `TEST-ONLY GUARD: sendFile must not reach the upload/invite/message post when the ` +
+          `roster is unavailable — unexpected call: ${u}`,
+      );
+    });
+    const chats = subjectWithSleep(fetchFn as unknown as typeof fetch, cache, waits);
+
+    // Review round 1 MAJOR 5/MINOR b (fresh-context re-review of PR #24): a SECOND sendFile call
+    // used to be made here purely to re-check the "Retry with --grant-to" suffix — but by then the
+    // GraphClient gate for this resource family is already closed from the FIRST call's last 429,
+    // so that second call's own /members attempt is refused LOCALLY (LocallyThrottled, zero
+    // network calls) and trivially reproduces the same message text; it proved nothing about the
+    // real retry-exhaustion path. Both assertions now run against the ONE call that actually
+    // exhausts the budget over the network, and the attempt count is pinned exactly (was
+    // `toBeLessThanOrEqual(6)` across two calls — raising LIVE_MEMBERS_REFRESH_RETRIES 2->5 left
+    // that bound green; `toBe(3)` on one call does not).
+    await expect(chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' })).rejects.toMatchObject({
+      message: expect.stringMatching(/^THROTTLED: the member list refresh needed to grant file access/),
+    });
+    const error = await chats
+      .sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' })
+      .catch((caught: unknown) => caught);
+    expect((error as Error).message).toContain('Retry with --grant-to <ids> or --no-grant');
+    // The SECOND call's own /members attempt was refused locally (the gate the first call's last
+    // 429 closed is still closed) — proving the local-gate short-circuit does NOT itself carry
+    // the network-attempt count past the budget the first call already exhausted.
+    expect(membersAttempts).toBe(3); // exactly 1 + LIVE_MEMBERS_REFRESH_RETRIES(2), the first call only
+  });
+});
+
+// 0.6.0, live 2026-09-08: explicit recipients / no-grant both skip roster resolution entirely —
+// the caller-facing escape hatch for the "roster unavailable, no manual retry landed yet" case
+// the two describe blocks above exist to make rarer, not to make impossible.
+describe('GraphTeamsChats.sendFile — grantTo/noGrant skip roster resolution entirely (0.6.0, live 2026-09-08)', () => {
+  let dir: string;
+  let path: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'teams-chats-sendfile-grantto-'));
+    path = join(dir, 'members-cache.json');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function subject(fetchFn: typeof fetch, cache: MembersCache) {
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn });
+    return new GraphTeamsChats(graph, { membersCache: cache });
+  }
+
+  const uploadResponse = () =>
+    json({
+      id: 'drive-item-grantto',
+      eTag: '"{ABCDEF12-3456-7890-ABCD-EF1234567892},1"',
+      webUrl: 'https://contoso.sharepoint.com/personal/assistant/report.pdf',
+      name: 'report.pdf',
+    });
+
+  function grantsFor(objectIds: readonly string[]) {
+    return json({ value: objectIds.map((id) => ({ grantedToV2: { user: { id } } })) });
+  }
+
+  it('grantTo grants EXACTLY the given ids, with no /members or /me call at all', async () => {
+    const cache = new MembersCache({ path }); // cold — would refuse/throttle on the default path
+    let inviteBody: unknown;
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/root:') && method === 'PUT') return uploadResponse();
+      if (u.includes('/invite')) {
+        inviteBody = JSON.parse(String(init?.body));
+        return grantsFor(['aad-explicit-1', 'aad-explicit-2']);
+      }
+      if (u.includes('/messages') && method === 'POST') {
+        return json({
+          id: 'msg-grantto',
+          chatId: CHAT,
+          createdDateTime: '2026-09-08T10:00:00Z',
+          body: { contentType: 'html', content: '' },
+        });
+      }
+      throw new Error(`unexpected call in this test (roster/self-id call?): ${method} ${u}`);
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    const sent = await chats.sendFile(
+      CHAT,
+      { bytes: new Uint8Array([1]), name: 'report.pdf' },
+      undefined,
+      { grantTo: ['aad-explicit-1', 'aad-explicit-2'] },
+    );
+
+    expect(sent.id).toBe('msg-grantto');
+    expect(inviteBody).toEqual({
+      recipients: [{ objectId: 'aad-explicit-1' }, { objectId: 'aad-explicit-2' }],
+      requireSignIn: true,
+      sendInvitation: false,
+      roles: ['read'],
+    });
+  });
+
+  it('an empty grantTo array is refused before any upload — ambiguous between "no one" and a caller mistake', async () => {
+    const cache = new MembersCache({ path });
+    const fetchFn = vi.fn(async (url: string) => {
+      throw new Error(`must not reach the network with an empty grantTo: ${String(url)}`);
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    await expect(
+      chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' }, undefined, { grantTo: [] }),
+    ).rejects.toThrow(/grantTo was given but empty/);
+  });
+
+  it('noGrant uploads and posts the card with NO /invite call and no roster/self-id lookup', async () => {
+    const cache = new MembersCache({ path }); // cold — would refuse/throttle on the default path
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/root:') && method === 'PUT') return uploadResponse();
+      if (u.includes('/messages') && method === 'POST') {
+        return json({
+          id: 'msg-nograant',
+          chatId: CHAT,
+          createdDateTime: '2026-09-08T10:00:00Z',
+          body: { contentType: 'html', content: '' },
+        });
+      }
+      throw new Error(`unexpected call in this test (roster/self-id/invite call?): ${method} ${u}`);
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    const sent = await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' }, undefined, {
+      noGrant: true,
+    });
+
+    expect(sent.id).toBe('msg-nograant');
+  });
+
+  it('grantTo and noGrant together are refused as a caller error, before any upload', async () => {
+    const cache = new MembersCache({ path });
+    const fetchFn = vi.fn(async (url: string) => {
+      throw new Error(`must not reach the network: ${String(url)}`);
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    await expect(
+      chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' }, undefined, {
+        grantTo: ['aad-x'],
+        noGrant: true,
+      }),
+    ).rejects.toThrow(/mutually exclusive/);
   });
 });
 

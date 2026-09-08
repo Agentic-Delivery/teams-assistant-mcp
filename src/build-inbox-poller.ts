@@ -7,7 +7,7 @@ import type { TeamsChatsPort } from './graph/teams-chats.js';
 import type { TokenProvider } from './auth/token-provider.js';
 
 export interface BuildInboxPollerOptions {
-  chats: Pick<TeamsChatsPort, 'readMessages'>;
+  chats: Pick<TeamsChatsPort, 'readMessages' | 'warmMembers'>;
   /** Only `/me` is used here (to learn who "self" is) — the raw client, not the chats wrapper. */
   graph: GraphClient;
   tokenProvider: TokenProvider;
