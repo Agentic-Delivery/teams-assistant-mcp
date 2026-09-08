@@ -25,6 +25,54 @@ describe('message text', () => {
 
     expect(htmlToText(html)).toBe('line one\nline two\n\nparagraph two');
   });
+
+  it('keeps a pasted link\'s URL when the visible label differs from it', () => {
+    // Observed live 2026-09-08: a chat message with a pasted link arrived with attachments: 0
+    // and text that kept only the anchor's label, silently dropping the href. This reproduces
+    // the shape (a page-title label pointing at a slugified URL), not the live content.
+    const html =
+      '<div>Please review this page and its sub pages. Summarise the Product Overview ' +
+      '<a href="https://contoso.sharepoint.com/wiki/Product-Overview" ' +
+      'title="https://contoso.sharepoint.com/wiki/Product-Overview">Product Overview page</a></div>';
+
+    expect(htmlToText(html)).toBe(
+      'Please review this page and its sub pages. Summarise the Product Overview ' +
+        'Product Overview page (https://contoso.sharepoint.com/wiki/Product-Overview)',
+    );
+  });
+
+  it('keeps a bare pasted URL as-is instead of doubling it up', () => {
+    // Guards against a doubling regression: main (pre-fix) also passes this one, since it never
+    // wrapped a bare URL at all — this proves the fix's own dedupe branch, not just "no crash".
+    const html = '<p>see <a href="https://example.com/plan">https://example.com/plan</a></p>';
+
+    expect(htmlToText(html)).toBe('see https://example.com/plan');
+  });
+
+  it('decodes an ampersand in the href the same way the rest of the text is decoded', () => {
+    const html = '<p><a href="https://example.com/x?a=1&amp;b=2">the plan</a></p>';
+
+    expect(htmlToText(html)).toBe('the plan (https://example.com/x?a=1&b=2)');
+  });
+
+  it('strips nested markup from a link label without losing the href', () => {
+    const html = '<p><a href="https://example.com/plan">the <b>plan</b></a></p>';
+
+    expect(htmlToText(html)).toBe('the plan (https://example.com/plan)');
+  });
+
+  it('turns a block tag inside a link label into a space instead of gluing words together', () => {
+    const html = '<p><a href="https://example.com/plan">line1<br>line2</a></p>';
+
+    expect(htmlToText(html)).toBe('line1 line2 (https://example.com/plan)');
+  });
+
+  it('dedupes a bare pasted URL whose non-ASCII character is percent-encoded in the href but shown decoded in the label', () => {
+    // A synthetic non-ASCII word (not customer content): "smorgasbord" written as "smörgåsbord".
+    const html = '<p><a href="https://example.com/sm%C3%B6rg%C3%A5sbord">https://example.com/sm&#246;rg&#229;sbord</a></p>';
+
+    expect(htmlToText(html)).toBe('https://example.com/sm%C3%B6rg%C3%A5sbord');
+  });
 });
 
 describe('graph message mapping', () => {
