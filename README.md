@@ -20,9 +20,10 @@ vocabulary Teams verifiably renders (verified by screenshot against the real cli
 inferred from docs), known rendering quirks, and a live status-board pattern for making
 agent progress visible in the chat. Install it by adding this repo as a Claude Code plugin
 marketplace. Styled output needs the raw-HTML path the skill assumes: pass `format: 'html'`
-to `send_chat_message`/`edit_chat_message` (default `'text'` still escapes everything), or
-`--html` to `teams-post`/`teams-edit`. The caller owns entity-escaping `<`, `>`, `&` inside
-their own content on that path — the server posts it verbatim.
+to `send_chat_message`/`reply_chat_message`/`edit_chat_message` (default `'text'` still escapes
+everything), or `--html` to `teams-post`/`teams-reply`/`teams-edit`. The caller owns
+entity-escaping `<`, `>`, `&` inside their own content on that path — the server posts it
+verbatim.
 
 ## Getting started
 
@@ -49,7 +50,7 @@ The server speaks MCP over stdio and exposes sixteen tools:
 | `send_chat_message` | Posts to a chat whose allowlist entry has `canPost: true`; `format: 'text'` (default) escapes and renders, `format: 'html'` posts raw HTML verbatim; optional `mentions` — see "@mentions" below |
 | `send_chat_image` | Posts a PNG/JPEG that renders inline, from a local path or base64 bytes |
 | `send_chat_file` | Uploads a local file to the account's OneDrive (`TEAMS_MCP_UPLOAD_DIR`, default `ai-test`) and shares it into the chat, granting every other chat member read access on the uploaded item; optional `grantTo` (explicit AAD ids, skips roster resolution) or `noGrant` (post with no grant at all) — see "@mentions" below |
-| `reply_chat_message` | Posts a quoted reply to a specific message — chats have no reply threads, so this is the quote card the Teams UI produces; optional `mentions` |
+| `reply_chat_message` | Posts a quoted reply to a specific message — chats have no reply threads, so this is the quote card the Teams UI produces; same `format` and `mentions` options as `send_chat_message` |
 | `edit_chat_message` | Replaces the text of a message this account sent (Graph refuses anyone else's); same `format` and `mentions` options as `send_chat_message` |
 | `react_to_chat_message` | Puts an emoji reaction on a message — the receipt gesture for "seen, being handled" |
 | `delete_chat_message` | Soft-deletes a message this account sent — the reversible kind; no hard delete offered |
@@ -377,17 +378,17 @@ for read-budget headroom.
 
 Nine small commands ship beside the server for scripts, cron jobs and background monitors that
 need Teams without a running MCP session: `teams-post <chatId> [--html] [--mention "Name"]...`
-(text on stdin), `teams-reply <chatId> <messageId> [--mention "Name"]...` (text on stdin),
-`teams-edit <chatId> <messageId> [--html] [--mention "Name"]...` (new text on stdin), `teams-react
-<chatId> <messageId> <emoji>`, `teams-read <chatId> [--limit N] [--since ISO]`, `teams-pin
-<chatId> <messageId>`, `teams-unpin <chatId> <messageId>`, `teams-send-file <chatId> <path>
-[more paths...] [--caption "text"] [--grant-to <id>[,<id>...] | --no-grant]` and
+(text on stdin), `teams-reply <chatId> <messageId> [--html] [--mention "Name"]...` (text on
+stdin), `teams-edit <chatId> <messageId> [--html] [--mention "Name"]...` (new text on stdin),
+`teams-react <chatId> <messageId> <emoji>`, `teams-read <chatId> [--limit N] [--since ISO]`,
+`teams-pin <chatId> <messageId>`, `teams-unpin <chatId> <messageId>`, `teams-send-file <chatId>
+<path> [more paths...] [--caption "text"] [--grant-to <id>[,<id>...] | --no-grant]` and
 `teams-attachments <chatId> <messageId> [--list]
 [--name <filter>] [--out <dir>]`. Same allowlist, same auth, same
 code paths as the server tools — including the send reliability below. `--html` on
-`teams-post`/`teams-edit` posts stdin as raw Teams-subset HTML, verbatim — the caller is
-responsible for entity-escaping their own `<`, `>`, `&`; see the `teams-styling` plugin for the
-verified vocabulary. `--mention
+`teams-post`/`teams-reply`/`teams-edit` posts stdin as raw Teams-subset HTML, verbatim — the
+caller is responsible for entity-escaping their own `<`, `>`, `&`; see the `teams-styling` plugin
+for the verified vocabulary. `--mention
 "Name"` (repeatable) @mentions that person, same resolution and placement rules as the
 `mentions` tool parameter — see "@mentions" above. `teams-send-file` uploads and shares one or
 more files in one call (one `send_chat_file` per path); `--caption` (optional, anywhere in argv)
