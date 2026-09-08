@@ -241,6 +241,30 @@ export interface GraphTeamsChatsOptions {
 
 export const DEFAULT_UPLOAD_DIR = 'ai-test';
 
+/**
+ * Extra attempts (beyond the first) for a LIVE `/members` refresh, shared by both
+ * resolveMentions and membersForInvite — 2 extra attempts, so up to 3 tries total. Each retry
+ * honours the server's own Retry-After (GraphClient's existing per-attempt sleep, capped at
+ * MAX_RETRY_SLEEP_MS — see graph-client.ts), so the worst-case wait across the whole budget stays
+ * well inside 5 minutes for the retry-after values actually measured against this endpoint
+ * (62s live, per docs/throttling-mitigation.md).
+ *
+ * Live 2026-09-08: `teams-send-file` refused 7/7 times over ~2 hours on a NEWLY CREATED chat —
+ * no prior COMPLETE or stale roster to fall back to, one 429, no retry, hard failure every single
+ * attempt (see membersForInvite's own doc comment and KNOWN-ISSUES.md for the full incident).
+ * The SAME day, ~13:58Z, `teams-post --mention` failed the identical way on a chat that HAD
+ * traffic all day: the mentioned person simply had not spoken yet, so the harvested (PARTIAL)
+ * roster resolveMentions read had no entry for them, forcing the exact same throttled live
+ * refresh with no recourse. Both callers previously refreshed with a SINGLE, never-retried call
+ * (deliberately, to fail fast rather than delay a real error behind a throttle wait) — that
+ * trade-off is what this constant revises: a single 429 is common enough in practice that "fail
+ * immediately" was costing real, avoidable failures for both mentions and file grants, while a
+ * bounded retry (still not unbounded, still capped) fixes the overwhelming majority of them
+ * without meaningfully changing the "delay a real error" cost for the rarer callers who are
+ * throttled on every attempt.
+ */
+export const LIVE_MEMBERS_REFRESH_RETRIES = 2;
+
 interface GraphMember {
   displayName?: string | null;
   email?: string | null;
@@ -334,8 +358,12 @@ export class GraphTeamsChats implements TeamsChatsPort {
    * would come back "No chat member matches", indistinguishable from them genuinely not being in
    * the chat (review round 2, 2026-08-26).
    */
-  private async membersOf(chatId: string): Promise<ChatMember[]> {
-    const raw = await this.graph.getAll<GraphMember>(`/chats/${encodeURIComponent(chatId)}/members`);
+  private async membersOf(chatId: string, readRetries?: number): Promise<ChatMember[]> {
+    const raw = await this.graph.getAll<GraphMember>(
+      `/chats/${encodeURIComponent(chatId)}/members`,
+      200,
+      readRetries !== undefined ? { readRetries } : {},
+    );
     return raw.flatMap((member) => {
       const mapped = toChatMember(member);
       return mapped ? [mapped] : [];
@@ -358,25 +386,35 @@ export class GraphTeamsChats implements TeamsChatsPort {
   }
 
   /**
-   * A single, never-retried `/members` refresh, with the 429→THROTTLED translation shared by
-   * BOTH resolveMentions and membersForInvite — those two used to carry nearly identical but
-   * independently-worded catch blocks (2026-09-02 review MINOR: one owner now). `reason` is the
-   * only thing that differs between callers, folded into one message; `extraOnThrottle`, when
-   * given, is appended verbatim — resolveMentions uses it to keep its own specific reassurance
-   * ("this does not mean the name does not exist") alive through the shared helper instead of
-   * silently dropping it (2026-09-02 re-review MINOR: the first extraction lost this exact clause,
-   * the same shape of regression as 0.4.1 losing Retry-After off the MCP tool path — pinned by a
-   * test this time, not just a doc comment promise). Same rule either way: the wait itself is NOT
-   * stated in the message text — retryAfterSeconds (the 4th constructor argument) is the one place
-   * that number lives; retryAfterSuffix (graph-client.ts) is the only renderer, shared by the CLI
-   * and the MCP tool path (0.4.1 review round 2).
+   * A `/members` refresh, with the 429→THROTTLED translation shared by BOTH resolveMentions and
+   * membersForInvite — those two used to carry nearly identical but independently-worded catch
+   * blocks (2026-09-02 review MINOR: one owner now). `reason` is the only thing that differs
+   * between callers, folded into one message; `extraOnThrottle`, when given, is appended verbatim
+   * — resolveMentions uses it to keep its own specific reassurance ("this does not mean the name
+   * does not exist") alive through the shared helper instead of silently dropping it (2026-09-02
+   * re-review MINOR: the first extraction lost this exact clause, the same shape of regression as
+   * 0.4.1 losing Retry-After off the MCP tool path — pinned by a test this time, not just a doc
+   * comment promise). Same rule either way: the wait itself is NOT stated in the message text —
+   * retryAfterSeconds (the 4th constructor argument) is the one place that number lives;
+   * retryAfterSuffix (graph-client.ts) is the only renderer, shared by the CLI and the MCP tool
+   * path (0.4.1 review round 2).
+   *
+   * `readRetries` (live 2026-09-08 — see LIVE_MEMBERS_REFRESH_RETRIES's own doc comment for the
+   * two incidents this closes): BOTH callers below now pass LIVE_MEMBERS_REFRESH_RETRIES rather
+   * than leaving this at GraphClient's own default. Was previously "a single, never-retried
+   * refresh" by deliberate design (failing fast rather than delaying a real error behind a
+   * throttle wait); live evidence the same day on both callers showed that trade-off costing real,
+   * avoidable failures on a single 429, which a bounded (not unbounded) retry mostly fixes. The
+   * THROTTLED translation and its ONE final Retry-After number are unchanged either way — only
+   * how many live attempts happen before this throws it.
    */
   private async refreshMembers(
     chatId: string,
     reason: string,
     extraOnThrottle = '',
+    readRetries?: number,
   ): Promise<ChatMember[]> {
-    return this.membersOf(chatId).catch((caught: unknown) => {
+    return this.membersOf(chatId, readRetries).catch((caught: unknown) => {
       if (caught instanceof GraphError && caught.status === 429) {
         // Mitigation 3 (docs/throttling-mitigation.md §4, stage 1 item 1): the scope is stated
         // in the message text (not just carried structurally on the error) because THIS is the
@@ -421,9 +459,10 @@ export class GraphTeamsChats implements TeamsChatsPort {
 
   /**
    * Cache-first: a hit resolves every name against the on-disk roster with ZERO Graph calls. A
-   * miss — no cache, an expired entry, or a name the cached roster does not have — refreshes ONCE
-   * (a single `/members` call, never a retry loop) and re-checks against the fresh roster; a name
-   * still unresolved after that gets resolveMentionTargets's own clear error.
+   * miss — no cache, an expired entry, or a name the cached roster does not have — refreshes
+   * (bounded retry budget, LIVE_MEMBERS_REFRESH_RETRIES — see that constant's own doc comment;
+   * up to 0.5.5 this was a single, never-retried call) and re-checks against the fresh roster; a
+   * name still unresolved after that gets resolveMentionTargets's own clear error.
    *
    * Mitigation 1 (docs/throttling-mitigation.md §4, stage 1 item 2; root-caused live 2026-09-04
    * — see KNOWN-ISSUES.md): when that refresh itself fails with a throttled/transiently-
@@ -444,7 +483,7 @@ export class GraphTeamsChats implements TeamsChatsPort {
         if (!GraphTeamsChats.isRefreshWorthy(error)) {
           throw error; // ambiguous / empty name: a refresh cannot fix a caller error
         }
-        // Fall through to a single refresh — see doc comment above.
+        // Fall through to a bounded-retry refresh — see doc comment above.
       }
     }
     try {
@@ -452,6 +491,7 @@ export class GraphTeamsChats implements TeamsChatsPort {
         chatId,
         'for mention resolution',
         ' This does not mean the name does not exist.',
+        LIVE_MEMBERS_REFRESH_RETRIES,
       );
       this.cacheIfNonEmpty(chatId, fresh);
       return resolveMentionTargets(names, fresh);
@@ -528,7 +568,17 @@ export class GraphTeamsChats implements TeamsChatsPort {
       return complete;
     }
     try {
-      const fresh = await this.refreshMembers(chatId, 'needed to grant file access');
+      // Bounded retry budget (live 2026-09-08 — see LIVE_MEMBERS_REFRESH_RETRIES's own doc
+      // comment): a brand-new chat has no COMPLETE or stale roster to fall back to at all, so a
+      // single 429 here used to be a hard failure with no recourse but a MANUAL retry (measured:
+      // teams-send-file refused 7/7 times over ~2 hours on exactly this shape). The next-step
+      // suggestion below fires only once this budget is truly exhausted.
+      const fresh = await this.refreshMembers(
+        chatId,
+        'needed to grant file access',
+        ' Retry with --grant-to <ids> or --no-grant.',
+        LIVE_MEMBERS_REFRESH_RETRIES,
+      );
       this.cacheIfNonEmpty(chatId, fresh);
       return fresh;
     } catch (error) {

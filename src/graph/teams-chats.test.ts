@@ -1663,6 +1663,129 @@ describe('GraphTeamsChats.sendFile — a PARTIAL (traffic-harvested) roster is n
   });
 });
 
+// Live 2026-09-08: teams-send-file failed 7/7 times over ~2 hours on a NEWLY CREATED chat with
+// "THROTTLED: the member list refresh needed to grant file access was throttled; nothing was
+// done" — a single 429 on /members, no prior COMPLETE or stale roster to fall back to (a brand
+// new chat has neither), and no retry within the attempt. Posts/replies/reactions in the same
+// window succeeded, confirming this was the members endpoint specifically, not an account-wide
+// block. See KNOWN-ISSUES.md's entry for this incident.
+describe('GraphTeamsChats.sendFile — membersForInvite retries a throttled /members refresh within a bounded budget instead of failing on the first 429 (live 2026-09-08)', () => {
+  let dir: string;
+  let path: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'teams-chats-sendfile-retry-'));
+    path = join(dir, 'members-cache.json');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  // Locally scoped, same convention as the "grants chat members read access" describe block
+  // above — each describe in this file builds its own tiny response fixtures rather than sharing
+  // module-level ones across unrelated scenarios.
+  function selfIdResponse() {
+    return json({ id: 'aad-self' });
+  }
+
+  function uploadResponse() {
+    return json({
+      id: 'drive-item-retry-1',
+      eTag: '"{ABCDEF12-3456-7890-ABCD-EF1234567891},1"',
+      webUrl: 'https://contoso.sharepoint.com/personal/assistant/report.pdf',
+      name: 'report.pdf',
+    });
+  }
+
+  function grantsFor(objectIds: readonly string[]) {
+    return json({ value: objectIds.map((id) => ({ grantedToV2: { user: { id } } })) });
+  }
+
+  function subjectWithSleep(fetchFn: typeof fetch, cache: MembersCache, waits: number[]) {
+    let clock = 0;
+    const graph = new GraphClient({
+      tokenProvider: stubToken,
+      fetchFn,
+      nowFn: () => clock,
+      sleepFn: async (ms: number) => {
+        waits.push(ms);
+        clock += ms;
+      },
+    });
+    return new GraphTeamsChats(graph, { membersCache: cache });
+  }
+
+  it('two 429s (a brand-new chat, no prior roster) followed by a 200 still grants the file — no manual retry needed', async () => {
+    const cache = new MembersCache({ path }); // cold: exactly the "newly created chat" shape
+    const waits: number[] = [];
+    let membersAttempts = 0;
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/me?') && u.includes('select=id')) return selfIdResponse();
+      if (u.includes('/members')) {
+        membersAttempts += 1;
+        if (membersAttempts <= 2) {
+          return json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
+            'retry-after': '62',
+          });
+        }
+        return membersPage();
+      }
+      if (u.includes('/root:') && method === 'PUT') return uploadResponse();
+      if (u.includes('/invite')) return grantsFor(['aad-mika', 'aad-johan']);
+      if (u.includes('/messages') && method === 'POST') {
+        return json({
+          id: 'msg-retried',
+          chatId: CHAT,
+          createdDateTime: '2026-09-08T10:00:00Z',
+          body: { contentType: 'html', content: '' },
+        });
+      }
+      throw new Error(`unexpected call in this test: ${method} ${u}`);
+    });
+    const chats = subjectWithSleep(fetchFn as unknown as typeof fetch, cache, waits);
+
+    const sent = await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' });
+
+    expect(sent.id).toBe('msg-retried');
+    expect(membersAttempts).toBe(3); // 1 original + 2 retries, within the bounded budget
+    // Honours Retry-After on each retry; total wait stays well under the 5-minute cap.
+    expect(waits.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(5 * 60 * 1000);
+    expect(waits.every((ms) => ms > 0)).toBe(true);
+  });
+
+  it('a persistently throttled /members exhausts the retry budget, still refuses BEFORE any upload, and names the concrete next step', async () => {
+    const cache = new MembersCache({ path });
+    const waits: number[] = [];
+    let membersAttempts = 0;
+    const fetchFn = vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes('/members')) {
+        membersAttempts += 1;
+        return json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
+          'retry-after': '62',
+        });
+      }
+      throw new Error(
+        `TEST-ONLY GUARD: sendFile must not reach the upload/invite/message post when the ` +
+          `roster is unavailable — unexpected call: ${u}`,
+      );
+    });
+    const chats = subjectWithSleep(fetchFn as unknown as typeof fetch, cache, waits);
+
+    await expect(chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' })).rejects.toMatchObject({
+      message: expect.stringMatching(/^THROTTLED: the member list refresh needed to grant file access/),
+    });
+    await expect(chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' })).rejects.toMatchObject({
+      message: expect.stringContaining('Retry with --grant-to <ids> or --no-grant'),
+    });
+    // Bounded, not infinite: the same budget as the successful-retry test above (1 + 2 retries).
+    expect(membersAttempts).toBeLessThanOrEqual(6); // two sendFile calls above, 3 attempts each
+  });
+});
+
 describe('GraphTeamsChats.sendImage — hosted content, no OneDrive item, no grant applies here', () => {
   it('never touches OneDrive or /invite — only the plain message-with-hostedContents POST', async () => {
     const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {

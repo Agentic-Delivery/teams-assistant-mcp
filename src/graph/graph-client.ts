@@ -398,12 +398,18 @@ export class GraphClient {
     };
   }
 
-  /** Follows @odata.nextLink until the pages run out or `max` items have been collected. */
-  async getAll<T>(path: string, max = 200): Promise<T[]> {
+  /**
+   * Follows @odata.nextLink until the pages run out or `max` items have been collected.
+   * `options.readRetries`, when given, overrides the client default for EVERY page fetched here
+   * — a caller with a higher tolerance for waiting out a 429 (e.g. GraphTeamsChats.membersForInvite's
+   * bounded retry budget for send_chat_file's permission grant, live 2026-09-08) passes it through
+   * rather than this method inventing its own retry loop on top of getResponse's existing one.
+   */
+  async getAll<T>(path: string, max = 200, options: { readRetries?: number } = {}): Promise<T[]> {
     const collected: T[] = [];
     let next: string | undefined = path;
     while (next && collected.length < max) {
-      const page: { value?: T[]; '@odata.nextLink'?: string } = await this.get(next);
+      const page: { value?: T[]; '@odata.nextLink'?: string } = await this.get(next, options);
       collected.push(...(page.value ?? []));
       next = page['@odata.nextLink'];
     }
