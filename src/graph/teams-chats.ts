@@ -55,6 +55,28 @@ export interface OutboundFile {
 }
 
 /**
+ * sendFile's escape hatches around the default roster-derived permission grant (0.6.0, live
+ * 2026-09-08 — see sendFile's own doc comment for the full reasoning). Mutually exclusive; giving
+ * both is a caller error, refused before any upload.
+ */
+export interface SendFileOptions {
+  /**
+   * Explicit recipient AAD ids. Skips roster resolution AND self-id resolution entirely — no
+   * `/members` call, no `/me` call, cache or no cache — and grants read access to exactly these
+   * ids, trusted verbatim (the caller is assumed to already know who should see the file; this is
+   * not a roster entry that might be missing an AAD id, so no such check applies here).
+   */
+  grantTo?: readonly string[];
+  /**
+   * Uploads and posts the file card with NO permission grant at all — no `/members`/`/me` call
+   * either. The caller accepts that only the uploading account can open the file; the CLI/MCP
+   * tool layer is responsible for saying so to whoever is watching (this method has no stdout of
+   * its own).
+   */
+  noGrant?: boolean;
+}
+
+/**
  * Secondary port for Teams chats. Everything above it (the MCP tools) speaks ChatSummary and
  * ChatMessage, never Graph JSON, so a different backing API or a test double swaps in here.
  */
@@ -81,7 +103,7 @@ export interface TeamsChatsPort {
    */
   sendHtmlMessage(chatId: string, html: string, mentions?: readonly MentionTarget[]): Promise<ChatMessage>;
   sendImage(chatId: string, image: OutboundImage, text?: string): Promise<ChatMessage>;
-  sendFile(chatId: string, file: OutboundFile, text?: string): Promise<ChatMessage>;
+  sendFile(chatId: string, file: OutboundFile, text?: string, options?: SendFileOptions): Promise<ChatMessage>;
   replyToMessage(
     chatId: string,
     replyToMessageId: string,
@@ -773,6 +795,56 @@ export class GraphTeamsChats implements TeamsChatsPort {
   }
 
   /**
+   * The default (no grantTo/noGrant) recipient computation `sendFile` used to do inline —
+   * extracted unchanged (0.6.0) so `sendFile` itself can branch cleanly on `options` without
+   * duplicating this reasoning. Resolves the roster (`membersForInvite`, COMPLETE-only, bounded
+   * retry budget), excludes self (re-resolving live if the cached/overridden self id turns out
+   * not to be anyone in THIS roster — see `sendFile`'s own doc comment for the fuller history of
+   * both), and refuses BEFORE any upload if the roster is empty, self is undetermined, or any
+   * OTHER member has no AAD id — the exact "no dead cards, ever" contract named there.
+   */
+  private async recipientIdsFromRoster(chatId: string, fileName: string): Promise<string[]> {
+    const members = await this.membersForInvite(chatId);
+    if (members.length === 0) {
+      throw new Error(
+        `Cannot share ${fileName} into chat ${chatId}: the chat's member list resolved to ` +
+          'empty, so no recipient permission grant could be attempted. Nothing was uploaded.',
+      );
+    }
+    let selfId = await this.resolveSelfId();
+    if (selfId !== undefined && !members.some((member) => member.id === selfId)) {
+      // Roster-membership re-check — see sendFile's own doc comment for the realistic ways a
+      // WRONG id reaches this point (a TEAMS_MCP_SELF_ID typo, a stale cache entry). Bypasses
+      // override/memo/cache entirely: only a fresh /me is trustworthy enough to override a value
+      // that does not match anyone in this specific chat.
+      this.log(
+        'resolved self id does not match this chat\'s roster; re-resolving live rather than trusting it.',
+      );
+      selfId = await this.resolveSelfIdLive();
+    }
+    if (selfId === undefined) {
+      throw new Error(
+        `Cannot share ${fileName} into chat ${chatId}: the assistant's own account id could ` +
+          "not be determined (the /me lookup failed), so members could not be safely excluded " +
+          'from the read permission grant. Nothing was uploaded — try again once /me is reachable.',
+      );
+    }
+    // selfId is a definite string from here on — see sendFile's own doc comment for why that
+    // structurally rules out the earlier self/id-less-member confusion.
+    const others = members.filter((member) => member.id !== selfId);
+    const unresolvable = others.filter((member) => !member.id);
+    if (unresolvable.length > 0) {
+      throw new Error(
+        `Cannot share ${fileName} into chat ${chatId}: ${unresolvable.length} of this chat's ` +
+          `${others.length} other member(s) — ${unresolvable.map((member) => member.displayName).join(', ')} ` +
+          '— has no AAD id Graph reported, so a read permission grant could not be attempted for ' +
+          'them. Nothing was uploaded.',
+      );
+    }
+    return others.map((member) => member.id as string);
+  }
+
+  /**
    * Uploads `file` to the account's OneDrive and shares it into the chat as a reference
    * attachment.
    *
@@ -841,46 +913,40 @@ export class GraphTeamsChats implements TeamsChatsPort {
    *    throws, same as an outright /invite failure, same orphan-honesty;
    *  - a chat whose only member is the assistant itself (no OTHER member at all) skips the invite
    *    call entirely and sends normally — there is nobody who could see a dead card.
+   *
+   * `options.grantTo`/`options.noGrant` (0.6.0, live 2026-09-08): both skip roster resolution
+   * (and therefore self-id resolution too — there is no roster to check a resolved self id
+   * against) ENTIRELY, so neither pays the throttled `/members` endpoint at all, cache or no
+   * cache. `grantTo` trusts the caller's explicit id list verbatim — no self-exclusion, no
+   * AAD-id-presence check, since the caller already supplied real ids, not roster entries that
+   * might lack one. `noGrant` uploads and posts with no recipient grant at all; the caller
+   * accepts that only the uploading account can open the file (mirrored in the CLI/MCP-tool
+   * result, not here — this method has no stdout of its own). Both still keep the roster-BEFORE-
+   * upload ordering's spirit: there is no roster step to order against, so the upload is simply
+   * the first network call either way.
    */
-  async sendFile(chatId: string, file: OutboundFile, text?: string): Promise<ChatMessage> {
-    const members = await this.membersForInvite(chatId);
-    if (members.length === 0) {
-      throw new Error(
-        `Cannot share ${file.name} into chat ${chatId}: the chat's member list resolved to ` +
-          'empty, so no recipient permission grant could be attempted. Nothing was uploaded.',
-      );
+  async sendFile(
+    chatId: string,
+    file: OutboundFile,
+    text?: string,
+    options: SendFileOptions = {},
+  ): Promise<ChatMessage> {
+    if (options.grantTo !== undefined && options.noGrant) {
+      throw new Error('sendFile: grantTo and noGrant are mutually exclusive.');
     }
-    let selfId = await this.resolveSelfId();
-    if (selfId !== undefined && !members.some((member) => member.id === selfId)) {
-      // Roster-membership re-check — see this method's own doc comment for the realistic ways a
-      // WRONG id reaches this point (a TEAMS_MCP_SELF_ID typo, a stale cache entry). Bypasses
-      // override/memo/cache entirely: only a fresh /me is trustworthy enough to override a value
-      // that does not match anyone in this specific chat.
-      this.log(
-        'resolved self id does not match this chat\'s roster; re-resolving live rather than trusting it.',
-      );
-      selfId = await this.resolveSelfIdLive();
+    let recipientIds: string[];
+    if (options.noGrant) {
+      recipientIds = [];
+    } else if (options.grantTo !== undefined) {
+      if (options.grantTo.length === 0) {
+        throw new Error(
+          'sendFile: grantTo was given but empty; pass at least one id or use noGrant instead.',
+        );
+      }
+      recipientIds = [...options.grantTo];
+    } else {
+      recipientIds = await this.recipientIdsFromRoster(chatId, file.name);
     }
-    if (selfId === undefined) {
-      throw new Error(
-        `Cannot share ${file.name} into chat ${chatId}: the assistant's own account id could ` +
-          "not be determined (the /me lookup failed), so members could not be safely excluded " +
-          'from the read permission grant. Nothing was uploaded — try again once /me is reachable.',
-      );
-    }
-    // selfId is a definite string from here on — see the method doc comment for why that
-    // structurally rules out the earlier self/id-less-member confusion.
-    const others = members.filter((member) => member.id !== selfId);
-    const unresolvable = others.filter((member) => !member.id);
-    if (unresolvable.length > 0) {
-      throw new Error(
-        `Cannot share ${file.name} into chat ${chatId}: ${unresolvable.length} of this chat's ` +
-          `${others.length} other member(s) — ${unresolvable.map((member) => member.displayName).join(', ')} ` +
-          '— has no AAD id Graph reported, so a read permission grant could not be attempted for ' +
-          'them. Nothing was uploaded.',
-      );
-    }
-    const recipientIds = others.map((member) => member.id as string);
 
     // A chat cannot host a real file; it has to live in the sender's OneDrive first, and the
     // message then carries a reference attachment pointing at it.

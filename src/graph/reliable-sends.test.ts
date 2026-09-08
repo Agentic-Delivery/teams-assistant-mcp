@@ -910,4 +910,27 @@ describe('reliable sends — resolveMentions and pin/unpin/list are pure passthr
     expect(unpinMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1');
     expect(listPinnedMessages).toHaveBeenCalledWith('19:a@thread.v2');
   });
+
+  // 0.6.0, live 2026-09-08: sendFile grew a 4th (options: grantTo/noGrant) parameter on
+  // TeamsChatsPort. This proves the decorator forwards it — TS's structural typing would let a
+  // 3-parameter sendFile satisfy the interface silently (methods are checked bivariantly), so a
+  // dropped 4th argument here would compile clean and simply discard --grant-to/--no-grant on
+  // every real send, the exact "wire silently dropped, only a type error away" shape this repo's
+  // own doc comments call out repeatedly (e.g. membersCache being required, not optional).
+  it('sendFile forwards its options (grantTo/noGrant) to the inner port untouched', async () => {
+    const sendFile = vi.fn(async () => message({ id: 'f1' }));
+    const inner = portWith({ sendFile });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {} });
+
+    await chats.sendFile('19:a@thread.v2', { bytes: new Uint8Array([1]), name: 'a.txt' }, 'caption', {
+      grantTo: ['aad-x'],
+    });
+
+    expect(sendFile).toHaveBeenCalledWith(
+      '19:a@thread.v2',
+      { bytes: new Uint8Array([1]), name: 'a.txt' },
+      'caption',
+      { grantTo: ['aad-x'] },
+    );
+  });
 });

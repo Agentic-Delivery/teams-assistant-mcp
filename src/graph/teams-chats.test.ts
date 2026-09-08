@@ -1846,6 +1846,131 @@ describe('GraphTeamsChats.sendFile — membersForInvite retries a throttled /mem
   });
 });
 
+// 0.6.0, live 2026-09-08: explicit recipients / no-grant both skip roster resolution entirely —
+// the caller-facing escape hatch for the "roster unavailable, no manual retry landed yet" case
+// the two describe blocks above exist to make rarer, not to make impossible.
+describe('GraphTeamsChats.sendFile — grantTo/noGrant skip roster resolution entirely (0.6.0, live 2026-09-08)', () => {
+  let dir: string;
+  let path: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'teams-chats-sendfile-grantto-'));
+    path = join(dir, 'members-cache.json');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function subject(fetchFn: typeof fetch, cache: MembersCache) {
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn });
+    return new GraphTeamsChats(graph, { membersCache: cache });
+  }
+
+  const uploadResponse = () =>
+    json({
+      id: 'drive-item-grantto',
+      eTag: '"{ABCDEF12-3456-7890-ABCD-EF1234567892},1"',
+      webUrl: 'https://contoso.sharepoint.com/personal/assistant/report.pdf',
+      name: 'report.pdf',
+    });
+
+  function grantsFor(objectIds: readonly string[]) {
+    return json({ value: objectIds.map((id) => ({ grantedToV2: { user: { id } } })) });
+  }
+
+  it('grantTo grants EXACTLY the given ids, with no /members or /me call at all', async () => {
+    const cache = new MembersCache({ path }); // cold — would refuse/throttle on the default path
+    let inviteBody: unknown;
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/root:') && method === 'PUT') return uploadResponse();
+      if (u.includes('/invite')) {
+        inviteBody = JSON.parse(String(init?.body));
+        return grantsFor(['aad-explicit-1', 'aad-explicit-2']);
+      }
+      if (u.includes('/messages') && method === 'POST') {
+        return json({
+          id: 'msg-grantto',
+          chatId: CHAT,
+          createdDateTime: '2026-09-08T10:00:00Z',
+          body: { contentType: 'html', content: '' },
+        });
+      }
+      throw new Error(`unexpected call in this test (roster/self-id call?): ${method} ${u}`);
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    const sent = await chats.sendFile(
+      CHAT,
+      { bytes: new Uint8Array([1]), name: 'report.pdf' },
+      undefined,
+      { grantTo: ['aad-explicit-1', 'aad-explicit-2'] },
+    );
+
+    expect(sent.id).toBe('msg-grantto');
+    expect(inviteBody).toEqual({
+      recipients: [{ objectId: 'aad-explicit-1' }, { objectId: 'aad-explicit-2' }],
+      requireSignIn: true,
+      sendInvitation: false,
+      roles: ['read'],
+    });
+  });
+
+  it('an empty grantTo array is refused before any upload — ambiguous between "no one" and a caller mistake', async () => {
+    const cache = new MembersCache({ path });
+    const fetchFn = vi.fn(async (url: string) => {
+      throw new Error(`must not reach the network with an empty grantTo: ${String(url)}`);
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    await expect(
+      chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' }, undefined, { grantTo: [] }),
+    ).rejects.toThrow(/grantTo was given but empty/);
+  });
+
+  it('noGrant uploads and posts the card with NO /invite call and no roster/self-id lookup', async () => {
+    const cache = new MembersCache({ path }); // cold — would refuse/throttle on the default path
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.includes('/root:') && method === 'PUT') return uploadResponse();
+      if (u.includes('/messages') && method === 'POST') {
+        return json({
+          id: 'msg-nograant',
+          chatId: CHAT,
+          createdDateTime: '2026-09-08T10:00:00Z',
+          body: { contentType: 'html', content: '' },
+        });
+      }
+      throw new Error(`unexpected call in this test (roster/self-id/invite call?): ${method} ${u}`);
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    const sent = await chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' }, undefined, {
+      noGrant: true,
+    });
+
+    expect(sent.id).toBe('msg-nograant');
+  });
+
+  it('grantTo and noGrant together are refused as a caller error, before any upload', async () => {
+    const cache = new MembersCache({ path });
+    const fetchFn = vi.fn(async (url: string) => {
+      throw new Error(`must not reach the network: ${String(url)}`);
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    await expect(
+      chats.sendFile(CHAT, { bytes: new Uint8Array([1]), name: 'report.pdf' }, undefined, {
+        grantTo: ['aad-x'],
+        noGrant: true,
+      }),
+    ).rejects.toThrow(/mutually exclusive/);
+  });
+});
+
 describe('GraphTeamsChats.sendImage — hosted content, no OneDrive item, no grant applies here', () => {
   it('never touches OneDrive or /invite — only the plain message-with-hostedContents POST', async () => {
     const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {

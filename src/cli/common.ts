@@ -76,14 +76,21 @@ export function parseSendFlags(args: readonly string[]): { html: boolean; mentio
 
 /**
  * Parses teams-send-file's trailing argv: an optional `--caption <text>` (anywhere among the
- * positionals, same flag-anywhere convention as --mention above) and one or more positional file
- * paths, in order. Any OTHER argument starting with `--` is refused (2026-09-02 review MINOR:
- * aligned with teams-reply's doctrine of refusing a stray `--html`/unrecognised leftover instead
- * of silently accepting it) — a typo'd flag must fail loudly, not get quietly uploaded as a
- * literal filename.
+ * positionals, same flag-anywhere convention as --mention above), an optional `--grant-to
+ * <id>[,<id>…]` (comma-separated, at least one non-blank id) OR a bare `--no-grant` — mutually
+ * exclusive, both skip the roster lookup entirely (0.6.0, live 2026-09-08: the caller-facing
+ * escape hatch around a throttled/unavailable roster, see GraphTeamsChats.sendFile's own doc
+ * comment) — and one or more positional file paths, in order. Any OTHER argument starting with
+ * `--` is refused (2026-09-02 review MINOR: aligned with teams-reply's doctrine of refusing a
+ * stray `--html`/unrecognised leftover instead of silently accepting it) — a typo'd flag must
+ * fail loudly, not get quietly uploaded as a literal filename.
  */
-export function parseSendFileFlags(args: readonly string[]): { caption?: string; paths: string[] } {
+export function parseSendFileFlags(
+  args: readonly string[],
+): { caption?: string; paths: string[]; grantTo?: string[]; noGrant?: boolean } {
   let caption: string | undefined;
+  let grantTo: string[] | undefined;
+  let noGrant = false;
   const paths: string[] = [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i] as string;
@@ -100,13 +107,43 @@ export function parseSendFileFlags(args: readonly string[]): { caption?: string;
       }
       caption = value;
       i += 1;
+    } else if (arg === '--grant-to') {
+      const value = args[i + 1];
+      if (value === undefined || value.startsWith('--')) {
+        usage(
+          value === undefined
+            ? '--grant-to needs a value'
+            : `--grant-to needs a value, got "${value}" which looks like a flag`,
+        );
+      }
+      // Blank entries (a stray comma, leading/trailing whitespace) are dropped, not passed
+      // through as a literal empty-string id Graph would reject with a confusing error far from
+      // the actual mistake; an ALL-blank list collapses to the same "no one to grant" ambiguity
+      // an explicit empty array would be, refused loudly here rather than reaching sendFile at
+      // all — mirrors the empty-mention-name refusal in parseSendFlags above.
+      const ids = value.split(',').map((id) => id.trim()).filter((id) => id !== '');
+      if (ids.length === 0) {
+        usage(`--grant-to needs at least one non-blank id, got "${value}"`);
+      }
+      grantTo = ids;
+      i += 1;
+    } else if (arg === '--no-grant') {
+      noGrant = true;
     } else if (arg.startsWith('--')) {
       usage(`teams-send-file: unrecognised flag ${arg}`);
     } else {
       paths.push(arg);
     }
   }
-  return { ...(caption !== undefined ? { caption } : {}), paths };
+  if (grantTo !== undefined && noGrant) {
+    usage('--grant-to and --no-grant are mutually exclusive.');
+  }
+  return {
+    ...(caption !== undefined ? { caption } : {}),
+    paths,
+    ...(grantTo !== undefined ? { grantTo } : {}),
+    ...(noGrant ? { noGrant } : {}),
+  };
 }
 
 /**
@@ -337,13 +374,20 @@ export async function doReply(
 }
 
 /** One send-file success payload — the shape `onSent` (doSendFile below) delivers, and
- *  `writeLine` (below) turns into one JSON stdout line. */
+ *  `writeLine` (below) turns into one JSON stdout line. `granted`/`note` (0.6.0, live
+ *  2026-09-08): the CLI's own "says so on stdout" contract for `--no-grant` — this JSON line IS
+ *  the only output surface doSendFile has, so a caller reading it (human or orchestrator) sees
+ *  `granted: false` and the reason without having to know which flag produced it. `granted` is
+ *  `true` for both the default roster-derived grant and an explicit `--grant-to` — the caller who
+ *  gave `--grant-to` already knows who they told sendFile to grant to. */
 export interface SendFileResult {
   action: 'send-file';
   id: string;
   chat: string;
   name: string;
   bytes: number;
+  granted: boolean;
+  note?: string;
 }
 
 /**
@@ -368,8 +412,14 @@ export async function doSendFile(
   paths: readonly string[],
   caption: string | undefined,
   onSent: (payload: SendFileResult) => void | Promise<void>,
+  sendOptions: { grantTo?: readonly string[]; noGrant?: boolean } = {},
 ): Promise<void> {
   const entry = allowlist.assertPostable(chatId);
+  const options = sendOptions.noGrant
+    ? { noGrant: true as const }
+    : sendOptions.grantTo !== undefined
+      ? { grantTo: sendOptions.grantTo }
+      : undefined;
   for (const [index, filePath] of paths.entries()) {
     const buffer = await readFile(filePath);
     const name = basename(filePath);
@@ -377,8 +427,19 @@ export async function doSendFile(
       chatId,
       { bytes: new Uint8Array(buffer), name },
       index === 0 ? caption : undefined,
+      options,
     );
-    await onSent({ action: 'send-file', id: sent.id, chat: entry.label, name, bytes: buffer.byteLength });
+    await onSent({
+      action: 'send-file',
+      id: sent.id,
+      chat: entry.label,
+      name,
+      bytes: buffer.byteLength,
+      granted: !sendOptions.noGrant,
+      ...(sendOptions.noGrant
+        ? { note: 'uploaded without a permission grant (--no-grant) — only the sender can open this file' }
+        : {}),
+    });
   }
 }
 

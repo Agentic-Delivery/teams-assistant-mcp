@@ -6,6 +6,7 @@ import type {
   OutboundFile,
   OutboundImage,
   PinnedMessage,
+  SendFileOptions,
   TeamsChatsPort,
 } from './teams-chats.js';
 import { htmlToText, type ChatAttachmentRef, type ChatMessage, type ReadResult } from '../messages.js';
@@ -185,8 +186,8 @@ export class ReliableTeamsChats implements TeamsChatsPort {
     return this.inner.sendImage(chatId, image, text);
   }
 
-  sendFile(chatId: string, file: OutboundFile, text?: string): Promise<ChatMessage> {
-    return this.inner.sendFile(chatId, file, text);
+  sendFile(chatId: string, file: OutboundFile, text?: string, options?: SendFileOptions): Promise<ChatMessage> {
+    return this.inner.sendFile(chatId, file, text, options);
   }
 
   replyToMessage(
