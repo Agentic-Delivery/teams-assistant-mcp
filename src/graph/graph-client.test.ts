@@ -324,6 +324,40 @@ describe('teams chats over graph', () => {
     });
   });
 
+  // reply --html parity (0.6.x): same quote-card wiring as the plain-text reply above, except
+  // the reply's own text is posted VERBATIM (no textToHtml escaping) — the same contentType
+  // 'html'/no-escaping contract sendHtmlMessage already carries, now on the reply path too.
+  it('replies with html: quotes the original and posts the raw html verbatim (reply --html parity)', async () => {
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        json({
+          id: 'orig-1',
+          createdDateTime: '2026-08-19T08:00:00Z',
+          from: { user: { id: 'oid-9', displayName: 'Alice Anderson' } },
+          body: { contentType: 'html', content: '<p>Where does the report end up?</p>' },
+        }),
+      )
+      .mockResolvedValueOnce(
+        json({ id: 'reply-html-1', createdDateTime: '2026-08-19T10:00:00Z', body: { content: 'Here' } }),
+      );
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
+
+    await chats.replyToHtmlMessage('19:a@thread.v2', 'orig-1', '<b>In the ai-test folder</b>');
+
+    const [postUrl, init] = fetchFn.mock.calls[1] as unknown as [string, RequestInit];
+    expect(postUrl).toBe('https://graph.microsoft.com/v1.0/chats/19%3Aa%40thread.v2/messages');
+    const body = JSON.parse(init.body as string) as {
+      body: { contentType: string; content: string };
+      attachments: Array<{ id: string; contentType: string; content: string }>;
+    };
+    // Verbatim: no <p> wrapping added, the caller's own <b> markup survives untouched.
+    expect(body.body.content).toBe('<attachment id="orig-1"></attachment><b>In the ai-test folder</b>');
+    expect(body.attachments[0]?.id).toBe('orig-1');
+    expect(body.attachments[0]?.contentType).toBe('messageReference');
+  });
+
   it('edits a message with a PATCH carrying the replacement body', async () => {
     const fetchFn = vi.fn(async () => new Response(null, { status: 204 }));
     const chats = new GraphTeamsChats(
@@ -578,6 +612,36 @@ describe('teams chats — @mentions', () => {
     expect(body.body.content).toBe(
       '<attachment id="orig-1"></attachment><p><at id="0">Berggren, Mikael</at> can you confirm?</p>',
     );
+  });
+
+  // reply --html parity (0.6.x): the @{Name} placeholder contract (renderHtmlWithMentions) on
+  // the reply path, same as sendHtmlMessage's own placeholder test above.
+  it('replyToHtmlMessage substitutes the @{Name} placeholder in the reply tail, not the quoted original', async () => {
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        json({
+          id: 'orig-1',
+          createdDateTime: '2026-08-19T08:00:00Z',
+          from: { user: { id: 'oid-9', displayName: 'Alice Anderson' } },
+          body: { contentType: 'html', content: '<p>Mika already knows about this</p>' },
+        }),
+      )
+      .mockResolvedValueOnce(
+        json({ id: 'reply-html-1', createdDateTime: '2026-08-19T10:00:00Z', body: { content: 'x' } }),
+      );
+    const chats = new GraphTeamsChats(
+      new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
+    const mention = { name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' };
+
+    await chats.replyToHtmlMessage('19:a@thread.v2', 'orig-1', '<p>@{Mika} can you confirm?</p>', [mention]);
+
+    const [, init] = fetchFn.mock.calls[1] as unknown as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as { body: { content: string }; mentions: unknown[] };
+    expect(body.body.content).toBe(
+      '<attachment id="orig-1"></attachment><p><at id="0">Berggren, Mikael</at> can you confirm?</p>',
+    );
+    expect(body.mentions).toHaveLength(1);
   });
 
   it('editMessage and editHtmlMessage carry mentions through the PATCH body', async () => {

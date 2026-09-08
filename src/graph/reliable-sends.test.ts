@@ -40,6 +40,7 @@ function portWith(overrides: Partial<TeamsChatsPort>): TeamsChatsPort {
     sendImage: reject,
     sendFile: reject,
     replyToMessage: reject,
+    replyToHtmlMessage: reject,
     editMessage: reject,
     editHtmlMessage: reject,
     deleteMessage: reject,
@@ -815,6 +816,64 @@ describe('reliable sends — @mentions rewrite the match key, not just the sent 
 
     expect(result).toBe(landed);
     expect(sendHtmlMessage).toHaveBeenCalledTimes(1);
+  });
+
+  // reply --html parity (0.6.x): same reply-tail guard as plain-text replyToMessage above, on
+  // the html placeholder path.
+  it('replyToHtmlMessage with a mention placeholder matches on the resolved displayName in the reply tail', async () => {
+    const landed = message({ text: 'quoted original text\nBerggren, Mikael can you confirm?' });
+    const replyToHtmlMessage = vi.fn(async () => {
+      throw new GraphError('socket hang up mid-response', 0);
+    });
+    const inner = portWith({
+      replyToHtmlMessage,
+      readMessages: vi.fn(async () => ({ messages: [landed] }) as unknown as ReadResult),
+    });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    const result = await chats.replyToHtmlMessage(
+      '19:a@thread.v2',
+      'orig-1',
+      '<p>@{Mika} can you confirm?</p>',
+      [MENTION],
+    );
+
+    expect(result).toBe(landed);
+    expect(replyToHtmlMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('reliable sends — html reply format: readback dedup compares TEXT, not raw markup (reply --html parity, 0.6.x)', () => {
+  it('passes a clean html reply straight through, untouched', async () => {
+    const sent = message({ id: 'fresh-html-reply' });
+    const inner = portWith({ replyToHtmlMessage: vi.fn(async () => sent) });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    expect(await chats.replyToHtmlMessage('19:a@thread.v2', 'orig-1', '<b>Deploy</b> done')).toBe(sent);
+    expect(inner.replyToHtmlMessage).toHaveBeenCalledWith('19:a@thread.v2', 'orig-1', '<b>Deploy</b> done', []);
+    expect(inner.replyToHtmlMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('a short html reply is not satisfied by the quoted ORIGINAL containing the same words (reply-tail shape, not whole-message)', async () => {
+    // Same hazard as replyToMessage's own "not satisfied by the quoted ORIGINAL" test above,
+    // through the html door: the guard must use the 'reply-tail' shape (ends-with), never
+    // whole-message equality, or a reply whose words already appear in the quoted original could
+    // wrongly "match" before this attempt's own copy has even landed.
+    const original = message({ id: 'orig', from: 'Johan', text: 'Ska jag deploya nu? ja/nej' });
+    const replyToHtmlMessage = vi
+      .fn()
+      .mockRejectedValueOnce(new GraphError('hang up', 0))
+      .mockResolvedValueOnce(message({ id: 'real-reply-html', text: 'Ska jag deploya nu? ja/nej\nja' }));
+    const inner = portWith({
+      replyToHtmlMessage,
+      readMessages: async () => ({ messages: [original] }) as unknown as ReadResult,
+    });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    const result = await chats.replyToHtmlMessage('19:a@thread.v2', 'orig', '<p>ja</p>');
+
+    expect(result.id).toBe('real-reply-html');
+    expect(replyToHtmlMessage).toHaveBeenCalledTimes(2);
   });
 });
 

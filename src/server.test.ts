@@ -119,6 +119,7 @@ class FakeTeamsChats implements TeamsChatsPort {
   }
 
   readonly replies: Array<{ chatId: string; replyToMessageId: string; text: string }> = [];
+  readonly htmlReplies: Array<{ chatId: string; replyToMessageId: string; html: string }> = [];
   readonly edits: Array<{ chatId: string; messageId: string; newText: string }> = [];
   readonly htmlEdits: Array<{ chatId: string; messageId: string; html: string }> = [];
   readonly deletes: Array<{ chatId: string; messageId: string }> = [];
@@ -133,6 +134,30 @@ class FakeTeamsChats implements TeamsChatsPort {
     this.sentMentions.push(mentions);
     return toChatMessage(
       { id: 'reply-1', chatId, createdDateTime: '2026-08-19T10:00:00Z', body: { content: text } },
+      chatId,
+    );
+  }
+
+  // reply --html parity (0.6.x). GH-14 (verified-fakes fix): rendered through the SAME
+  // renderHtmlWithMentions GraphTeamsChats.replyToHtmlMessage actually calls before its POST —
+  // same reasoning as sendHtmlMessage's fake above, so an orphaned @{Name} placeholder is caught
+  // here too, not just by a fake that always "succeeds" regardless.
+  async replyToHtmlMessage(
+    chatId: string,
+    replyToMessageId: string,
+    html: string,
+    mentions: readonly MentionTarget[] = [],
+  ) {
+    const rendered = renderHtmlWithMentions(html, mentions);
+    this.htmlReplies.push({ chatId, replyToMessageId, html: rendered });
+    this.sentMentions.push(mentions);
+    return toChatMessage(
+      {
+        id: 'reply-html-1',
+        chatId,
+        createdDateTime: '2026-08-19T10:00:00Z',
+        body: { contentType: 'html', content: rendered },
+      },
       chatId,
     );
   }
@@ -397,6 +422,52 @@ describe('reply_chat_message', () => {
 
     expect(result.isError).toBe(false);
     expect(chats.sentMentions).toEqual([[{ name: 'Bob', id: 'aad-bob', displayName: 'Bob Brown' }]]);
+  });
+
+  // reply --html parity (0.6.x): same format 'html' contract as send_chat_message/edit_chat_message.
+  it('format "html" posts the content verbatim through replyToHtmlMessage', async () => {
+    const html = '<table border="1"><tr><td>ok</td></tr></table>';
+    const result = await call(client, 'reply_chat_message', {
+      chatId: PILOT,
+      replyToMessageId: 'm1',
+      text: html,
+      format: 'html',
+    });
+
+    expect(result.isError).toBe(false);
+    expect(chats.htmlReplies).toEqual([{ chatId: PILOT, replyToMessageId: 'm1', html }]);
+    expect(chats.replies).toEqual([]);
+  });
+
+  it('format "html" mentions are placed via the @{Name} placeholder and forwarded to replyToHtmlMessage', async () => {
+    const result = await call(client, 'reply_chat_message', {
+      chatId: PILOT,
+      replyToMessageId: 'm1',
+      text: '<p>@{Bob}, thoughts?</p>',
+      format: 'html',
+      mentions: ['Bob'],
+    });
+
+    expect(result.isError).toBe(false);
+    expect(chats.htmlReplies).toEqual([
+      { chatId: PILOT, replyToMessageId: 'm1', html: '<p><at id="0">Bob Brown</at>, thoughts?</p>' },
+    ]);
+  });
+
+  // GH-14, reply path (0.6.x): same guard as send_chat_message/edit_chat_message's own GH-14
+  // tests, closing the one send path those didn't cover.
+  it('GH-14: format "html" with a resolved mention but no @{Name} token refuses BEFORE any reply is posted', async () => {
+    const result = await call(client, 'reply_chat_message', {
+      chatId: PILOT,
+      replyToMessageId: 'm1',
+      text: '<p>Please review Bob Brown</p>',
+      format: 'html',
+      mentions: ['Bob'],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.text).toMatch(/no @\{Name\}-style placeholder/);
+    expect(chats.htmlReplies).toEqual([]); // nothing recorded as sent — refused before the call
   });
 });
 

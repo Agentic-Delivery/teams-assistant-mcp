@@ -211,6 +211,31 @@ export class ReliableTeamsChats implements TeamsChatsPort {
     );
   }
 
+  /**
+   * Reply --html parity (0.6.x): same htmlMatchText reduction as sendHtmlMessage above (a
+   * landed copy's readback always comes back through htmlToText — see that method's own
+   * comment), but matched with the 'reply-tail' shape (ends-with, not equality) — same reason
+   * as replyToMessage above: the quote card's own preview text sits BEFORE our content in the
+   * readback.
+   */
+  replyToHtmlMessage(
+    chatId: string,
+    replyToMessageId: string,
+    html: string,
+    mentions: readonly MentionTarget[] = [],
+  ): Promise<ChatMessage> {
+    const rendered = mentions.length > 0 ? renderHtmlWithMentions(html, mentions) : html;
+    const matchText = htmlMatchText(rendered);
+    if (normalized(matchText) === '') {
+      // Same empty-match-text hazard as sendHtmlMessage above: no readback key to guard with,
+      // so one honest attempt rather than a retry that could claim an unrelated earlier reply.
+      return this.inner.replyToHtmlMessage(chatId, replyToMessageId, html, mentions);
+    }
+    return this.sendGuarded(chatId, matchText, 'reply-tail', () =>
+      this.inner.replyToHtmlMessage(chatId, replyToMessageId, html, mentions),
+    );
+  }
+
   editMessage(
     chatId: string,
     messageId: string,

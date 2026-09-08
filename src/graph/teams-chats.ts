@@ -110,6 +110,17 @@ export interface TeamsChatsPort {
     text: string,
     mentions?: readonly MentionTarget[],
   ): Promise<ChatMessage>;
+  /**
+   * Same verbatim contract as sendHtmlMessage (no textToHtml, no escaping, `@{Name}` placeholder
+   * for mentions — see sendHtmlMessage's own doc comment), applied to a reply: html is posted
+   * AFTER the quote-card attachment, exactly where replyToMessage places its rendered text.
+   */
+  replyToHtmlMessage(
+    chatId: string,
+    replyToMessageId: string,
+    html: string,
+    mentions?: readonly MentionTarget[],
+  ): Promise<ChatMessage>;
   editMessage(chatId: string, messageId: string, newText: string, mentions?: readonly MentionTarget[]): Promise<void>;
   /** Same verbatim contract as sendHtmlMessage, applied to an edit. */
   editHtmlMessage(chatId: string, messageId: string, html: string, mentions?: readonly MentionTarget[]): Promise<void>;
@@ -1132,6 +1143,31 @@ export class GraphTeamsChats implements TeamsChatsPort {
     }
   }
 
+  /**
+   * The quote-card `attachments[0]` entry a reply carries — shared by replyToMessage and
+   * replyToHtmlMessage (extracted for reply --html parity, 0.6.x, rather than duplicating the
+   * reference-JSON shape a second time).
+   */
+  private quoteCardFor(original: ChatMessage): { id: string; contentType: 'messageReference'; content: string } {
+    return {
+      id: original.id,
+      contentType: 'messageReference',
+      content: JSON.stringify({
+        messageId: original.id,
+        messagePreview: original.text.slice(0, 150),
+        messageSender: {
+          application: null,
+          device: null,
+          user: {
+            userIdentityType: 'aadUser',
+            id: original.fromId ?? null,
+            displayName: original.from,
+          },
+        },
+      }),
+    };
+  }
+
   async replyToMessage(
     chatId: string,
     replyToMessageId: string,
@@ -1143,20 +1179,6 @@ export class GraphTeamsChats implements TeamsChatsPort {
     // original message - so that is what gets posted here.
     const original = await this.fetchMessage(chatId, replyToMessageId);
 
-    const reference = JSON.stringify({
-      messageId: original.id,
-      messagePreview: original.text.slice(0, 150),
-      messageSender: {
-        application: null,
-        device: null,
-        user: {
-          userIdentityType: 'aadUser',
-          id: original.fromId ?? null,
-          displayName: original.from,
-        },
-      },
-    });
-
     const created = await this.graph.post<unknown>(
       `/chats/${encodeURIComponent(chatId)}/messages`,
       {
@@ -1164,9 +1186,36 @@ export class GraphTeamsChats implements TeamsChatsPort {
           contentType: 'html',
           content: `<attachment id="${original.id}"></attachment>${renderTextWithMentions(text, mentions)}`,
         },
-        attachments: [
-          { id: original.id, contentType: 'messageReference', content: reference },
-        ],
+        attachments: [this.quoteCardFor(original)],
+        ...(mentions.length > 0 ? { mentions: buildGraphMentionsPayload(mentions) } : {}),
+      },
+    );
+    return toChatMessage(created, chatId);
+  }
+
+  /**
+   * Reply --html parity (0.6.x): same verbatim raw-HTML contract as sendHtmlMessage (no
+   * textToHtml, no escaping, `@{Name}` placeholder substitution via renderHtmlWithMentions —
+   * which also carries its own orphaned-mention refusal, same as sendHtmlMessage/editHtmlMessage,
+   * GH-14), applied after the quote-card attachment exactly where replyToMessage places its
+   * rendered text.
+   */
+  async replyToHtmlMessage(
+    chatId: string,
+    replyToMessageId: string,
+    html: string,
+    mentions: readonly MentionTarget[] = [],
+  ): Promise<ChatMessage> {
+    const original = await this.fetchMessage(chatId, replyToMessageId);
+
+    const created = await this.graph.post<unknown>(
+      `/chats/${encodeURIComponent(chatId)}/messages`,
+      {
+        body: {
+          contentType: 'html',
+          content: `<attachment id="${original.id}"></attachment>${renderHtmlWithMentions(html, mentions)}`,
+        },
+        attachments: [this.quoteCardFor(original)],
         ...(mentions.length > 0 ? { mentions: buildGraphMentionsPayload(mentions) } : {}),
       },
     );
