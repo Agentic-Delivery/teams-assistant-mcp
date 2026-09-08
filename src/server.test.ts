@@ -915,6 +915,27 @@ describe('send_chat_file', () => {
     const json = result.json() as { granted: boolean };
     expect(json.granted).toBe(true);
   });
+
+  // Review round 1 MAJOR 3 (fresh-context re-review of PR #24): grantTo+noGrant given together
+  // used to be resolved by SILENTLY preferring noGrant (`noGrant ? {...} : grantTo ? {...} :
+  // undefined`) — sendFile's own mutually-exclusive guard was structurally unreachable from this
+  // tool, since the constructed options object could never carry both keys at once. Matches the
+  // CLI's own exit-2 refusal for the identical combination.
+  it('MAJOR 3: grantTo and noGrant together are refused, not silently resolved to noGrant', async () => {
+    const path = join(downloadDir, 'note5.txt');
+    writeFileSync(path, 'hi');
+
+    const result = await call(client, 'send_chat_file', {
+      chatId: PILOT,
+      path,
+      grantTo: ['aad-x'],
+      noGrant: true,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.text).toMatch(/mutually exclusive/);
+    expect(chats.sentFiles).toEqual([]); // refused before any upload, same as every other pre-flight check
+  });
 });
 
 describe('get_chat_attachment', () => {

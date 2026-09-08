@@ -524,6 +524,13 @@ export function buildServer(deps: ServerDeps): McpServer {
     ({ chatId, path, text, grantTo, noGrant }) =>
       guard(async () => {
         allowlist.assertPostable(chatId);
+        if (grantTo !== undefined && noGrant) {
+          // Review round 1 MAJOR 3: this used to be resolved by silently preferring noGrant —
+          // sendFile's own mutually-exclusive guard was structurally unreachable from here, since
+          // the options object built below could never carry both keys. Refused here, before any
+          // upload, same as the CLI's own --grant-to/--no-grant exit-2 refusal (cli/common.ts).
+          throw new Error('grantTo and noGrant are mutually exclusive.');
+        }
         const bytes = new Uint8Array(await readFile(path));
         const name = basename(path);
         const sendOptions = noGrant ? { noGrant: true as const } : grantTo ? { grantTo } : undefined;
