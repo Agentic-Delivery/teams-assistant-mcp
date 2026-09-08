@@ -543,8 +543,11 @@ describe('doSendFile — one sendFile call per positional path, --caption applie
       '19:a@thread.v2',
       { bytes: expect.any(Uint8Array), name: 'a.txt' },
       undefined,
+      undefined,
     );
-    expect(sent).toEqual([{ action: 'send-file', id: 'f1', chat: 'chat A', name: 'a.txt', bytes: 5 }]);
+    expect(sent).toEqual([
+      { action: 'send-file', id: 'f1', chat: 'chat A', name: 'a.txt', bytes: 5, granted: true },
+    ]);
   });
 
   it('applies --caption to the FIRST file only, when several paths are given', async () => {
@@ -572,16 +575,18 @@ describe('doSendFile — one sendFile call per positional path, --caption applie
       '19:a@thread.v2',
       { bytes: expect.any(Uint8Array), name: 'first.txt' },
       'see attached',
+      undefined,
     );
     expect(sendFile).toHaveBeenNthCalledWith(
       2,
       '19:a@thread.v2',
       { bytes: expect.any(Uint8Array), name: 'second.txt' },
       undefined, // the second (and every later) file gets no caption
+      undefined,
     );
     expect(sent).toEqual([
-      { action: 'send-file', id: 'f-with-caption', chat: 'chat A', name: 'first.txt', bytes: 3 },
-      { action: 'send-file', id: 'f-second.txt', chat: 'chat A', name: 'second.txt', bytes: 7 },
+      { action: 'send-file', id: 'f-with-caption', chat: 'chat A', name: 'first.txt', bytes: 3, granted: true },
+      { action: 'send-file', id: 'f-second.txt', chat: 'chat A', name: 'second.txt', bytes: 7, granted: true },
     ]);
   });
 
@@ -616,9 +621,92 @@ describe('doSendFile — one sendFile call per positional path, --caption applie
 
     // The first file's success is visible even though the batch overall failed on the second.
     expect(sent).toEqual([
-      { action: 'send-file', id: 'f-first.txt', chat: 'chat A', name: 'first.txt', bytes: 3 },
+      { action: 'send-file', id: 'f-first.txt', chat: 'chat A', name: 'first.txt', bytes: 3, granted: true },
     ]);
     expect(sendFile).toHaveBeenCalledTimes(2); // both were attempted; only the second failed
+  });
+
+  // Review round 1 MAJOR 1 (fresh-context re-review of PR #24): doSendFile's 6th (sendOptions)
+  // parameter reaching chats.sendFile as its 4th argument was untested — deleting the `options,`
+  // forwarding argument left the full 571-test suite green. These two pin the exact shape.
+  it('MAJOR 1: forwards sendOptions.grantTo to sendFile as its 4th argument, untouched', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'teams-send-file-'));
+    const filePath = join(dir, 'a.txt');
+    writeFileSync(filePath, 'hello');
+    const sendFile = vi.fn(async () => stubMessage('f1'));
+    const chats = new ReliableTeamsChats(fakeFilePort({ sendFile }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    await doSendFile({ chats, allowlist }, '19:a@thread.v2', [filePath], undefined, () => {}, {
+      grantTo: ['aad-x', 'aad-y'],
+    });
+
+    expect(sendFile).toHaveBeenCalledWith(
+      '19:a@thread.v2',
+      { bytes: expect.any(Uint8Array), name: 'a.txt' },
+      undefined,
+      { grantTo: ['aad-x', 'aad-y'] },
+    );
+  });
+
+  it('MAJOR 1: forwards sendOptions.noGrant to sendFile as its 4th argument, untouched', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'teams-send-file-'));
+    const filePath = join(dir, 'a.txt');
+    writeFileSync(filePath, 'hello');
+    const sendFile = vi.fn(async () => stubMessage('f1'));
+    const chats = new ReliableTeamsChats(fakeFilePort({ sendFile }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    await doSendFile({ chats, allowlist }, '19:a@thread.v2', [filePath], undefined, () => {}, {
+      noGrant: true,
+    });
+
+    expect(sendFile).toHaveBeenCalledWith(
+      '19:a@thread.v2',
+      { bytes: expect.any(Uint8Array), name: 'a.txt' },
+      undefined,
+      { noGrant: true },
+    );
+  });
+
+  // Review round 1 MAJOR 2: the --no-grant stdout disclosure (granted:false + the "only the
+  // sender" note) had no test at the doSendFile level — `granted: !sendOptions.noGrant` was
+  // replaceable by a hardcoded `granted: true` with the suite still green.
+  it('MAJOR 2: --no-grant reports granted:false and the "only the sender" note on the streamed payload', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'teams-send-file-'));
+    const filePath = join(dir, 'a.txt');
+    writeFileSync(filePath, 'hello');
+    const sendFile = vi.fn(async () => stubMessage('f1'));
+    const chats = new ReliableTeamsChats(fakeFilePort({ sendFile }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+    const sent: unknown[] = [];
+
+    await doSendFile(
+      { chats, allowlist },
+      '19:a@thread.v2',
+      [filePath],
+      undefined,
+      (payload) => sent.push(payload),
+      { noGrant: true },
+    );
+
+    expect(sent).toEqual([
+      {
+        action: 'send-file',
+        id: 'f1',
+        chat: 'chat A',
+        name: 'a.txt',
+        bytes: 5,
+        granted: false,
+        note: expect.stringMatching(/only the sender can open/),
+      },
+    ]);
   });
 
   // MINOR fix (2026-09-02 review, mutation-verified gap): a bare `.rejects.toThrow()` with no
@@ -726,6 +814,38 @@ describe('parseSendFileFlags — positional paths plus an optional --caption', (
       paths: ['a.txt', 'b.txt'],
     });
   });
+
+  // 0.6.0, live 2026-09-08: --grant-to/--no-grant, the caller-facing escape hatch around a
+  // throttled/unavailable roster (see GraphTeamsChats.sendFile's own doc comment).
+  it('--grant-to <ids> splits a comma-separated list into grantTo, leaving it out of paths', () => {
+    expect(parseSendFileFlags(['a.txt', '--grant-to', 'aad-1,aad-2'])).toEqual({
+      caption: undefined,
+      paths: ['a.txt'],
+      grantTo: ['aad-1', 'aad-2'],
+    });
+  });
+
+  it('--grant-to with a single id (no comma) still produces a one-element array', () => {
+    expect(parseSendFileFlags(['a.txt', '--grant-to', 'aad-1'])).toEqual({
+      caption: undefined,
+      paths: ['a.txt'],
+      grantTo: ['aad-1'],
+    });
+  });
+
+  it('--no-grant is a bare flag, leaving it out of paths', () => {
+    expect(parseSendFileFlags(['a.txt', '--no-grant'])).toEqual({
+      caption: undefined,
+      paths: ['a.txt'],
+      noGrant: true,
+    });
+  });
+
+  // Invalid-input cases (usage()/process.exit(2)) are exercised via subprocess only, same
+  // convention as --caption's own error paths below — see "teams-send-file — exit codes
+  // (subprocess)": usage() really calls process.exit, which a direct unit call would either kill
+  // the test worker or (mocked) fall through past TypeScript's `never`-typed control-flow
+  // assumption, unlike a real subprocess exit.
 });
 
 describe('teams-pin / teams-unpin — exit codes (subprocess)', () => {
@@ -836,6 +956,43 @@ describe('teams-send-file — exit codes (subprocess)', () => {
     expect(result.code).toBe(2);
     expect(result.stdout).toBe('');
     expect(result.stderr).toMatch(/--verbose/);
+  });
+
+  // 0.6.0, live 2026-09-08: --grant-to/--no-grant's error paths.
+  it('--grant-to and --no-grant together: exit 2, stdout empty, mutually exclusive', async () => {
+    const result = await runCli(
+      'send-file.ts',
+      ['19:readonly@thread.v2', '/tmp/does-not-matter.txt', '--grant-to', 'aad-1', '--no-grant'],
+      fixtureEnv(),
+    );
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/mutually exclusive/);
+  });
+
+  it('--grant-to with no value: exit 2', async () => {
+    const result = await runCli(
+      'send-file.ts',
+      ['19:readonly@thread.v2', '/tmp/does-not-matter.txt', '--grant-to'],
+      fixtureEnv(),
+    );
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/--grant-to needs a value/);
+  });
+
+  it('--grant-to with an empty/all-blank list: exit 2 — same "no one to grant" ambiguity as an empty array', async () => {
+    const result = await runCli(
+      'send-file.ts',
+      ['19:readonly@thread.v2', '/tmp/does-not-matter.txt', '--grant-to', ' , ,'],
+      fixtureEnv(),
+    );
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/--grant-to/);
   });
 });
 

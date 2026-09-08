@@ -1,3 +1,93 @@
+## PR #24 review round 1 (fresh context, 2026-09-08): the daemon's own warm-up could stall a whole poll cycle on a real Retry-After, and three gaps in the 0.6.0 send-file/mentions work were untested
+
+Fresh-context review of the branch that became 0.6.0 (entry below) found five items before that
+version shipped:
+
+- **The awaited warm-up could block the poll cycle.** `inbox.ts` awaited
+  `GraphTeamsChats.warmMembers` synchronously inside the per-chat loop, and warm-up originally
+  reused the SAME bounded retry budget (`LIVE_MEMBERS_REFRESH_RETRIES`) as `send_chat_file`'s
+  grant and mention resolution — so a real, honourable (under the 90s sleep cap) Retry-After
+  genuinely slept the whole cycle for real, once per cold chat, and — because sleeping through a
+  retry advances the clock PAST the shared `/members` gate's own window — let a SECOND cold chat's
+  warm-up issue ANOTHER live 429 the same cycle, the exact amplification
+  `docs/throttling-mitigation.md`'s 2026-08-25 incident warns against. Every warm-up test fixture
+  had used a retry-after of 100s (past the 90s cap, fails fast, zero sleep), so nothing caught it
+  before review. **Fixed:** `warmMembers` now makes exactly ONE attempt (`readRetries: 0`, never
+  the shared budget — see this file's own "Daemon-side warm-up" item below) and returns whether
+  that attempt was itself throttled; the poller now treats a throttled warm-up the same as a
+  throttled message read — it ends the cycle (same "one 429 ends the cycle" rule), rather than
+  letting a later chat in the same cycle also hit the same closed gate.
+- **doSendFile's `sendOptions` forwarding and the `--no-grant` stdout disclosure were untested** at
+  the CLI level (only proven through the MCP tool's own tests) — deleting either left the full
+  suite green. Both now have dedicated `doSendFile`-level tests.
+- **The MCP tool resolved `grantTo`+`noGrant` given together by silently preferring `noGrant`** —
+  `sendFile`'s own mutually-exclusive guard was structurally unreachable from that call site. Now
+  refused in `guard()`, matching the CLI's own exit-2 behaviour.
+- **The retry budget's own upper bound was unpinned in its test** (an assertion across two
+  `sendFile` calls that a constant change from 2 to 5 retries would not have failed). Now pinned
+  exactly on one call.
+
+## send_chat_file and --mention both refused on a single 429, with no retry and no explicit-recipient escape hatch (live 2026-09-08, fixed 0.6.0)
+
+**send_chat_file, live 2026-09-08:** `teams-send-file <chatId> <path>` failed 7/7 times over ~2
+hours on a NEWLY CREATED chat with `THROTTLED: the member list refresh needed to grant file
+access was throttled; nothing was done.` Posts, replies and reactions into the SAME chat in the
+SAME window succeeded — this was `/chats/{id}/members` specifically, not an account-wide block. A
+brand-new chat has no COMPLETE roster on disk yet (never fetched) and no stale one to fall back
+to either, so `membersForInvite`'s single, never-retried live refresh (0.5.2's own "no dead
+cards" contract, correctly refusing rather than trusting a partial/harvested roster for the grant
+— see the entry below) had exactly one shot at Graph and no recourse when it missed.
+
+**`--mention`, live 2026-09-08 ~13:58Z:** `teams-post <chat> --mention "Name"` failed the
+identical way — `THROTTLED: the member list refresh for mention resolution was throttled` — on a
+chat that had had traffic ALL DAY. Root cause was different in shape but the same throttle class:
+the harvested (PARTIAL) roster the daemon's poller had built from that traffic had no entry for
+the SPECIFIC person mentioned (they simply had not spoken yet), forcing `resolveMentions`'s own
+single, never-retried live refresh, which hit the same 429.
+
+**Fixed 0.6.0, four changes (`src/graph/teams-chats.ts`, `src/inbox.ts`, `src/cli/send-file.ts`,
+`server.ts`):**
+1. **Bounded retry on both live refreshes.** `LIVE_MEMBERS_REFRESH_RETRIES` (2 extra attempts, 3
+   total) now applies to BOTH `membersForInvite` (the file-grant path) and `resolveMentions`
+   (mentions) — reusing `GraphClient.getAll`'s existing Retry-After-honouring retry loop (a new
+   `readRetries` passthrough option, rather than a second retry mechanism) instead of failing
+   after one 429. Fixes the overwhelming majority of both live incidents outright.
+2. **`--grant-to <id>[,<id>...]` / `grantTo: string[]`** (CLI and MCP tool) skips roster
+   resolution ENTIRELY — no `/members`, no `/me` — and grants exactly the given AAD ids,
+   trusted verbatim. **`--no-grant` / `noGrant: true`** uploads and posts with NO permission grant
+   at all (only the sender can open the file), same zero-roster-calls property; the CLI's JSON
+   line and the MCP tool's result both carry `granted: false` so the caller sees it, not just a
+   code comment. Mutually exclusive; refused before any upload.
+3. **Honest failure, once the retry budget above IS exhausted** and neither escape hatch was
+   used: the same `THROTTLED` line as before, now appended with the concrete next step —
+   `Retry with --grant-to <ids> or --no-grant.` The roster-BEFORE-upload ordering (0.4.2) is
+   unchanged: nothing is ever uploaded before the grant question is settled one way or another.
+4. **Daemon-side warm-up.** The inbox poller now calls `GraphTeamsChats.warmMembers` once per
+   allowlisted chat, on its first poll, when the roster cache is completely cold — a real
+   `/members` fetch, best-effort. Deliberately a SINGLE attempt (`readRetries: 0`), not behaviour
+   1's shared retry budget: this runs inside the poller's own awaited per-chat loop, and a real
+   Retry-After sleep there stalled the WHOLE cycle (found in fresh-context review of the PR that
+   introduced this, round 1, 2026-09-08 — see that entry's own reasoning below). A warm-up that
+   IS throttled still ends the cycle (same "one 429 ends the cycle" rule a throttled message read
+   already follows), so a second cold chat in the same cycle never issues its own live 429 against
+   a gate the first one just closed. This is what actually closes the send-file gap the retry
+   budget alone cannot: a chat created and used within the same poll interval its roster warms in.
+
+**A conflicting request, resolved and logged here for the record:** a follow-up ask during this
+work (2026-09-08) framed the fix as "the members cache must be persisted on disk and read by both
+the daemon and every CLI/MCP invocation" and asked for that sharing to be built. It already
+existed — `config.ts`'s `membersCachePath` and `build-chats.ts`'s single `buildChats()`
+composition already give every caller against the same env one shared on-disk cache file (proven
+by the existing "a pre-warmed cache … resolves a mention through buildChats() with ZERO /members
+calls" test, and by a new companion test proving a DAEMON write is visible to a LATER, independent
+`buildChats()` call standing in for a fresh CLI process). The literal other half of that ask —
+trusting the harvested (PARTIAL) roster for `send_chat_file`'s permission grant so a cache "hit"
+never calls `/members` at all — was deliberately NOT implemented: it is exactly what the entry
+below (0.5.2 BLOCKER 1) closed after live-verifying it silently omitted real, silent chat members
+from the grant. Retrying it here would reopen that incident for a narrower, load-bearing win
+(skipping one call on a genuinely cold cache) the bounded retry and warm-up above already capture
+far more safely. Flagged rather than silently built.
+
 ## Inbound links pasted as rich text lost their URL, keeping only the visible label (live 2026-09-08, fixed 0.5.5)
 
 Live hit 2026-09-08: a chat message reached the inbox with `attachments: 0` and text that kept a

@@ -49,7 +49,7 @@ export interface RosterHarvestPort {
 }
 
 export interface InboxPollerDeps {
-  chats: Pick<TeamsChatsPort, 'readMessages'>;
+  chats: Pick<TeamsChatsPort, 'readMessages' | 'warmMembers'>;
   allowlist: ChatAllowlist;
   /**
    * Resolves who the server is signed in as. The assistant's own posts must not come back as
@@ -219,6 +219,11 @@ export class InboxPoller {
   private authRemedyFired = false;
   /** The `until` of the yield last logged, so one yield episode logs once, not once per cycle. */
   private yieldLoggedUntil: number | undefined;
+  /** Chat ids already offered to `chats.warmMembers` THIS process lifetime — behaviour 4 (0.6.0,
+   *  live 2026-09-08): warm each allowlisted chat's roster cache ONCE, not once per poll cycle.
+   *  GraphTeamsChats.warmMembers is itself a no-op once the cache has any entry, so this Set is
+   *  only what keeps a PERSISTENTLY failing warm-up from retrying the live call every cycle. */
+  private readonly warmedChats = new Set<string>();
   private readonly writeFileFn: typeof writeFile;
   private readonly renameFn: typeof rename;
 
@@ -370,6 +375,30 @@ export class InboxPoller {
         continue; // a chat this account can't read (403) is re-tried on a slow cadence, not every cycle
       }
       attempted += 1;
+      // Behaviour 4 (0.6.0, live 2026-09-08): warm this chat's roster cache once — best-effort,
+      // GraphTeamsChats.warmMembers itself never throws, but a `.catch` here is cheap insurance
+      // against a differently-behaved TeamsChatsPort implementation (a test double, a future
+      // decorator) doing so instead, matching this poller's own "never take the server down"
+      // contract (class doc comment above). `readRetries: 0` inside warmMembers means this never
+      // sleeps through a Retry-After itself (review round 1 MAJOR 4) — its `true` return (this
+      // single, non-retried attempt WAS throttled) still ends the cycle here, same "one 429 ends
+      // the cycle" rule readMessages's own 429 handling follows below: skip THIS chat's read and
+      // stop before any LATER chat's warm-up or read, rather than each cold chat in the same
+      // cycle issuing its own live 429 against a gate the first one already closed.
+      if (this.deps.chats.warmMembers && !this.warmedChats.has(entry.id)) {
+        this.warmedChats.add(entry.id);
+        const warmThrottled = await this.deps.chats.warmMembers(entry.id).catch(() => false);
+        if (warmThrottled) {
+          throttled = true;
+          // A `failures` entry is what makes this cycle NOT "clean" below (the failures.length
+          // === 0 early return does not itself consult `throttled` — this keeps that invariant
+          // intact rather than special-casing it there) and is what a watcher reading the inbox's
+          // {error, at, consecutiveFailures} line sees; readMessages's own 429 handling (below)
+          // does the same pairing.
+          failures.push(`${entry.label}: THROTTLED (member roster warm-up)`);
+          continue; // the `if (throttled) break;` at the top of the next iteration ends the cycle
+        }
+      }
       const known = this.state[entry.id];
       // 0.4.1 (live-diagnosed: a restart was observed replaying ~40 old messages): no entry on
       // record for this chat means "history unknown to THIS process" — not "chat is empty" —

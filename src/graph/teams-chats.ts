@@ -55,6 +55,28 @@ export interface OutboundFile {
 }
 
 /**
+ * sendFile's escape hatches around the default roster-derived permission grant (0.6.0, live
+ * 2026-09-08 — see sendFile's own doc comment for the full reasoning). Mutually exclusive; giving
+ * both is a caller error, refused before any upload.
+ */
+export interface SendFileOptions {
+  /**
+   * Explicit recipient AAD ids. Skips roster resolution AND self-id resolution entirely — no
+   * `/members` call, no `/me` call, cache or no cache — and grants read access to exactly these
+   * ids, trusted verbatim (the caller is assumed to already know who should see the file; this is
+   * not a roster entry that might be missing an AAD id, so no such check applies here).
+   */
+  grantTo?: readonly string[];
+  /**
+   * Uploads and posts the file card with NO permission grant at all — no `/members`/`/me` call
+   * either. The caller accepts that only the uploading account can open the file; the CLI/MCP
+   * tool layer is responsible for saying so to whoever is watching (this method has no stdout of
+   * its own).
+   */
+  noGrant?: boolean;
+}
+
+/**
  * Secondary port for Teams chats. Everything above it (the MCP tools) speaks ChatSummary and
  * ChatMessage, never Graph JSON, so a different backing API or a test double swaps in here.
  */
@@ -81,7 +103,7 @@ export interface TeamsChatsPort {
    */
   sendHtmlMessage(chatId: string, html: string, mentions?: readonly MentionTarget[]): Promise<ChatMessage>;
   sendImage(chatId: string, image: OutboundImage, text?: string): Promise<ChatMessage>;
-  sendFile(chatId: string, file: OutboundFile, text?: string): Promise<ChatMessage>;
+  sendFile(chatId: string, file: OutboundFile, text?: string, options?: SendFileOptions): Promise<ChatMessage>;
   replyToMessage(
     chatId: string,
     replyToMessageId: string,
@@ -119,6 +141,14 @@ export interface TeamsChatsPort {
   pinMessage(chatId: string, messageId: string): Promise<PinnedMessage[]>;
   unpinMessage(chatId: string, messageId: string): Promise<void>;
   listPinnedMessages(chatId: string): Promise<PinnedMessage[]>;
+  /**
+   * Daemon-side roster warm-up (0.6.0, live 2026-09-08) — see GraphTeamsChats.warmMembers's own
+   * doc comment. Optional: a caller with no reason to warm anything (every CLI, most of the MCP
+   * tool surface) simply never calls it; the inbox poller (inbox.ts) is the one real caller, which
+   * uses the returned `true` (this single, non-retried attempt was itself throttled) to stop
+   * asking for more this poll cycle.
+   */
+  warmMembers?(chatId: string): Promise<boolean>;
 }
 
 export type { ChatMember, MentionTarget };
@@ -241,6 +271,30 @@ export interface GraphTeamsChatsOptions {
 
 export const DEFAULT_UPLOAD_DIR = 'ai-test';
 
+/**
+ * Extra attempts (beyond the first) for a LIVE `/members` refresh, shared by both
+ * resolveMentions and membersForInvite — 2 extra attempts, so up to 3 tries total. Each retry
+ * honours the server's own Retry-After (GraphClient's existing per-attempt sleep, capped at
+ * MAX_RETRY_SLEEP_MS — see graph-client.ts), so the worst-case wait across the whole budget stays
+ * well inside 5 minutes for the retry-after values actually measured against this endpoint
+ * (62s live, per docs/throttling-mitigation.md).
+ *
+ * Live 2026-09-08: `teams-send-file` refused 7/7 times over ~2 hours on a NEWLY CREATED chat —
+ * no prior COMPLETE or stale roster to fall back to, one 429, no retry, hard failure every single
+ * attempt (see membersForInvite's own doc comment and KNOWN-ISSUES.md for the full incident).
+ * The SAME day, ~13:58Z, `teams-post --mention` failed the identical way on a chat that HAD
+ * traffic all day: the mentioned person simply had not spoken yet, so the harvested (PARTIAL)
+ * roster resolveMentions read had no entry for them, forcing the exact same throttled live
+ * refresh with no recourse. Both callers previously refreshed with a SINGLE, never-retried call
+ * (deliberately, to fail fast rather than delay a real error behind a throttle wait) — that
+ * trade-off is what this constant revises: a single 429 is common enough in practice that "fail
+ * immediately" was costing real, avoidable failures for both mentions and file grants, while a
+ * bounded retry (still not unbounded, still capped) fixes the overwhelming majority of them
+ * without meaningfully changing the "delay a real error" cost for the rarer callers who are
+ * throttled on every attempt.
+ */
+export const LIVE_MEMBERS_REFRESH_RETRIES = 2;
+
 interface GraphMember {
   displayName?: string | null;
   email?: string | null;
@@ -334,8 +388,12 @@ export class GraphTeamsChats implements TeamsChatsPort {
    * would come back "No chat member matches", indistinguishable from them genuinely not being in
    * the chat (review round 2, 2026-08-26).
    */
-  private async membersOf(chatId: string): Promise<ChatMember[]> {
-    const raw = await this.graph.getAll<GraphMember>(`/chats/${encodeURIComponent(chatId)}/members`);
+  private async membersOf(chatId: string, readRetries?: number): Promise<ChatMember[]> {
+    const raw = await this.graph.getAll<GraphMember>(
+      `/chats/${encodeURIComponent(chatId)}/members`,
+      200,
+      readRetries !== undefined ? { readRetries } : {},
+    );
     return raw.flatMap((member) => {
       const mapped = toChatMember(member);
       return mapped ? [mapped] : [];
@@ -358,25 +416,35 @@ export class GraphTeamsChats implements TeamsChatsPort {
   }
 
   /**
-   * A single, never-retried `/members` refresh, with the 429→THROTTLED translation shared by
-   * BOTH resolveMentions and membersForInvite — those two used to carry nearly identical but
-   * independently-worded catch blocks (2026-09-02 review MINOR: one owner now). `reason` is the
-   * only thing that differs between callers, folded into one message; `extraOnThrottle`, when
-   * given, is appended verbatim — resolveMentions uses it to keep its own specific reassurance
-   * ("this does not mean the name does not exist") alive through the shared helper instead of
-   * silently dropping it (2026-09-02 re-review MINOR: the first extraction lost this exact clause,
-   * the same shape of regression as 0.4.1 losing Retry-After off the MCP tool path — pinned by a
-   * test this time, not just a doc comment promise). Same rule either way: the wait itself is NOT
-   * stated in the message text — retryAfterSeconds (the 4th constructor argument) is the one place
-   * that number lives; retryAfterSuffix (graph-client.ts) is the only renderer, shared by the CLI
-   * and the MCP tool path (0.4.1 review round 2).
+   * A `/members` refresh, with the 429→THROTTLED translation shared by BOTH resolveMentions and
+   * membersForInvite — those two used to carry nearly identical but independently-worded catch
+   * blocks (2026-09-02 review MINOR: one owner now). `reason` is the only thing that differs
+   * between callers, folded into one message; `extraOnThrottle`, when given, is appended verbatim
+   * — resolveMentions uses it to keep its own specific reassurance ("this does not mean the name
+   * does not exist") alive through the shared helper instead of silently dropping it (2026-09-02
+   * re-review MINOR: the first extraction lost this exact clause, the same shape of regression as
+   * 0.4.1 losing Retry-After off the MCP tool path — pinned by a test this time, not just a doc
+   * comment promise). Same rule either way: the wait itself is NOT stated in the message text —
+   * retryAfterSeconds (the 4th constructor argument) is the one place that number lives;
+   * retryAfterSuffix (graph-client.ts) is the only renderer, shared by the CLI and the MCP tool
+   * path (0.4.1 review round 2).
+   *
+   * `readRetries` (live 2026-09-08 — see LIVE_MEMBERS_REFRESH_RETRIES's own doc comment for the
+   * two incidents this closes): BOTH callers below now pass LIVE_MEMBERS_REFRESH_RETRIES rather
+   * than leaving this at GraphClient's own default. Was previously "a single, never-retried
+   * refresh" by deliberate design (failing fast rather than delaying a real error behind a
+   * throttle wait); live evidence the same day on both callers showed that trade-off costing real,
+   * avoidable failures on a single 429, which a bounded (not unbounded) retry mostly fixes. The
+   * THROTTLED translation and its ONE final Retry-After number are unchanged either way — only
+   * how many live attempts happen before this throws it.
    */
   private async refreshMembers(
     chatId: string,
     reason: string,
     extraOnThrottle = '',
+    readRetries?: number,
   ): Promise<ChatMember[]> {
-    return this.membersOf(chatId).catch((caught: unknown) => {
+    return this.membersOf(chatId, readRetries).catch((caught: unknown) => {
       if (caught instanceof GraphError && caught.status === 429) {
         // Mitigation 3 (docs/throttling-mitigation.md §4, stage 1 item 1): the scope is stated
         // in the message text (not just carried structurally on the error) because THIS is the
@@ -421,9 +489,10 @@ export class GraphTeamsChats implements TeamsChatsPort {
 
   /**
    * Cache-first: a hit resolves every name against the on-disk roster with ZERO Graph calls. A
-   * miss — no cache, an expired entry, or a name the cached roster does not have — refreshes ONCE
-   * (a single `/members` call, never a retry loop) and re-checks against the fresh roster; a name
-   * still unresolved after that gets resolveMentionTargets's own clear error.
+   * miss — no cache, an expired entry, or a name the cached roster does not have — refreshes
+   * (bounded retry budget, LIVE_MEMBERS_REFRESH_RETRIES — see that constant's own doc comment;
+   * up to 0.5.5 this was a single, never-retried call) and re-checks against the fresh roster; a
+   * name still unresolved after that gets resolveMentionTargets's own clear error.
    *
    * Mitigation 1 (docs/throttling-mitigation.md §4, stage 1 item 2; root-caused live 2026-09-04
    * — see KNOWN-ISSUES.md): when that refresh itself fails with a throttled/transiently-
@@ -444,7 +513,7 @@ export class GraphTeamsChats implements TeamsChatsPort {
         if (!GraphTeamsChats.isRefreshWorthy(error)) {
           throw error; // ambiguous / empty name: a refresh cannot fix a caller error
         }
-        // Fall through to a single refresh — see doc comment above.
+        // Fall through to a bounded-retry refresh — see doc comment above.
       }
     }
     try {
@@ -452,6 +521,7 @@ export class GraphTeamsChats implements TeamsChatsPort {
         chatId,
         'for mention resolution',
         ' This does not mean the name does not exist.',
+        LIVE_MEMBERS_REFRESH_RETRIES,
       );
       this.cacheIfNonEmpty(chatId, fresh);
       return resolveMentionTargets(names, fresh);
@@ -528,7 +598,17 @@ export class GraphTeamsChats implements TeamsChatsPort {
       return complete;
     }
     try {
-      const fresh = await this.refreshMembers(chatId, 'needed to grant file access');
+      // Bounded retry budget (live 2026-09-08 — see LIVE_MEMBERS_REFRESH_RETRIES's own doc
+      // comment): a brand-new chat has no COMPLETE or stale roster to fall back to at all, so a
+      // single 429 here used to be a hard failure with no recourse but a MANUAL retry (measured:
+      // teams-send-file refused 7/7 times over ~2 hours on exactly this shape). The next-step
+      // suggestion below fires only once this budget is truly exhausted.
+      const fresh = await this.refreshMembers(
+        chatId,
+        'needed to grant file access',
+        ' Retry with --grant-to <ids> or --no-grant.',
+        LIVE_MEMBERS_REFRESH_RETRIES,
+      );
       this.cacheIfNonEmpty(chatId, fresh);
       return fresh;
     } catch (error) {
@@ -546,6 +626,52 @@ export class GraphTeamsChats implements TeamsChatsPort {
         }
       }
       throw error;
+    }
+  }
+
+  /**
+   * Daemon-side warm-up (behaviour 4, live 2026-09-08 — see KNOWN-ISSUES.md): when an allowlisted
+   * chat's roster cache is COLD (no entry at all, complete or partial — `get()`), fetches it ONCE
+   * so a later sendFile/mention resolution does not pay the live call. A chat with ANY cached
+   * roster is left alone — this exists to avoid a cold miss, not to upgrade a PARTIAL roster to
+   * COMPLETE (membersForInvite's own live refresh already does that when sendFile actually needs
+   * one). Best-effort and NEVER throws: a throttled/failed warm-up leaves the roster exactly as
+   * cold as it would be without this method, logged once for diagnosis — the inbox poller this is
+   * called from must never be taken down by it (same posture as every other poller failure path,
+   * see InboxPoller's own class doc comment).
+   *
+   * `readRetries: 0` (review round 1 MAJOR 4, fresh-context re-review of PR #24, live 2026-09-08):
+   * deliberately does NOT use LIVE_MEMBERS_REFRESH_RETRIES like membersForInvite/resolveMentions
+   * — this is called from INSIDE the poller's per-chat loop and AWAITED there, so a real,
+   * honourable (under the 90s sleep cap) Retry-After used to sleep the WHOLE poll cycle for real,
+   * per cold chat, per retry — the exact "retries amplify a throttle" shape
+   * docs/throttling-mitigation.md's 2026-08-25 incident already warns about, since sleeping
+   * through a retry advances the clock PAST the shared `/members` gate's own window, letting a
+   * SECOND cold chat's warm-up issue ANOTHER live 429 in the SAME cycle instead of being refused
+   * locally. One attempt, honest result, no wait, ever.
+   *
+   * Returns `true` when that single attempt was itself throttled (a live 429, OR the local
+   * `LocallyThrottled` gate a PRIOR call already closed) — the caller (the poller) uses this to
+   * stop asking for more THIS cycle, same "one 429 ends the cycle" rule readMessages's own 429
+   * handling already follows. Returns `false` for every other outcome: already cached, fetched
+   * successfully, or failed for a reason OTHER than throttling (network error, licence problem,
+   * …) — none of those say anything about whether asking again right now would make things worse.
+   */
+  async warmMembers(chatId: string): Promise<boolean> {
+    if (this.membersCache.get(chatId)) {
+      return false;
+    }
+    try {
+      const fresh = await this.refreshMembers(chatId, 'for daemon warm-up', '', 0);
+      this.cacheIfNonEmpty(chatId, fresh);
+      return false;
+    } catch (error) {
+      this.log(
+        `warmMembers: /members warm-up for ${chatId} failed ` +
+          `(${error instanceof Error ? error.message : String(error)}); leaving the roster cold ` +
+          'for the next real caller to retry.',
+      );
+      return error instanceof GraphError && error.status === 429;
     }
   }
 
@@ -723,6 +849,56 @@ export class GraphTeamsChats implements TeamsChatsPort {
   }
 
   /**
+   * The default (no grantTo/noGrant) recipient computation `sendFile` used to do inline —
+   * extracted unchanged (0.6.0) so `sendFile` itself can branch cleanly on `options` without
+   * duplicating this reasoning. Resolves the roster (`membersForInvite`, COMPLETE-only, bounded
+   * retry budget), excludes self (re-resolving live if the cached/overridden self id turns out
+   * not to be anyone in THIS roster — see `sendFile`'s own doc comment for the fuller history of
+   * both), and refuses BEFORE any upload if the roster is empty, self is undetermined, or any
+   * OTHER member has no AAD id — the exact "no dead cards, ever" contract named there.
+   */
+  private async recipientIdsFromRoster(chatId: string, fileName: string): Promise<string[]> {
+    const members = await this.membersForInvite(chatId);
+    if (members.length === 0) {
+      throw new Error(
+        `Cannot share ${fileName} into chat ${chatId}: the chat's member list resolved to ` +
+          'empty, so no recipient permission grant could be attempted. Nothing was uploaded.',
+      );
+    }
+    let selfId = await this.resolveSelfId();
+    if (selfId !== undefined && !members.some((member) => member.id === selfId)) {
+      // Roster-membership re-check — see sendFile's own doc comment for the realistic ways a
+      // WRONG id reaches this point (a TEAMS_MCP_SELF_ID typo, a stale cache entry). Bypasses
+      // override/memo/cache entirely: only a fresh /me is trustworthy enough to override a value
+      // that does not match anyone in this specific chat.
+      this.log(
+        'resolved self id does not match this chat\'s roster; re-resolving live rather than trusting it.',
+      );
+      selfId = await this.resolveSelfIdLive();
+    }
+    if (selfId === undefined) {
+      throw new Error(
+        `Cannot share ${fileName} into chat ${chatId}: the assistant's own account id could ` +
+          "not be determined (the /me lookup failed), so members could not be safely excluded " +
+          'from the read permission grant. Nothing was uploaded — try again once /me is reachable.',
+      );
+    }
+    // selfId is a definite string from here on — see sendFile's own doc comment for why that
+    // structurally rules out the earlier self/id-less-member confusion.
+    const others = members.filter((member) => member.id !== selfId);
+    const unresolvable = others.filter((member) => !member.id);
+    if (unresolvable.length > 0) {
+      throw new Error(
+        `Cannot share ${fileName} into chat ${chatId}: ${unresolvable.length} of this chat's ` +
+          `${others.length} other member(s) — ${unresolvable.map((member) => member.displayName).join(', ')} ` +
+          '— has no AAD id Graph reported, so a read permission grant could not be attempted for ' +
+          'them. Nothing was uploaded.',
+      );
+    }
+    return others.map((member) => member.id as string);
+  }
+
+  /**
    * Uploads `file` to the account's OneDrive and shares it into the chat as a reference
    * attachment.
    *
@@ -791,46 +967,40 @@ export class GraphTeamsChats implements TeamsChatsPort {
    *    throws, same as an outright /invite failure, same orphan-honesty;
    *  - a chat whose only member is the assistant itself (no OTHER member at all) skips the invite
    *    call entirely and sends normally — there is nobody who could see a dead card.
+   *
+   * `options.grantTo`/`options.noGrant` (0.6.0, live 2026-09-08): both skip roster resolution
+   * (and therefore self-id resolution too — there is no roster to check a resolved self id
+   * against) ENTIRELY, so neither pays the throttled `/members` endpoint at all, cache or no
+   * cache. `grantTo` trusts the caller's explicit id list verbatim — no self-exclusion, no
+   * AAD-id-presence check, since the caller already supplied real ids, not roster entries that
+   * might lack one. `noGrant` uploads and posts with no recipient grant at all; the caller
+   * accepts that only the uploading account can open the file (mirrored in the CLI/MCP-tool
+   * result, not here — this method has no stdout of its own). Both still keep the roster-BEFORE-
+   * upload ordering's spirit: there is no roster step to order against, so the upload is simply
+   * the first network call either way.
    */
-  async sendFile(chatId: string, file: OutboundFile, text?: string): Promise<ChatMessage> {
-    const members = await this.membersForInvite(chatId);
-    if (members.length === 0) {
-      throw new Error(
-        `Cannot share ${file.name} into chat ${chatId}: the chat's member list resolved to ` +
-          'empty, so no recipient permission grant could be attempted. Nothing was uploaded.',
-      );
+  async sendFile(
+    chatId: string,
+    file: OutboundFile,
+    text?: string,
+    options: SendFileOptions = {},
+  ): Promise<ChatMessage> {
+    if (options.grantTo !== undefined && options.noGrant) {
+      throw new Error('sendFile: grantTo and noGrant are mutually exclusive.');
     }
-    let selfId = await this.resolveSelfId();
-    if (selfId !== undefined && !members.some((member) => member.id === selfId)) {
-      // Roster-membership re-check — see this method's own doc comment for the realistic ways a
-      // WRONG id reaches this point (a TEAMS_MCP_SELF_ID typo, a stale cache entry). Bypasses
-      // override/memo/cache entirely: only a fresh /me is trustworthy enough to override a value
-      // that does not match anyone in this specific chat.
-      this.log(
-        'resolved self id does not match this chat\'s roster; re-resolving live rather than trusting it.',
-      );
-      selfId = await this.resolveSelfIdLive();
+    let recipientIds: string[];
+    if (options.noGrant) {
+      recipientIds = [];
+    } else if (options.grantTo !== undefined) {
+      if (options.grantTo.length === 0) {
+        throw new Error(
+          'sendFile: grantTo was given but empty; pass at least one id or use noGrant instead.',
+        );
+      }
+      recipientIds = [...options.grantTo];
+    } else {
+      recipientIds = await this.recipientIdsFromRoster(chatId, file.name);
     }
-    if (selfId === undefined) {
-      throw new Error(
-        `Cannot share ${file.name} into chat ${chatId}: the assistant's own account id could ` +
-          "not be determined (the /me lookup failed), so members could not be safely excluded " +
-          'from the read permission grant. Nothing was uploaded — try again once /me is reachable.',
-      );
-    }
-    // selfId is a definite string from here on — see the method doc comment for why that
-    // structurally rules out the earlier self/id-less-member confusion.
-    const others = members.filter((member) => member.id !== selfId);
-    const unresolvable = others.filter((member) => !member.id);
-    if (unresolvable.length > 0) {
-      throw new Error(
-        `Cannot share ${file.name} into chat ${chatId}: ${unresolvable.length} of this chat's ` +
-          `${others.length} other member(s) — ${unresolvable.map((member) => member.displayName).join(', ')} ` +
-          '— has no AAD id Graph reported, so a read permission grant could not be attempted for ' +
-          'them. Nothing was uploaded.',
-      );
-    }
-    const recipientIds = others.map((member) => member.id as string);
 
     // A chat cannot host a real file; it has to live in the sender's OneDrive first, and the
     // message then carries a reference attachment pointing at it.

@@ -895,6 +895,23 @@ describe('reliable sends — resolveMentions and pin/unpin/list are pure passthr
     expect(result).toEqual([{ name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' }]);
   });
 
+  it('warmMembers delegates untouched (0.6.0) — a best-effort read/cache-fill, nothing to guard', async () => {
+    const warmMembers = vi.fn(async () => undefined);
+    const inner = portWith({ warmMembers });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {} });
+
+    await chats.warmMembers('19:a@thread.v2');
+
+    expect(warmMembers).toHaveBeenCalledWith('19:a@thread.v2');
+  });
+
+  it('warmMembers on an inner port that does not implement it resolves without throwing', async () => {
+    const inner = portWith({}); // sendFile etc. still `reject`, warmMembers simply absent
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {} });
+
+    await expect(chats.warmMembers('19:a@thread.v2')).resolves.toBe(false);
+  });
+
   it('pinMessage, unpinMessage and listPinnedMessages all delegate untouched', async () => {
     const pinMessage = vi.fn(async () => [{ id: 'pin-1', messageId: 'm1', preview: 'x' }]);
     const unpinMessage = vi.fn(async () => undefined);
@@ -909,5 +926,28 @@ describe('reliable sends — resolveMentions and pin/unpin/list are pure passthr
     expect(pinMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1');
     expect(unpinMessage).toHaveBeenCalledWith('19:a@thread.v2', 'm1');
     expect(listPinnedMessages).toHaveBeenCalledWith('19:a@thread.v2');
+  });
+
+  // 0.6.0, live 2026-09-08: sendFile grew a 4th (options: grantTo/noGrant) parameter on
+  // TeamsChatsPort. This proves the decorator forwards it — TS's structural typing would let a
+  // 3-parameter sendFile satisfy the interface silently (methods are checked bivariantly), so a
+  // dropped 4th argument here would compile clean and simply discard --grant-to/--no-grant on
+  // every real send, the exact "wire silently dropped, only a type error away" shape this repo's
+  // own doc comments call out repeatedly (e.g. membersCache being required, not optional).
+  it('sendFile forwards its options (grantTo/noGrant) to the inner port untouched', async () => {
+    const sendFile = vi.fn(async () => message({ id: 'f1' }));
+    const inner = portWith({ sendFile });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {} });
+
+    await chats.sendFile('19:a@thread.v2', { bytes: new Uint8Array([1]), name: 'a.txt' }, 'caption', {
+      grantTo: ['aad-x'],
+    });
+
+    expect(sendFile).toHaveBeenCalledWith(
+      '19:a@thread.v2',
+      { bytes: new Uint8Array([1]), name: 'a.txt' },
+      'caption',
+      { grantTo: ['aad-x'] },
+    );
   });
 });

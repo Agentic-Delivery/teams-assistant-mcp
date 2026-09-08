@@ -1135,3 +1135,121 @@ describe('inbox poller — roster harvest from poll results (mitigation 2)', () 
     expect(harvestedIds).toContain(me.id);
   });
 });
+
+// Behaviour 4, live 2026-09-08: when an allowlisted chat appears and its roster cache is cold,
+// warm it once (GraphTeamsChats.warmMembers, teams-chats.ts) so a later sendFile/mention
+// resolution does not pay the live call. `chats.warmMembers` is optional on the poller's own dep
+// type (TeamsChatsPort) — a double without it must not make the poller misbehave either.
+describe('inbox poller — daemon-side roster warm-up (0.6.0)', () => {
+  let dir: string;
+  let inboxPath: string;
+  let statePath: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'inbox-warmup-test-'));
+    inboxPath = join(dir, 'inbox.jsonl');
+    statePath = join(dir, 'inbox-state.json');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function pollerWithWarm(
+    chats: Pick<ReturnType<typeof chatStore>, 'readMessages'> & {
+      warmMembers: (chatId: string) => Promise<boolean>;
+    },
+    chatIds = [CHAT],
+  ) {
+    return new InboxPoller({
+      chats,
+      allowlist: new ChatAllowlist(chatIds.map((id) => ({ id, label: id, canPost: true }))),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+    });
+  }
+
+  it('TRIGGERING: warms each allowlisted chat exactly once, even across several poll cycles', async () => {
+    const store = chatStore({});
+    const warmed: string[] = [];
+    const chats = {
+      ...store,
+      warmMembers: async (chatId: string) => {
+        warmed.push(chatId);
+        return false;
+      },
+    };
+    const p = pollerWithWarm(chats);
+
+    await p.pollOnce();
+    await p.pollOnce();
+    await p.pollOnce();
+
+    expect(warmed).toEqual([CHAT]); // once, not once per cycle
+  });
+
+  it('NON-TRIGGERING: a chats double with no warmMembers at all does not throw and polls normally', async () => {
+    const store = chatStore({});
+    store.add(CHAT, message({ id: 'a', from: 'Alice', fromId: 'alice-id' }));
+    const poller = new InboxPoller({
+      chats: store, // deliberately no warmMembers property at all
+      allowlist: new ChatAllowlist([{ id: CHAT, label: CHAT, canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+    });
+
+    const clean = await poller.pollOnce();
+
+    expect(clean).toBe(true);
+  });
+
+  // Defensive only: GraphTeamsChats.warmMembers's own contract is "never throws" (it reports
+  // throttling via its boolean return, not an exception) — this covers a DIFFERENTLY-BEHAVED
+  // TeamsChatsPort implementation (a test double, a future decorator) that violates that contract
+  // anyway, matching this poller's own "never take the server down" doctrine either way.
+  it("a warmMembers that THROWS (misbehaving port, not GraphTeamsChats's own contract) never fails the poll cycle", async () => {
+    const store = chatStore({});
+    const chats = {
+      ...store,
+      warmMembers: async (): Promise<boolean> => {
+        throw new Error('THROTTLED: the member list refresh for daemon warm-up was throttled');
+      },
+    };
+
+    const clean = await pollerWithWarm(chats).pollOnce();
+
+    expect(clean).toBe(true);
+  });
+
+  // Review round 1 MAJOR 4 (fresh-context re-review of PR #24): warmMembers reporting `true`
+  // (throttled) must stop the CYCLE from asking for more — same "one 429 ends the cycle" rule
+  // readMessages's own 429 handling already follows — rather than proceeding to readMessages for
+  // the SAME chat, or warming/reading any LATER chat in the same cycle (the exact amplification
+  // shape: a second cold chat's warm-up issuing ANOTHER live 429 the same cycle).
+  it('TRIGGERING: a warmMembers reporting throttled:true stops the cycle — no readMessages for that chat or any later one', async () => {
+    const CHAT_B = '19:chat-b@thread.v2';
+    const readCalls: string[] = [];
+    const store = {
+      readMessages: async (chatId: string) => {
+        readCalls.push(chatId);
+        return applyWatermark([], undefined);
+      },
+    };
+    const warmCalls: string[] = [];
+    const chats = {
+      ...store,
+      warmMembers: async (chatId: string) => {
+        warmCalls.push(chatId);
+        return true; // the FIRST cold chat's warm-up was itself throttled
+      },
+    };
+
+    const clean = await pollerWithWarm(chats, [CHAT, CHAT_B]).pollOnce();
+
+    expect(warmCalls).toEqual([CHAT]); // never reached chat B's warm-up either
+    expect(readCalls).toEqual([]); // readMessages never called for EITHER chat this cycle
+    expect(clean).toBe(false); // a throttled cycle is never clean (same rule as a messages 429)
+  });
+});
