@@ -288,12 +288,12 @@ describe('GraphTeamsChats.warmMembers — daemon-side cache warm-up on an empty 
     return new GraphTeamsChats(graph, { membersCache: cache, log });
   }
 
-  it('a cold cache (no entry at all) fetches once and caches the result', async () => {
+  it('a cold cache (no entry at all) fetches once, caches the result, and reports NOT throttled', async () => {
     const cache = new MembersCache({ path });
     const { fetchFn, calls } = countingMembersFetch(membersPage);
     const chats = subject(fetchFn as unknown as typeof fetch, cache);
 
-    await chats.warmMembers(CHAT);
+    await expect(chats.warmMembers(CHAT)).resolves.toBe(false);
 
     expect(calls).toHaveLength(1);
     expect(cache.get(CHAT)).toEqual([
@@ -302,18 +302,18 @@ describe('GraphTeamsChats.warmMembers — daemon-side cache warm-up on an empty 
     ]);
   });
 
-  it('a warm cache (already has an entry, complete OR partial) makes NO /members call', async () => {
+  it('a warm cache (already has an entry, complete OR partial) makes NO /members call, reports NOT throttled', async () => {
     const cache = new MembersCache({ path });
     cache.merge(CHAT, [{ id: 'aad-mika', displayName: 'Berggren, Mikael' }]); // partial is enough to skip
     const { fetchFn, calls } = countingMembersFetch(membersPage);
     const chats = subject(fetchFn as unknown as typeof fetch, cache);
 
-    await chats.warmMembers(CHAT);
+    await expect(chats.warmMembers(CHAT)).resolves.toBe(false);
 
     expect(calls).toHaveLength(0);
   });
 
-  it('a throttled warm-up never throws — leaves the roster cold and logs one line', async () => {
+  it('a throttled warm-up never throws, leaves the roster cold, logs one line, and reports throttled: true', async () => {
     const cache = new MembersCache({ path });
     const { fetchFn } = countingMembersFetch(() =>
       json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
@@ -323,10 +323,41 @@ describe('GraphTeamsChats.warmMembers — daemon-side cache warm-up on an empty 
     const lines: string[] = [];
     const chats = subject(fetchFn as unknown as typeof fetch, cache, (line) => lines.push(line));
 
-    await expect(chats.warmMembers(CHAT)).resolves.toBeUndefined();
+    await expect(chats.warmMembers(CHAT)).resolves.toBe(true);
 
     expect(cache.get(CHAT)).toBeUndefined();
     expect(lines.some((line) => line.includes('warm-up'))).toBe(true);
+  });
+
+  // Review round 1 MAJOR 4 (fresh-context re-review of PR #24): warmMembers used to call
+  // refreshMembers with the SAME bounded retry budget (LIVE_MEMBERS_REFRESH_RETRIES, up to 2
+  // real Retry-After sleeps) as membersForInvite/resolveMentions — but unlike those two, this is
+  // called from INSIDE the poller's per-chat loop and AWAITED there, so a real (honourable, under
+  // the 90s cap) Retry-After genuinely slept the whole poll cycle. One attempt, no retry, is the
+  // fix: this proves it with a retry-after (30s) that WOULD have triggered a real sleep under the
+  // old readRetries default — the injected sleepFn must never be called at all.
+  it('a single (honourable, under-cap) Retry-After never triggers a sleep — one attempt, no retry, ever', async () => {
+    const cache = new MembersCache({ path });
+    let attempts = 0;
+    const fetchFn = vi.fn(async (url: string) => {
+      if (String(url).includes('/members')) {
+        attempts += 1;
+        return json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
+          'retry-after': '30', // well under MAX_RETRY_SLEEP_MS (90s) — a retry loop WOULD sleep this
+        });
+      }
+      throw new Error(`unexpected call: ${String(url)}`);
+    });
+    const sleepFn = vi.fn(async () => {
+      throw new Error('warmMembers must never sleep — it runs inside the poller\'s awaited cycle');
+    });
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch, sleepFn });
+    const chats = new GraphTeamsChats(graph, { membersCache: cache });
+
+    await expect(chats.warmMembers(CHAT)).resolves.toBe(true);
+
+    expect(attempts).toBe(1); // exactly one live attempt — readRetries: 0, not the shared budget
+    expect(sleepFn).not.toHaveBeenCalled();
   });
 });
 

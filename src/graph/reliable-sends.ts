@@ -143,8 +143,8 @@ export class ReliableTeamsChats implements TeamsChatsPort {
   }
 
   /** Pure passthrough — see TeamsChatsPort.warmMembers's own doc comment (0.6.0). */
-  warmMembers(chatId: string): Promise<void> {
-    return this.inner.warmMembers?.(chatId) ?? Promise.resolve();
+  warmMembers(chatId: string): Promise<boolean> {
+    return this.inner.warmMembers?.(chatId) ?? Promise.resolve(false);
   }
 
   sendMessage(chatId: string, text: string, mentions: readonly MentionTarget[] = []): Promise<ChatMessage> {

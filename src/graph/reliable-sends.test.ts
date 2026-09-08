@@ -909,7 +909,7 @@ describe('reliable sends — resolveMentions and pin/unpin/list are pure passthr
     const inner = portWith({}); // sendFile etc. still `reject`, warmMembers simply absent
     const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {} });
 
-    await expect(chats.warmMembers('19:a@thread.v2')).resolves.toBeUndefined();
+    await expect(chats.warmMembers('19:a@thread.v2')).resolves.toBe(false);
   });
 
   it('pinMessage, unpinMessage and listPinnedMessages all delegate untouched', async () => {

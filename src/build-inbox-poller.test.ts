@@ -93,9 +93,14 @@ describe('buildInboxPoller — the real composition, driven end to end (MAJOR 3,
         inboxPath: join(dir, 'inbox.jsonl'),
       });
 
-      // Bootstrap poll (0.4.1: the first poll on a chat with no known watermark only settles it,
-      // delivering nothing) — but harvest runs BEFORE that filter (inbox.ts's own doc comment), so
-      // even this settling poll must have harvested Bob already.
+      // Cycle 1: behaviour-4 warm-up (0.6.0) hits the throttled /members mock ONCE — readRetries:0
+      // means no sleep, but review round 1 MAJOR 4 also made a throttled warm-up end the CYCLE
+      // (same "one 429 ends the cycle" rule readMessages's own 429 handling follows), so this
+      // cycle never reaches readMessages/harvest at all. warmedChats already records CHAT as
+      // attempted, so cycle 2 skips warm-up and proceeds straight to the bootstrap poll (0.4.1:
+      // the first poll on a chat with no known watermark only settles it, delivering nothing —
+      // but harvest runs BEFORE that filter, so even this settling poll harvests Bob).
+      await poller.pollOnce();
       await poller.pollOnce();
 
       const freshCache = new MembersCache({ path: config.membersCachePath });

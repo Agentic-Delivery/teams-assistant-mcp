@@ -1,3 +1,32 @@
+## PR #24 review round 1 (fresh context, 2026-09-08): the daemon's own warm-up could stall a whole poll cycle on a real Retry-After, and three gaps in the 0.6.0 send-file/mentions work were untested
+
+Fresh-context review of the branch that became 0.6.0 (entry below) found five items before that
+version shipped:
+
+- **The awaited warm-up could block the poll cycle.** `inbox.ts` awaited
+  `GraphTeamsChats.warmMembers` synchronously inside the per-chat loop, and warm-up originally
+  reused the SAME bounded retry budget (`LIVE_MEMBERS_REFRESH_RETRIES`) as `send_chat_file`'s
+  grant and mention resolution — so a real, honourable (under the 90s sleep cap) Retry-After
+  genuinely slept the whole cycle for real, once per cold chat, and — because sleeping through a
+  retry advances the clock PAST the shared `/members` gate's own window — let a SECOND cold chat's
+  warm-up issue ANOTHER live 429 the same cycle, the exact amplification
+  `docs/throttling-mitigation.md`'s 2026-08-25 incident warns against. Every warm-up test fixture
+  had used a retry-after of 100s (past the 90s cap, fails fast, zero sleep), so nothing caught it
+  before review. **Fixed:** `warmMembers` now makes exactly ONE attempt (`readRetries: 0`, never
+  the shared budget — see this file's own "Daemon-side warm-up" item below) and returns whether
+  that attempt was itself throttled; the poller now treats a throttled warm-up the same as a
+  throttled message read — it ends the cycle (same "one 429 ends the cycle" rule), rather than
+  letting a later chat in the same cycle also hit the same closed gate.
+- **doSendFile's `sendOptions` forwarding and the `--no-grant` stdout disclosure were untested** at
+  the CLI level (only proven through the MCP tool's own tests) — deleting either left the full
+  suite green. Both now have dedicated `doSendFile`-level tests.
+- **The MCP tool resolved `grantTo`+`noGrant` given together by silently preferring `noGrant`** —
+  `sendFile`'s own mutually-exclusive guard was structurally unreachable from that call site. Now
+  refused in `guard()`, matching the CLI's own exit-2 behaviour.
+- **The retry budget's own upper bound was unpinned in its test** (an assertion across two
+  `sendFile` calls that a constant change from 2 to 5 retries would not have failed). Now pinned
+  exactly on one call.
+
 ## send_chat_file and --mention both refused on a single 429, with no retry and no explicit-recipient escape hatch (live 2026-09-08, fixed 0.6.0)
 
 **send_chat_file, live 2026-09-08:** `teams-send-file <chatId> <path>` failed 7/7 times over ~2
@@ -35,9 +64,14 @@ single, never-retried live refresh, which hit the same 429.
    unchanged: nothing is ever uploaded before the grant question is settled one way or another.
 4. **Daemon-side warm-up.** The inbox poller now calls `GraphTeamsChats.warmMembers` once per
    allowlisted chat, on its first poll, when the roster cache is completely cold — a real
-   `/members` fetch, same throttle discipline, best-effort (never fails the poll cycle). This is
-   what actually closes the send-file gap the retry budget alone cannot: a chat created and used
-   within the same poll interval its roster warms in.
+   `/members` fetch, best-effort. Deliberately a SINGLE attempt (`readRetries: 0`), not behaviour
+   1's shared retry budget: this runs inside the poller's own awaited per-chat loop, and a real
+   Retry-After sleep there stalled the WHOLE cycle (found in fresh-context review of the PR that
+   introduced this, round 1, 2026-09-08 — see that entry's own reasoning below). A warm-up that
+   IS throttled still ends the cycle (same "one 429 ends the cycle" rule a throttled message read
+   already follows), so a second cold chat in the same cycle never issues its own live 429 against
+   a gate the first one just closed. This is what actually closes the send-file gap the retry
+   budget alone cannot: a chat created and used within the same poll interval its roster warms in.
 
 **A conflicting request, resolved and logged here for the record:** a follow-up ask during this
 work (2026-09-08) framed the fix as "the members cache must be persisted on disk and read by both

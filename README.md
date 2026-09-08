@@ -148,12 +148,20 @@ moves on.**
 
 **Since 0.6.0 the background inbox poller also warms a cold roster proactively.** The FIRST poll
 of any newly-allowlisted chat, if its roster cache has no entry at all (complete or partial), now
-tries one real `/members` fetch (`GraphTeamsChats.warmMembers`, same throttle/gate discipline and
-retry budget as every other refresh, best-effort — a throttled warm-up just leaves the roster cold
-for the next real caller to retry, never fails the poll) so a chat's very first `send_chat_file`
-does not have to pay that call live. This is what actually shortens the gap the bounded retry
-above cannot fully close: a chat created and used within the SAME poll interval the roster warms
-in.
+tries ONE real `/members` fetch (`GraphTeamsChats.warmMembers`, best-effort — a throttled warm-up
+just leaves the roster cold for the next real caller to retry, never fails the poll on its own) so
+a chat's very first `send_chat_file` does not have to pay that call live. Deliberately NOT the
+same retry budget mention resolution and `send_chat_file`'s grant use above: warm-up makes a
+single attempt (`readRetries: 0`, no Retry-After sleep at all) because it runs inside the poller's
+own awaited per-chat loop — a real, honoured Retry-After there would have stalled the WHOLE poll
+cycle, not just this one chat, and let the SAME shared `/members` throttle window reopen partway
+through another cold chat's own attempt in the same cycle (retrying-then-sleeping is exactly the
+amplification `docs/throttling-mitigation.md`'s 2026-08-25 incident warns about). A warm-up that
+IS itself throttled still ends the cycle — the same "one 429 ends the cycle" rule the poller
+already applies to a throttled message read — rather than letting every other cold chat in the
+same cycle also attempt (and also get throttled by) the same closed gate. This is what actually
+shortens the gap the bounded retry above cannot fully close: a chat created and used within the
+SAME poll interval the roster warms in.
 
 ## Retry-After
 

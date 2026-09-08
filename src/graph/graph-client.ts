@@ -404,6 +404,13 @@ export class GraphClient {
    * — a caller with a higher tolerance for waiting out a 429 (e.g. GraphTeamsChats.membersForInvite's
    * bounded retry budget for send_chat_file's permission grant, live 2026-09-08) passes it through
    * rather than this method inventing its own retry loop on top of getResponse's existing one.
+   *
+   * CAVEAT (review round 1, fresh-context re-review of PR #24): `readRetries` applies PER PAGE,
+   * not as a whole-call budget — a caller passing 2 against a THREE-page collection could see up
+   * to 3×(1+2) = 9 live attempts, not 3. `/chats/{id}/members` (this constant's one real caller,
+   * GraphTeamsChats.membersOf) has no `$top` and is not observed to paginate in this pilot's chat
+   * sizes, so this has not mattered in practice — but a genuinely large chat, or any FUTURE
+   * multi-page caller of this option, would need a whole-call budget, not this per-page one.
    */
   async getAll<T>(path: string, max = 200, options: { readRetries?: number } = {}): Promise<T[]> {
     const collected: T[] = [];

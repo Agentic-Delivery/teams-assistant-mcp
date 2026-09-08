@@ -144,9 +144,11 @@ export interface TeamsChatsPort {
   /**
    * Daemon-side roster warm-up (0.6.0, live 2026-09-08) — see GraphTeamsChats.warmMembers's own
    * doc comment. Optional: a caller with no reason to warm anything (every CLI, most of the MCP
-   * tool surface) simply never calls it; the inbox poller (inbox.ts) is the one real caller.
+   * tool surface) simply never calls it; the inbox poller (inbox.ts) is the one real caller, which
+   * uses the returned `true` (this single, non-retried attempt was itself throttled) to stop
+   * asking for more this poll cycle.
    */
-  warmMembers?(chatId: string): Promise<void>;
+  warmMembers?(chatId: string): Promise<boolean>;
 }
 
 export type { ChatMember, MentionTarget };
@@ -637,20 +639,39 @@ export class GraphTeamsChats implements TeamsChatsPort {
    * cold as it would be without this method, logged once for diagnosis — the inbox poller this is
    * called from must never be taken down by it (same posture as every other poller failure path,
    * see InboxPoller's own class doc comment).
+   *
+   * `readRetries: 0` (review round 1 MAJOR 4, fresh-context re-review of PR #24, live 2026-09-08):
+   * deliberately does NOT use LIVE_MEMBERS_REFRESH_RETRIES like membersForInvite/resolveMentions
+   * — this is called from INSIDE the poller's per-chat loop and AWAITED there, so a real,
+   * honourable (under the 90s sleep cap) Retry-After used to sleep the WHOLE poll cycle for real,
+   * per cold chat, per retry — the exact "retries amplify a throttle" shape
+   * docs/throttling-mitigation.md's 2026-08-25 incident already warns about, since sleeping
+   * through a retry advances the clock PAST the shared `/members` gate's own window, letting a
+   * SECOND cold chat's warm-up issue ANOTHER live 429 in the SAME cycle instead of being refused
+   * locally. One attempt, honest result, no wait, ever.
+   *
+   * Returns `true` when that single attempt was itself throttled (a live 429, OR the local
+   * `LocallyThrottled` gate a PRIOR call already closed) — the caller (the poller) uses this to
+   * stop asking for more THIS cycle, same "one 429 ends the cycle" rule readMessages's own 429
+   * handling already follows. Returns `false` for every other outcome: already cached, fetched
+   * successfully, or failed for a reason OTHER than throttling (network error, licence problem,
+   * …) — none of those say anything about whether asking again right now would make things worse.
    */
-  async warmMembers(chatId: string): Promise<void> {
+  async warmMembers(chatId: string): Promise<boolean> {
     if (this.membersCache.get(chatId)) {
-      return;
+      return false;
     }
     try {
-      const fresh = await this.refreshMembers(chatId, 'for daemon warm-up');
+      const fresh = await this.refreshMembers(chatId, 'for daemon warm-up', '', 0);
       this.cacheIfNonEmpty(chatId, fresh);
+      return false;
     } catch (error) {
       this.log(
         `warmMembers: /members warm-up for ${chatId} failed ` +
           `(${error instanceof Error ? error.message : String(error)}); leaving the roster cold ` +
           'for the next real caller to retry.',
       );
+      return error instanceof GraphError && error.status === 429;
     }
   }
 
