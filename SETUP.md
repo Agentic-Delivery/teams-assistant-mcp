@@ -298,7 +298,7 @@ The sixteen tools, as registered in `src/server.ts`. All results are JSON text; 
 | `list_chats` | The allowlist intersected with what the account can see; `visibleToAccount: false` flags missing membership | none |
 | `read_chat_messages` | Messages from one chat, oldest first, with a watermark for the next call | `chatId`, `since?` (ISO watermark, exclusive), `limit?` (1–200, default 50) |
 | `send_chat_message` | Posts to a chat with `canPost: true` | `chatId`, `text`, `format?` (`'text'` default, escapes and renders; `'html'` posts raw Teams-subset HTML verbatim — caller escapes their own `<`, `>`, `&`), `mentions?` (display names to @mention — see below) |
-| `reply_chat_message` | Posts a quote-card reply to a specific message | `chatId`, `replyToMessageId`, `text`, `mentions?` |
+| `reply_chat_message` | Posts a quote-card reply to a specific message | `chatId`, `replyToMessageId`, `text`, `format?` (same as `send_chat_message`), `mentions?` |
 | `edit_chat_message` | Replaces the text of a message this account sent; Teams shows "Edited" | `chatId`, `messageId`, `newText`, `format?`, `mentions?` (same as `send_chat_message`) |
 | `react_to_chat_message` | Puts an emoji reaction on a message in an allowlisted chat | `chatId`, `messageId`, `emoji` |
 | `delete_chat_message` | Soft-deletes a message this account sent (restorable in Teams) | `chatId`, `messageId` |
@@ -327,14 +327,15 @@ when to tag someone versus just naming them.
 ## The standalone CLIs
 
 Beside the server, `npm run build` produces nine commands under `dist/cli/` (also exposed as
-package bins): `teams-post [--html] [--mention "Name"]...`, `teams-reply [--mention "Name"]...`,
-`teams-edit [--html] [--mention "Name"]...`, `teams-react`, `teams-read`, `teams-pin`,
-`teams-unpin`, `teams-send-file <chatId> <path> [more paths...] [--caption "text"]` and
-`teams-attachments <chatId> <messageId> [--list] [--name <filter>] [--out <dir>]` (download all,
-or `--list` for metadata only — see README's "Downloading attachments"). Same env
+package bins): `teams-post [--html] [--mention "Name"]...`, `teams-reply [--html] [--mention
+"Name"]...`, `teams-edit [--html] [--mention "Name"]...`, `teams-react`, `teams-read`,
+`teams-pin`, `teams-unpin`, `teams-send-file <chatId> <path> [more paths...] [--caption "text"]`
+and `teams-attachments <chatId> <messageId> [--list] [--name <filter>] [--out <dir>]` (download
+all, or `--list` for metadata only — see README's "Downloading attachments"). Same env
 vars, same allowlist, same send-reliability code paths as the server tools. `--html` on
-`teams-post`/`teams-edit` posts stdin as raw HTML verbatim, same contract as `format: 'html'`
-above; `--mention "Name"` (repeatable) works the same as the `mentions` tool parameter.
+`teams-post`/`teams-reply`/`teams-edit` posts stdin as raw HTML verbatim, same contract as
+`format: 'html'` above; `--mention "Name"` (repeatable) works the same as the `mentions` tool
+parameter.
 `teams-send-file` sends one or more local files (`--caption`, optional, shown on the first file
 only), streaming one JSON line to stdout as EACH file lands rather than buffering until the whole
 batch finishes — see README's "The standalone CLIs" for why a mid-batch failure still needs the

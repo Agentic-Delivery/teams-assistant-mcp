@@ -16,6 +16,8 @@ in, plain text out); the raw-HTML path this skill assumes is `format: 'html'` on
 (standalone CLIs) — shipped since teams-assistant-mcp 0.3.0. On that path YOU own
 entity-escaping `<`, `>`, `&` inside your own content (quirk 3 below); the server posts it
 verbatim. Never post markdown syntax into Teams (it renders as literal `**asterisks**`).
+Threaded replies (`reply_chat_message` `format: 'html'` / `teams-reply --html`) carry the same
+verbatim contract since reply HTML parity — style a reply exactly as you would a new message.
 
 ## When to style — and when not to
 
@@ -24,7 +26,8 @@ text; reach for styling when the content has structure a reader must scan:
 
 | Content | Format |
 |---|---|
-| Short conversational reply, answer to a question | Plain text — no styling |
+| Short conversational reply, answer to a question (1–2 sentences) | Plain text — no styling |
+| Medium answer to a person (3–8 sentences, usually with an ask) | HTML: one `<b>` lead line, `<div>&nbsp;</div>` air between ideas, bullets for parallel items, the question/ask on its own last line — never a plain-text paragraph block |
 | Comparison across items with SHORT cells (ids, labels, verdicts, numbers) | `<table>` — never plain-text pipe walls |
 | Findings with prose explanations | Headed sections, NOT a table: one `<b>` heading line per item, `<ul>` bullets under it, a bold `→ Fix:`/`→ Action:` closing bullet |
 | Long report | Summary message with a table + link to the full document; not the whole report inline |
@@ -35,6 +38,7 @@ text; reach for styling when the content has structure a reader must scan:
 
 Restraint rules: at most one `<h2>` title per message (h1 is oversized in chat); style the
 signal, not every word; a message that is all bold has no bold. If in doubt, plain text.
+More than two sentences ⇒ not plain text. Plain text is for one- or two-sentence replies only.
 
 ## Mentions
 

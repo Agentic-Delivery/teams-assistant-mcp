@@ -357,19 +357,24 @@ export async function doEdit(
   return { action: 'edit', id: messageId, chat: entry.label };
 }
 
-/** teams-reply's --mention plumbing — same rationale as doPost/doEdit above (testable without a
- *  live send; a subprocess test can't distinguish "mentions were resolved and forwarded" from
- *  "the flag was silently ignored"). */
+/** teams-reply's --html/--mention plumbing — same rationale as doPost/doEdit above (testable
+ *  without a live send; a subprocess test can't distinguish "the html branch runs" from "the
+ *  flag was ignored", because assertPostable always throws (or not) before either reply path is
+ *  ever reached). `html` gained reply --html parity, 0.6.x — same verbatim raw-HTML contract as
+ *  doPost's html branch, applied to replyToHtmlMessage instead of sendHtmlMessage. */
 export async function doReply(
   { chats, allowlist }: CliContext,
   chatId: string,
   replyToMessageId: string,
   text: string,
+  html: boolean,
   mentions: readonly string[] = [],
 ): Promise<{ action: 'reply'; id: string; inReplyTo: string; chat: string }> {
   const entry = allowlist.assertPostable(chatId);
   const resolved = await resolveMentions(chats, chatId, mentions);
-  const sent = await chats.replyToMessage(chatId, replyToMessageId, text, resolved);
+  const sent = html
+    ? await chats.replyToHtmlMessage(chatId, replyToMessageId, text, resolved)
+    : await chats.replyToMessage(chatId, replyToMessageId, text, resolved);
   return { action: 'reply', id: sent.id, inReplyTo: replyToMessageId, chat: entry.label };
 }
 

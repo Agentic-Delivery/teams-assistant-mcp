@@ -221,23 +221,34 @@ export function buildServer(deps: ServerDeps): McpServer {
         'carrying a quote card of the original, so it appears at the bottom of the chat like any ' +
         'other message. Use it when a bare message would lose which question it answers. Same ' +
         'rules and rendering as send_chat_message: allowlisted chat with canPost, visible ' +
-        'immediately, text always posted as HTML (newlines and links render, markdown does not).',
+        'immediately. Default format "text": the text is rendered into HTML (newlines and links ' +
+        'render, markdown does not). format "html": text is raw Teams-subset HTML posted ' +
+        'VERBATIM after the quote card — no escaping happens here, so the caller is responsible ' +
+        'for entity-escaping `<`, `>` and `&` inside their own content. See the teams-styling ' +
+        'plugin shipped in this repo for the verified HTML vocabulary and usage doctrine.',
       inputSchema: {
         chatId: z.string().describe('Graph chat id, must be allowlisted with canPost: true'),
         replyToMessageId: z.string().describe('Id of the message being answered'),
         text: z
           .string()
           .min(1)
-          .describe('Plain text of the reply; newlines and URLs render properly, markdown does not'),
+          .describe('Content of the reply; plain text by default, raw HTML when format is "html"'),
+        format: z
+          .enum(['text', 'html'])
+          .optional()
+          .describe('"text" (default) escapes and renders text; "html" posts text as raw HTML, verbatim'),
         mentions: mentionsSchema,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
-    ({ chatId, replyToMessageId, text, mentions }) =>
+    ({ chatId, replyToMessageId, text, format, mentions }) =>
       guard(async () => {
         allowlist.assertPostable(chatId);
         const resolved = await resolveMentions(chats, chatId, mentions);
-        const sent = await chats.replyToMessage(chatId, replyToMessageId, text, resolved);
+        const sent =
+          format === 'html'
+            ? await chats.replyToHtmlMessage(chatId, replyToMessageId, text, resolved)
+            : await chats.replyToMessage(chatId, replyToMessageId, text, resolved);
         return ok({
           posted: true,
           chatId,

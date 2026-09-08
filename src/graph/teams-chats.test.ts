@@ -2158,4 +2158,50 @@ describe('GraphTeamsChats.sendHtmlMessage / editHtmlMessage — the orphaned-men
     ).rejects.toThrow(/no @\{Name\}-style placeholder/);
     expect(fetchFn).not.toHaveBeenCalled();
   });
+
+  // reply --html parity (0.6.x): replyToHtmlMessage must fetch the original (the quote card
+  // needs it) but the orphaned-mention guard still has to fire BEFORE the reply is actually
+  // posted — same doctrine as GH-14a/c, applied to the one send path those tests didn't cover.
+  it('GH-14d: replyToHtmlMessage refuses AFTER fetching the original but BEFORE any POST when a resolved mention has no @{Name} token', async () => {
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      if ((init?.method ?? 'GET') === 'GET') {
+        return json({
+          id: 'orig-1',
+          createdDateTime: '2026-09-08T08:00:00Z',
+          from: { user: { id: 'oid-9', displayName: 'Alice Anderson' } },
+          body: { contentType: 'html', content: '<p>Where does the report end up?</p>' },
+        });
+      }
+      throw new Error('must never POST — the refusal must happen before the reply is sent');
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch);
+
+    await expect(
+      chats.replyToHtmlMessage(CHAT, 'orig-1', '<p>Please review Nordqvist, Maja</p>', [maja]),
+    ).rejects.toThrow(/no @\{Name\}-style placeholder/);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('GH-14e: replyToHtmlMessage posts and places the mention when the @{Name} token IS present (the other decision side)', async () => {
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      if ((init?.method ?? 'GET') === 'GET') {
+        return json({
+          id: 'orig-1',
+          createdDateTime: '2026-09-08T08:00:00Z',
+          from: { user: { id: 'oid-9', displayName: 'Alice Anderson' } },
+          body: { contentType: 'html', content: '<p>Where does the report end up?</p>' },
+        });
+      }
+      const body = JSON.parse(String(init?.body)) as { body: { content: string }; mentions?: unknown[] };
+      expect(body.body.content).toContain('<at id="0">Nordqvist, Maja</at>');
+      expect(body.mentions).toHaveLength(1);
+      return json({ id: 'reply-1', chatId: CHAT, createdDateTime: '2026-09-08T10:00:00Z', body: { contentType: 'html', content: body.body.content } });
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch);
+
+    const sent = await chats.replyToHtmlMessage(CHAT, 'orig-1', '<p>Please review @{Nordqvist, Maja}</p>', [maja]);
+
+    expect(sent.id).toBe('reply-1');
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
 });

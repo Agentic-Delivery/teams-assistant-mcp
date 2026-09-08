@@ -215,20 +215,19 @@ describe('the CLI contract — exit codes, and nothing but the JSON line on stdo
     expect(result.stdout).toBe('');
   });
 
-  // Review round 2 follow-up NIT (2026-08-26): parseSendFlags also understands --html, but
-  // reply.ts only ever destructured { mentions } — a stray --html (or any other leftover
-  // argument) used to be silently accepted and ignored, and the reply still went out as plain
-  // text with no error at all. teams-reply does not support raw HTML; it must say so.
-  it('teams-reply rejects --html instead of silently posting plain text: exit 2', async () => {
+  // reply --html parity (0.6.x): teams-reply gained --html (see the "reply --html" describe
+  // block below for the routing proof and the doReply tests above for the wiring) — same
+  // subprocess-can't-prove-routing reasoning as teams-edit --html above, so this only proves the
+  // flag is parsed as a bare flag (not swallowing the next positional) and reaches the same gate.
+  it('teams-reply --html: reaches the same allowlist gate as plain text (exit 3, no network reached) — routing itself is proven in-process below', async () => {
     const result = await runCli(
       'reply.ts',
       ['19:readonly@thread.v2', 'msg-1', '--html'],
       fixtureEnv(),
     );
 
-    expect(result.code).toBe(2);
+    expect(result.code).toBe(3);
     expect(result.stdout).toBe('');
-    expect(result.stderr).toMatch(/--html/);
   });
 
   it('teams-reply rejects an unrecognised leftover argument instead of silently ignoring it: exit 2', async () => {
@@ -260,6 +259,7 @@ describe('teams-post / teams-edit — the --html routing decision (in-process, n
       sendImage: reject,
       sendFile: reject,
       replyToMessage: reject,
+      replyToHtmlMessage: reject,
       editMessage: reject,
       editHtmlMessage: reject,
       deleteMessage: reject,
@@ -404,7 +404,14 @@ describe('teams-post / teams-edit — the --html routing decision (in-process, n
       sleepFn: async () => {},
     });
 
-    const result = await doReply({ chats, allowlist }, '19:a@thread.v2', 'orig-1', 'Mika can you confirm?', ['Mika']);
+    const result = await doReply(
+      { chats, allowlist },
+      '19:a@thread.v2',
+      'orig-1',
+      'Mika can you confirm?',
+      false,
+      ['Mika'],
+    );
 
     expect(resolveMentions).toHaveBeenCalledWith('19:a@thread.v2', ['Mika']);
     expect(replyToMessage).toHaveBeenCalledWith('19:a@thread.v2', 'orig-1', 'Mika can you confirm?', [
@@ -421,9 +428,72 @@ describe('teams-post / teams-edit — the --html routing decision (in-process, n
       sleepFn: async () => {},
     });
 
-    await doReply({ chats, allowlist }, '19:a@thread.v2', 'orig-1', 'plain reply', []);
+    await doReply({ chats, allowlist }, '19:a@thread.v2', 'orig-1', 'plain reply', false, []);
 
     expect(resolveMentions).not.toHaveBeenCalled();
+  });
+
+  // reply --html parity (0.6.x): a subprocess test cannot prove this — assertPostable always
+  // throws (or not) identically whether or not --html was passed, same reasoning as doPost's own
+  // --html routing tests above. doReply is called here directly with a fake TeamsChatsPort, so
+  // the assertion is on which METHOD actually got called.
+  it('doReply without --html calls replyToMessage — never replyToHtmlMessage', async () => {
+    const replyToMessage = vi.fn(async () => stubMessage('r3'));
+    const replyToHtmlMessage = vi.fn();
+    const chats = new ReliableTeamsChats(fakePort({ replyToMessage, replyToHtmlMessage }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    const result = await doReply({ chats, allowlist }, '19:a@thread.v2', 'orig-1', 'plain reply', false);
+
+    expect(replyToMessage).toHaveBeenCalledWith('19:a@thread.v2', 'orig-1', 'plain reply', []);
+    expect(replyToHtmlMessage).not.toHaveBeenCalled();
+    expect(result).toEqual({ action: 'reply', id: 'r3', inReplyTo: 'orig-1', chat: 'chat A' });
+  });
+
+  it('doReply with --html calls replyToHtmlMessage — never replyToMessage', async () => {
+    const replyToMessage = vi.fn();
+    const replyToHtmlMessage = vi.fn(async () => stubMessage('r4'));
+    const chats = new ReliableTeamsChats(fakePort({ replyToMessage, replyToHtmlMessage }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    const result = await doReply({ chats, allowlist }, '19:a@thread.v2', 'orig-1', '<b>done</b>', true);
+
+    expect(replyToHtmlMessage).toHaveBeenCalledWith('19:a@thread.v2', 'orig-1', '<b>done</b>', []);
+    expect(replyToMessage).not.toHaveBeenCalled();
+    expect(result).toEqual({ action: 'reply', id: 'r4', inReplyTo: 'orig-1', chat: 'chat A' });
+  });
+
+  it('doReply --html with --mention resolves the name and forwards it to replyToHtmlMessage', async () => {
+    const resolveMentions = vi.fn(async () => [
+      { name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' },
+    ]);
+    const replyToHtmlMessage = vi.fn(async () => stubMessage('r5'));
+    const chats = new ReliableTeamsChats(fakePort({ resolveMentions, replyToHtmlMessage }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    const result = await doReply(
+      { chats, allowlist },
+      '19:a@thread.v2',
+      'orig-1',
+      '<p>@{Mika} can you confirm?</p>',
+      true,
+      ['Mika'],
+    );
+
+    expect(resolveMentions).toHaveBeenCalledWith('19:a@thread.v2', ['Mika']);
+    expect(replyToHtmlMessage).toHaveBeenCalledWith(
+      '19:a@thread.v2',
+      'orig-1',
+      '<p>@{Mika} can you confirm?</p>',
+      [{ name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' }],
+    );
+    expect(result).toEqual({ action: 'reply', id: 'r5', inReplyTo: 'orig-1', chat: 'chat A' });
   });
 });
 
@@ -439,6 +509,7 @@ describe('doPin — confirms the target message actually landed before claiming 
       sendImage: reject,
       sendFile: reject,
       replyToMessage: reject,
+      replyToHtmlMessage: reject,
       editMessage: reject,
       editHtmlMessage: reject,
       deleteMessage: reject,
@@ -497,6 +568,7 @@ describe('doSendFile — one sendFile call per positional path, --caption applie
       sendImage: reject,
       sendFile: reject,
       replyToMessage: reject,
+      replyToHtmlMessage: reject,
       editMessage: reject,
       editHtmlMessage: reject,
       deleteMessage: reject,
@@ -1159,6 +1231,7 @@ describe('teams-attachments — the do* routing (in-process, fake port, real tmp
       sendImage: reject,
       sendFile: reject,
       replyToMessage: reject,
+      replyToHtmlMessage: reject,
       editMessage: reject,
       editHtmlMessage: reject,
       deleteMessage: reject,
