@@ -332,6 +332,66 @@ describe('buildChats — the composition actually wires the members cache (0.4.1
       globalThis.fetch = originalFetch;
     }
   });
+
+  // Live 2026-09-08 ~13:58Z: teams-post --mention failed on a chat that had traffic all day,
+  // which raised the question of whether a CLI invocation actually sees what the DAEMON'S poller
+  // harvested from that traffic into the members cache, or only ever sees its own process's
+  // writes. It does: both are `buildChats(config)` against the SAME env, which resolves to the
+  // SAME `config.membersCachePath` (config.ts) — this proves the daemon side (`MembersCache.merge`,
+  // the exact call inbox.ts's roster harvest makes) and a LATER, independently-constructed
+  // `buildChats(config)` (standing in for a fresh CLI process) read the identical on-disk file,
+  // with no other wiring needed.
+  it('a roster the DAEMON harvested via MembersCache.merge is visible to a LATER, independent buildChats() call — the CLI reads what the daemon wrote', async () => {
+    const { loadConfig } = await import('../config.js');
+    const { buildChats } = await import('../build-chats.js');
+    const configPath = join(dir, 'teams-mcp.config.json');
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(
+      configPath,
+      JSON.stringify({ allowedChats: [{ id: CHAT, label: 'pilot', canPost: true }] }),
+    );
+    const config = loadConfig({
+      TEAMS_MCP_CONFIG: configPath,
+      TEAMS_MCP_TENANT_ID: 'tenant',
+      TEAMS_MCP_USERNAME: 'assistant@example.com',
+      TEAMS_MCP_PASSWORD: 'secret',
+      TEAMS_MCP_TOKEN_CACHE: join(dir, '.token-cache.json'),
+    });
+
+    // The DAEMON side: buildChats() exposes the same MembersCache instance inbox.ts's poller
+    // merges harvested (senderId, displayName) pairs into on every poll cycle — simulated here
+    // directly rather than through the poller, since the poller's OWN wiring of this exact call
+    // is already covered elsewhere (build-inbox-poller.test.ts).
+    const daemonSide = buildChats(config);
+    daemonSide.membersCache.merge(CHAT, [{ id: 'aad-mika', displayName: 'Berggren, Mikael' }]);
+
+    // A LATER, INDEPENDENT construction — standing in for a fresh `teams-post` CLI process
+    // against the same .env, which is exactly what buildContext() in cli/common.ts does per
+    // invocation (loadConfig() then buildChats(config), no daemon reference passed between them).
+    const { calls } = countingMembersFetch(membersPage);
+    const failEverythingElse = vi.fn(async () => {
+      throw new Error('this test only exercises resolveMentions — nothing else should be called');
+    });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      if (String(url).includes('/members')) {
+        calls.push(String(url));
+        return membersPage();
+      }
+      return failEverythingElse(url, init);
+    }) as typeof fetch;
+    try {
+      const cliSide = buildChats(config);
+      vi.spyOn(cliSide.tokenProvider, 'getAccessToken').mockResolvedValue('fake-token');
+
+      const resolved = await cliSide.chats.resolveMentions(CHAT, ['Mika']);
+
+      expect(resolved).toEqual([{ name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' }]);
+      expect(calls).toHaveLength(0); // the CLI process never had to call /members itself
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
 
 // Mitigation 3 (docs/throttling-mitigation.md §4, stage 1 item 1): an unwired GraphClient `log`
