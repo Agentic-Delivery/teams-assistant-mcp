@@ -626,6 +626,89 @@ describe('doSendFile — one sendFile call per positional path, --caption applie
     expect(sendFile).toHaveBeenCalledTimes(2); // both were attempted; only the second failed
   });
 
+  // Review round 1 MAJOR 1 (fresh-context re-review of PR #24): doSendFile's 6th (sendOptions)
+  // parameter reaching chats.sendFile as its 4th argument was untested — deleting the `options,`
+  // forwarding argument left the full 571-test suite green. These two pin the exact shape.
+  it('MAJOR 1: forwards sendOptions.grantTo to sendFile as its 4th argument, untouched', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'teams-send-file-'));
+    const filePath = join(dir, 'a.txt');
+    writeFileSync(filePath, 'hello');
+    const sendFile = vi.fn(async () => stubMessage('f1'));
+    const chats = new ReliableTeamsChats(fakeFilePort({ sendFile }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    await doSendFile({ chats, allowlist }, '19:a@thread.v2', [filePath], undefined, () => {}, {
+      grantTo: ['aad-x', 'aad-y'],
+    });
+
+    expect(sendFile).toHaveBeenCalledWith(
+      '19:a@thread.v2',
+      { bytes: expect.any(Uint8Array), name: 'a.txt' },
+      undefined,
+      { grantTo: ['aad-x', 'aad-y'] },
+    );
+  });
+
+  it('MAJOR 1: forwards sendOptions.noGrant to sendFile as its 4th argument, untouched', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'teams-send-file-'));
+    const filePath = join(dir, 'a.txt');
+    writeFileSync(filePath, 'hello');
+    const sendFile = vi.fn(async () => stubMessage('f1'));
+    const chats = new ReliableTeamsChats(fakeFilePort({ sendFile }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    await doSendFile({ chats, allowlist }, '19:a@thread.v2', [filePath], undefined, () => {}, {
+      noGrant: true,
+    });
+
+    expect(sendFile).toHaveBeenCalledWith(
+      '19:a@thread.v2',
+      { bytes: expect.any(Uint8Array), name: 'a.txt' },
+      undefined,
+      { noGrant: true },
+    );
+  });
+
+  // Review round 1 MAJOR 2: the --no-grant stdout disclosure (granted:false + the "only the
+  // sender" note) had no test at the doSendFile level — `granted: !sendOptions.noGrant` was
+  // replaceable by a hardcoded `granted: true` with the suite still green.
+  it('MAJOR 2: --no-grant reports granted:false and the "only the sender" note on the streamed payload', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'teams-send-file-'));
+    const filePath = join(dir, 'a.txt');
+    writeFileSync(filePath, 'hello');
+    const sendFile = vi.fn(async () => stubMessage('f1'));
+    const chats = new ReliableTeamsChats(fakeFilePort({ sendFile }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+    const sent: unknown[] = [];
+
+    await doSendFile(
+      { chats, allowlist },
+      '19:a@thread.v2',
+      [filePath],
+      undefined,
+      (payload) => sent.push(payload),
+      { noGrant: true },
+    );
+
+    expect(sent).toEqual([
+      {
+        action: 'send-file',
+        id: 'f1',
+        chat: 'chat A',
+        name: 'a.txt',
+        bytes: 5,
+        granted: false,
+        note: expect.stringMatching(/only the sender can open/),
+      },
+    ]);
+  });
+
   // MINOR fix (2026-09-02 review, mutation-verified gap): a bare `.rejects.toThrow()` with no
   // matcher and a genuinely nonexistent path passes on ANY rejection, including readFile's own
   // ENOENT -- it does not actually prove the allowlist check ran BEFORE the filesystem read. A
