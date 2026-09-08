@@ -48,8 +48,8 @@ auto-update.
 
 ## teams-post --html --mention posting raw markup instead of refusing on an orphaned placeholder — investigated, not reproducible against 0.5.2, closed by hardening test coverage (reported live 2026-09-02, closed 2026-09-04, GH-14)
 
-Reported: `teams-post --html --mention "Kleivdal, Celine"` with the name written plainly in the
-html (no `@{Kleivdal, Celine}` token) reportedly posted the message as raw HTML text instead of
+Reported: `teams-post --html --mention "Nordqvist, Maja"` with the name written plainly in the
+html (no `@{Nordqvist, Maja}` token) reportedly posted the message as raw HTML text instead of
 refusing per the documented orphaned-mention contract (see the `@mentions` section above).
 
 **Investigated 2026-09-04, per pragmatic-tdd's "reproduce before theorising" rule — could not
@@ -130,7 +130,7 @@ symptom.
 The 24h members-cache TTL (`DEFAULT_MEMBERS_TTL_MS`, `src/graph/members-cache.ts`) does not bound
 staleness risk at the cost of one refresh under contention — it converts a working cached mention
 path into a PERMANENT hard dependency on the very endpoint it exists to avoid. Root-caused live
-(CTP daemon, `docs/throttling-mitigation.md` §1.2): the CTP agent-team chat's roster
+(deployment A daemon, `docs/throttling-mitigation.md` §1.2): the deployment A agent-team chat's roster
 (`fetchedAt` 2026-09-03T07:34:05Z) expired at 07:34:05Z the next day; the first throttled mention
 came ~07:45Z, eleven minutes later. The mechanism: TTL expiry turns `MembersCache.get()` into a
 miss → the miss triggers a `/members` refresh, the one endpoint sharing the crowded per-tenant

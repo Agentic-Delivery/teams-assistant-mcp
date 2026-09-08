@@ -83,15 +83,15 @@ A plain `<at id="N">Name</at>` tag in the body does NOT notify anyone — Graph 
 bell when the message also carries a parallel `mentions` array entry with the person's real AAD
 user id. `send_chat_message`, `reply_chat_message` and `edit_chat_message` all take an optional
 `mentions: string[]` — display names to actually notify, resolved case-insensitively as an
-unambiguous substring against the chat's current member list ("Shiv" matches "Garg, Shivankit").
+unambiguous substring against the chat's current member list ("Mika" matches "Berggren, Mikael").
 A name matching zero or more than one member is refused with a clear error; nothing is ever
 silently dropped.
 
 How the name gets placed depends on `format`:
 - `format: 'text'` (default): the mention's name must literally occur somewhere in your message
   text — that occurrence becomes the notifying tag. Just write the person's name where you mean
-  to mention them ("Shiv can you review this?").
-- `format: 'html'`: place a literal `@{Name}` token at each spot to mention (e.g. `@{Shiv}`); the
+  to mention them ("Mika can you review this?").
+- `format: 'html'`: place a literal `@{Name}` token at each spot to mention (e.g. `@{Mika}`); the
   server swaps it for the `<at>` tag. Every name in `mentions` needs a matching token and every
   token needs a declared mention, or the call is refused.
 

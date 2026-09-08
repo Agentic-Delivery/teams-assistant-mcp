@@ -12,7 +12,7 @@ attachment read refuses, or the inbox goes quiet for an hour. The failures are n
 they cluster on the endpoints we call *least*, which is the first clue about where the budget
 is actually being spent.
 
-**2026-09-04, CTP daemon** (poll interval 60 s, one signed-in user, three allowlisted chats).
+**2026-09-04, deployment A daemon** (poll interval 60 s, one signed-in user, three allowlisted chats).
 Every `--mention` post between ~07:45Z and ~08:05Z failed with
 
 ```
@@ -38,16 +38,16 @@ not.
 
 ### 1.2 The 2026-09-04 incident, root-caused
 
-The members cache on the CTP instance
-(`~/.teams-assistant-guidewire/.members-cache.json`) holds:
+The members cache on the deployment A instance
+(`~/.teams-assistant-<deployment>/.members-cache.json`) holds:
 
 | chat | roster `fetchedAt` | members |
 | --- | --- | --- |
-| `19:1120cc7c…` — CTP agent-team | 2026-09-03T07:34:05Z | 6 |
+| `19:1120cc7c…` — deployment A agent-team | 2026-09-03T07:34:05Z | 6 |
 | `19:8af48977…` — MCP dev test | 2026-09-01T11:42:20Z | 3 |
-| `19:7cfde672…` — Guidewire Management | **no entry, ever** | — |
+| `19:7cfde672…` — chat C | **no entry, ever** | — |
 
-`DEFAULT_MEMBERS_TTL_MS` is 24 h. The CTP agent-team roster therefore expired at
+`DEFAULT_MEMBERS_TTL_MS` is 24 h. The deployment A agent-team roster therefore expired at
 **2026-09-04T07:34:05Z**. The first throttled mention was ~07:45Z — **eleven minutes after the
 TTL ran out.** That is not a coincidence; it is the mechanism:
 
@@ -61,8 +61,8 @@ TTL ran out.** That is not a coincidence; it is the mechanism:
 
 So the 24 h TTL does not bound staleness risk at the cost of one refresh; under contention it
 converts a working cached path into a **permanent** hard dependency on the throttled endpoint.
-The third chat is worse still: it has no entry at all, so *every* mention into the Guidewire
-Management chat has always been a live `/members` call.
+The third chat is worse still: it has no entry at all, so *every* mention into chat C has
+always been a live `/members` call.
 
 ### 1.3 Our actual call volume — and why it cannot be the cause
 
@@ -76,8 +76,8 @@ or not anything is new). Steady-state:
 
 | caller | requests | per day |
 | --- | --- | --- |
-| CTP poller — 3 chats @ 60 s | 3 / min | 4 320 |
-| SRP poller — 4 chats @ 60 s | 4 / min | 5 760 |
+| deployment A poller — 3 chats @ 60 s | 3 / min | 4 320 |
+| deployment B poller — 4 chats @ 60 s | 4 / min | 5 760 |
 | `/me` | ~0 since 0.5.1 (persisted cache) | ~0 |
 | `/chats/{id}/members` | 1 per mention on a cache miss | single digits |
 | single-message GET | 1 per quoted reply / attachment read | single digits |
@@ -161,7 +161,7 @@ that convenience is exactly what put us in someone else's queue.
 
 The consequence, stated plainly:
 
-- **Per app per tenant (30 rps, default GETs):** inside If P&C's tenant, every other caller
+- **Per app per tenant (30 rps, default GETs):** inside the customer's tenant, every other caller
   presenting the Office client id draws on the *same* 30 rps allowance we do. We contribute three
   requests a minute to a pool sized for a whole tenant's Office estate. We do not control it, we
   cannot see it, and we cannot make it quieter.
@@ -253,7 +253,7 @@ is the delegated-compatible shadow of it, and it is a payload optimisation, not 
 | **`ChatMember.ReadWrite`** | **Yes** |
 
 So an own app registration that asks only for `Chat.ReadWrite`, `ChatMessage.Send` and `User.Read`
-needs **no Global Admin in If's tenant** under a default consent policy — the consultant consents
+needs **no Global Admin in the customer's tenant** under a default consent policy — the consultant consents
 for himself, once. The moment we also ask for `ChatMember.Read` we need a tenant admin, and the
 whole "no admin rights required" property collapses.
 
@@ -278,7 +278,7 @@ Two caveats on option 8 worth carrying to the owner:
   names — but Conditional Access has a dedicated **authentication-flows condition that blocks
   device code flow**, and Microsoft's own guidance recommends organisations block it by default
   ([block authentication flows](https://learn.microsoft.com/en-us/entra/identity/conditional-access/policy-block-authentication-flows)).
-  We cannot see If's CA posture from outside. **Build against authorization-code flow**, which
+  We cannot see the customer's CA posture from outside. **Build against authorization-code flow**, which
   that condition does not target.
 
 **Option 9 — push instead of polling — is available to us, contrary to what we assumed.**
@@ -315,12 +315,12 @@ is the install: at an insurer, org-wide custom app upload is very likely off, in
 only route is "submit a custom app for admin approval" — a path Microsoft guarantees always exists
 and cannot be disabled
 ([custom app policies](https://learn.microsoft.com/en-us/microsoftteams/teams-custom-app-policies-and-settings)),
-but which is a formal ask of If's IT and highly visible in the Teams admin centre.
+but which is a formal ask of the customer's IT and highly visible in the Teams admin centre.
 
 **On visibility, for the record.** Neither option 8 nor option 10 is covert, and neither should
 be. A consent creates a service principal in Enterprise Applications plus a `Consent to
 application` audit event; an app install appears in Teams admin centre → Manage apps. That is
-consistent with how we already work — nothing here gets done without If knowing it was done.
+consistent with how we already work — nothing here gets done without the customer knowing it was done.
 
 ## 4. Recommendation — a staged plan
 
@@ -345,30 +345,30 @@ consistent with how we already work — nothing here gets done without If knowin
    (`poller-health.json`, `src/inbox.ts`), and the single-instance lock (`poller-lock.ts`,
    `poller.lock`, keyed per inbox path via `inboxPathFor(env)`). This is the evidence source this
    plan's later stages read from.
-4. **Two knobs, immediately, while the above ships**: give the CTP and SRP daemons distinct
-   `TEAMS_MCP_CLIENT_ID` values (they are identical today — both `d3590ed6…`), and raise the CTP
+4. **Two knobs, immediately, while the above ships**: give the deployment A and deployment B daemons distinct
+   `TEAMS_MCP_CLIENT_ID` values (they are identical today — both `d3590ed6…`), and raise the deployment A
    poll interval to 180 s. Neither is a fix; both are free insurance against the sustained-83 %
    rule and the per-chat 1 rps ceiling.
 
-### Stage 2 — next, on Agentic Delivery's own account, still nothing asked of If
+### Stage 2 — next, on Agentic Delivery's own account, still nothing asked of the customer
 
 5. **Register `Agentic Delivery Teams Assistant`** as a multi-tenant Entra app in the Agentic
    Delivery tenant, requesting **only user-consentable delegated scopes**: `Chat.ReadWrite`,
    `ChatMessage.Send`, `User.Read`. Deliberately **not** `ChatMember.Read` — that one permission
-   is the difference between "the consultant consents for himself" and "we need If's Global
+   is the difference between "the consultant consents for himself" and "we need the customer's Global
    Admin".
 6. **Complete publisher verification** before anyone is asked to consent, or step-up consent will
    refuse the app regardless of how modest the scopes are.
 7. **Ship an authorization-code token provider** alongside `RopcTokenProvider`. The
    `TokenProvider` seam already exists for exactly this swap. Auth-code rather than device-code,
-   because CA can block device-code flow tenant-wide and we cannot see If's policy.
-8. **Prototype change-notification ingestion** against the SRP tenant first — our own risk, our
+   because CA can block device-code flow tenant-wide and we cannot see the customer's policy.
+8. **Prototype change-notification ingestion** against the deployment B tenant first — our own risk, our
    own tenant, no customer exposure — using Event Hubs delivery in Agentic Delivery's Azure
    subscription. This also settles the protected-API ambiguity empirically.
 
 ### Stage 3 — the one ask of the customer, made once, with the cost stated
 
-9. **Ask for consent to the Agentic Delivery app in If's tenant.** Under a default consent policy
+9. **Ask for consent to the Agentic Delivery app in the customer's tenant.** Under a default consent policy
    the consultant can consent for himself and no admin action is needed; if user consent is
    restricted, the admin-consent-request workflow exists and the ask is a single approval of three
    low-impact delegated scopes — not a Global Admin operation, not a tenant-wide grant. **This is
@@ -376,7 +376,7 @@ consistent with how we already work — nothing here gets done without If knowin
    designed so we survive comfortably until it lands.
 10. **Hold the bot-for-ingestion hybrid (option 10) in reserve.** Propose it only if, after stages
     1–2, reads are still being throttled — it is the strongest remaining lever but it costs a
-    formal app-approval request to If's IT and a permanent, highly visible artifact in their
+    formal app-approval request to the customer's IT and a permanent, highly visible artifact in their
     Teams admin centre. Not worth spending that goodwill before the cheaper moves are measured.
 
 **What we are explicitly not doing:** batching (no budget effect), one shared poller (the buckets
@@ -387,9 +387,9 @@ attribution).
 
 1. **Is a per-instance client id acceptable as an interim measure?** Both daemons currently
    present the Microsoft Office id. Splitting them is one env var, but it means two different
-   Microsoft first-party identities appearing in If's sign-in logs against the same account. Is
+   Microsoft first-party identities appearing in the customer's sign-in logs against the same account. Is
    that better or worse from the "everything we do wears your name" standpoint?
-2. **Who at If do we ask about consent policy and Conditional Access**, and do we ask before or
+2. **Who at the customer do we ask about consent policy and Conditional Access**, and do we ask before or
    after the app is registered and verified? Asking first is more honest; asking after means we
    arrive with something concrete rather than a hypothetical.
 3. **Is publisher verification available to Agentic Delivery today** — does it hold a Microsoft AI

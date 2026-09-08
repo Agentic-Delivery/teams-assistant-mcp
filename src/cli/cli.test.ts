@@ -202,12 +202,12 @@ describe('the CLI contract — exit codes, and nothing but the JSON line on stdo
   });
 
   it('teams-reply --mention: still gated by the allowlist exactly like a plain reply (exit 3, no network reached)', async () => {
-    // Same shape as the --html test above: proves --mention/"Shiv" are parsed as a flag+value
+    // Same shape as the --html test above: proves --mention/"Mika" are parsed as a flag+value
     // pair, not misread as positionals, without needing a live resolveMentions call. The
     // resolution/forwarding itself is proven in-process below (doReply).
     const result = await runCli(
       'reply.ts',
-      ['19:readonly@thread.v2', 'msg-1', '--mention', 'Shiv'],
+      ['19:readonly@thread.v2', 'msg-1', '--mention', 'Mika'],
       fixtureEnv(),
     );
 
@@ -346,7 +346,7 @@ describe('teams-post / teams-edit — the --html routing decision (in-process, n
 
   it('doPost with --mention resolves the name and forwards the resolved mention to sendMessage', async () => {
     const resolveMentions = vi.fn(async () => [
-      { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+      { name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' },
     ]);
     const sendMessage = vi.fn(async () => stubMessage('m3'));
     const chats = new ReliableTeamsChats(fakePort({ resolveMentions, sendMessage }), {
@@ -354,11 +354,11 @@ describe('teams-post / teams-edit — the --html routing decision (in-process, n
       sleepFn: async () => {},
     });
 
-    await doPost({ chats, allowlist }, '19:a@thread.v2', 'Shiv please review', false, ['Shiv']);
+    await doPost({ chats, allowlist }, '19:a@thread.v2', 'Mika please review', false, ['Mika']);
 
-    expect(resolveMentions).toHaveBeenCalledWith('19:a@thread.v2', ['Shiv']);
-    expect(sendMessage).toHaveBeenCalledWith('19:a@thread.v2', 'Shiv please review', [
-      { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+    expect(resolveMentions).toHaveBeenCalledWith('19:a@thread.v2', ['Mika']);
+    expect(sendMessage).toHaveBeenCalledWith('19:a@thread.v2', 'Mika please review', [
+      { name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' },
     ]);
   });
 
@@ -377,7 +377,7 @@ describe('teams-post / teams-edit — the --html routing decision (in-process, n
 
   it('doEdit with --mention resolves the name and forwards it to editMessage', async () => {
     const resolveMentions = vi.fn(async () => [
-      { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+      { name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' },
     ]);
     const editMessage = vi.fn(async () => undefined);
     const chats = new ReliableTeamsChats(fakePort({ resolveMentions, editMessage }), {
@@ -385,10 +385,10 @@ describe('teams-post / teams-edit — the --html routing decision (in-process, n
       sleepFn: async () => {},
     });
 
-    await doEdit({ chats, allowlist }, '19:a@thread.v2', 'msg-1', 'Shiv see above', false, ['Shiv']);
+    await doEdit({ chats, allowlist }, '19:a@thread.v2', 'msg-1', 'Mika see above', false, ['Mika']);
 
-    expect(editMessage).toHaveBeenCalledWith('19:a@thread.v2', 'msg-1', 'Shiv see above', [
-      { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+    expect(editMessage).toHaveBeenCalledWith('19:a@thread.v2', 'msg-1', 'Mika see above', [
+      { name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' },
     ]);
   });
 
@@ -396,7 +396,7 @@ describe('teams-post / teams-edit — the --html routing decision (in-process, n
   // and the port both support it on replies — a half-shipped surface.
   it('doReply with --mention resolves the name and forwards it to replyToMessage', async () => {
     const resolveMentions = vi.fn(async () => [
-      { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+      { name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' },
     ]);
     const replyToMessage = vi.fn(async () => stubMessage('r1'));
     const chats = new ReliableTeamsChats(fakePort({ resolveMentions, replyToMessage }), {
@@ -404,11 +404,11 @@ describe('teams-post / teams-edit — the --html routing decision (in-process, n
       sleepFn: async () => {},
     });
 
-    const result = await doReply({ chats, allowlist }, '19:a@thread.v2', 'orig-1', 'Shiv can you confirm?', ['Shiv']);
+    const result = await doReply({ chats, allowlist }, '19:a@thread.v2', 'orig-1', 'Mika can you confirm?', ['Mika']);
 
-    expect(resolveMentions).toHaveBeenCalledWith('19:a@thread.v2', ['Shiv']);
-    expect(replyToMessage).toHaveBeenCalledWith('19:a@thread.v2', 'orig-1', 'Shiv can you confirm?', [
-      { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+    expect(resolveMentions).toHaveBeenCalledWith('19:a@thread.v2', ['Mika']);
+    expect(replyToMessage).toHaveBeenCalledWith('19:a@thread.v2', 'orig-1', 'Mika can you confirm?', [
+      { name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' },
     ]);
     expect(result).toEqual({ action: 'reply', id: 'r1', inReplyTo: 'orig-1', chat: 'chat A' });
   });
@@ -684,21 +684,21 @@ describe('parseSendFlags — --html and repeatable --mention', () => {
   });
 
   it('collects one --mention', () => {
-    expect(parseSendFlags(['--mention', 'Shiv'])).toEqual({ html: false, mentions: ['Shiv'], rest: [] });
+    expect(parseSendFlags(['--mention', 'Mika'])).toEqual({ html: false, mentions: ['Mika'], rest: [] });
   });
 
   it('collects several repeated --mention flags, in order', () => {
-    expect(parseSendFlags(['--mention', 'Shiv', '--mention', 'Johan'])).toEqual({
+    expect(parseSendFlags(['--mention', 'Mika', '--mention', 'Johan'])).toEqual({
       html: false,
-      mentions: ['Shiv', 'Johan'],
+      mentions: ['Mika', 'Johan'],
       rest: [],
     });
   });
 
   it('mixes --html and --mention in any order', () => {
-    expect(parseSendFlags(['--mention', 'Shiv', '--html'])).toEqual({
+    expect(parseSendFlags(['--mention', 'Mika', '--html'])).toEqual({
       html: true,
-      mentions: ['Shiv'],
+      mentions: ['Mika'],
       rest: [],
     });
   });
@@ -1150,8 +1150,8 @@ describe('teams-read — attachment metadata in the output (0.5.0: a file used t
 
   it('doRead includes id/name/contentType when a message carries attachments, and omits the field when not', async () => {
     const messages: ChatMessage[] = [
-      { id: 'm1', chatId: '19:r@thread.v2', createdDateTime: '2026-09-02T08:00:00Z', from: 'Celine', text: 'plain', isDeleted: false, attachments: [] },
-      { id: 'm2', chatId: '19:r@thread.v2', createdDateTime: '2026-09-02T08:01:00Z', from: 'Celine', text: 'file attached', isDeleted: false,
+      { id: 'm1', chatId: '19:r@thread.v2', createdDateTime: '2026-09-02T08:00:00Z', from: 'Maja', text: 'plain', isDeleted: false, attachments: [] },
+      { id: 'm2', chatId: '19:r@thread.v2', createdDateTime: '2026-09-02T08:01:00Z', from: 'Maja', text: 'file attached', isDeleted: false,
         attachments: [{ id: 'att-1', name: 'plan.xlsx', contentType: 'reference', contentUrl: 'https://x/p' }] },
     ];
     const readMessages = vi.fn(async () => ({ messages }) as ReadResult);
@@ -1294,14 +1294,14 @@ describe('teams-post / teams-edit --html --mention — the orphaned-mention refu
     const graph = new GraphClient({ tokenProvider: stubToken, fetchFn });
     const dir = mkdtempSync(join(tmpdir(), 'teams-gh14-members-'));
     const cache = new MembersCache({ path: join(dir, 'members.json') });
-    cache.set('19:a@thread.v2', [{ id: 'aad-celine', displayName: 'Kleivdal, Celine' }]);
+    cache.set('19:a@thread.v2', [{ id: 'aad-maja', displayName: 'Nordqvist, Maja' }]);
     return new ReliableTeamsChats(new GraphTeamsChats(graph, { membersCache: cache }), {
       selfDisplayName: 'Assistant',
       sleepFn: async () => {},
     });
   }
 
-  it('GH-14d: doPost --html --mention "Kleivdal, Celine" (name written plainly, no @{} token) refuses BEFORE any send', async () => {
+  it('GH-14d: doPost --html --mention "Nordqvist, Maja" (name written plainly, no @{} token) refuses BEFORE any send', async () => {
     const fetchFn = vi.fn(async () => {
       throw new Error('must never be called — the refusal must happen before any Graph request');
     });
@@ -1311,15 +1311,15 @@ describe('teams-post / teams-edit --html --mention — the orphaned-mention refu
       doPost(
         { chats, allowlist },
         '19:a@thread.v2',
-        '<p>Please review Kleivdal, Celine</p>',
+        '<p>Please review Nordqvist, Maja</p>',
         true,
-        ['Kleivdal, Celine'],
+        ['Nordqvist, Maja'],
       ),
     ).rejects.toThrow(/no @\{Name\}-style placeholder/);
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
-  it('GH-14e: doEdit --html --mention "Kleivdal, Celine" (name written plainly, no @{} token) refuses BEFORE any send — same guard on the edit path', async () => {
+  it('GH-14e: doEdit --html --mention "Nordqvist, Maja" (name written plainly, no @{} token) refuses BEFORE any send — same guard on the edit path', async () => {
     const fetchFn = vi.fn(async () => {
       throw new Error('must never be called — the refusal must happen before any Graph request');
     });
@@ -1330,9 +1330,9 @@ describe('teams-post / teams-edit --html --mention — the orphaned-mention refu
         { chats, allowlist },
         '19:a@thread.v2',
         'msg-1',
-        '<p>Please review Kleivdal, Celine</p>',
+        '<p>Please review Nordqvist, Maja</p>',
         true,
-        ['Kleivdal, Celine'],
+        ['Nordqvist, Maja'],
       ),
     ).rejects.toThrow(/no @\{Name\}-style placeholder/);
     expect(fetchFn).not.toHaveBeenCalled();
@@ -1351,9 +1351,9 @@ describe('teams-post / teams-edit --html --mention — the orphaned-mention refu
     const result = await doPost(
       { chats, allowlist },
       '19:a@thread.v2',
-      '<p>Please review @{Kleivdal, Celine}</p>',
+      '<p>Please review @{Nordqvist, Maja}</p>',
       true,
-      ['Kleivdal, Celine'],
+      ['Nordqvist, Maja'],
     );
 
     expect(result).toEqual({ action: 'post', id: 'sent-1', chat: 'chat A' });

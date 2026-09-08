@@ -66,11 +66,11 @@ const mentionsSchema = z
   .describe(
     'Display names to @mention so those people are actually NOTIFIED, not just referenced. ' +
       'Each name is matched case-insensitively as an unambiguous substring against the chat\'s ' +
-      'member list (e.g. "Shiv" matches "Garg, Shivankit"); a name matching zero or more than ' +
+      'member list (e.g. "Mika" matches "Berggren, Mikael"); a name matching zero or more than ' +
       'one member is refused, never silently dropped. format "text" (default): each mention\'s ' +
       'name must literally occur somewhere in the message text — that occurrence becomes the ' +
       'notifying tag, so just write the person\'s name where you mean to mention them. format ' +
-      '"html": place a literal `@{Name}` token (e.g. `@{Shiv}`) at each spot to mention; every ' +
+      '"html": place a literal `@{Name}` token (e.g. `@{Mika}`) at each spot to mention; every ' +
       'name in `mentions` needs a matching `@{Name}` token in the html and every token needs a ' +
       'matching name in `mentions`, or the call is refused. Only mention people who need to ACT ' +
       '— an owner, a question addressed to them — never everyone named in passing.',

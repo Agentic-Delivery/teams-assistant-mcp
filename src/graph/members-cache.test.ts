@@ -7,7 +7,7 @@ import { DEFAULT_MEMBERS_TTL_MS, MembersCache } from './members-cache.js';
 
 const CHAT = '19:pilot@thread.v2';
 const members = [
-  { id: 'aad-1', displayName: 'Garg, Shivankit' },
+  { id: 'aad-1', displayName: 'Berggren, Mikael' },
   { id: 'aad-2', displayName: 'Spännare, Johan' },
 ];
 
@@ -161,28 +161,28 @@ describe('MembersCache — disk-persisted, per-chat, TTL-bounded (0.4.1)', () =>
       let clock = 123;
       const cache = new MembersCache({ path, now: () => clock });
 
-      cache.merge(CHAT, [{ id: 'aad-1', displayName: 'Garg, Shivankit' }]);
+      cache.merge(CHAT, [{ id: 'aad-1', displayName: 'Berggren, Mikael' }]);
 
-      expect(cache.get(CHAT)).toEqual([{ id: 'aad-1', displayName: 'Garg, Shivankit' }]);
+      expect(cache.get(CHAT)).toEqual([{ id: 'aad-1', displayName: 'Berggren, Mikael' }]);
       expect(cache.getComplete(CHAT)).toBeUndefined();
       expect(cache.getStaleComplete(CHAT)).toBeUndefined();
       // fetchedAt: 0, not omitted — the 0.5.1-compatible "instantly expired, but shape-valid"
       // marker (MembersCacheEntry.fetchedAt's own doc comment); harvestedAt carries the real time.
       expect(cache.getStale(CHAT)).toEqual({
-        members: [{ id: 'aad-1', displayName: 'Garg, Shivankit' }],
+        members: [{ id: 'aad-1', displayName: 'Berggren, Mikael' }],
         fetchedAt: 0,
       });
     });
 
     it('adds a newly-seen sender to an existing roster without dropping the members already cached', () => {
       const cache = new MembersCache({ path });
-      cache.set(CHAT, [{ id: 'aad-1', displayName: 'Garg, Shivankit' }]);
+      cache.set(CHAT, [{ id: 'aad-1', displayName: 'Berggren, Mikael' }]);
 
       cache.merge(CHAT, [{ id: 'aad-2', displayName: 'Spännare, Johan' }]);
 
       expect(cache.get(CHAT)).toEqual(
         expect.arrayContaining([
-          { id: 'aad-1', displayName: 'Garg, Shivankit' },
+          { id: 'aad-1', displayName: 'Berggren, Mikael' },
           { id: 'aad-2', displayName: 'Spännare, Johan' },
         ]),
       );
@@ -191,26 +191,26 @@ describe('MembersCache — disk-persisted, per-chat, TTL-bounded (0.4.1)', () =>
     it('BLOCKER-1: a merge into an already-COMPLETE (set()) roster keeps it COMPLETE and keeps its ORIGINAL fetchedAt — traffic does not extend the grant-path freshness window', () => {
       let clock = 0;
       const cache = new MembersCache({ path, ttlMs: 1000, now: () => clock });
-      cache.set(CHAT, [{ id: 'aad-1', displayName: 'Garg, Shivankit' }]); // fetchedAt stamped at clock=0
+      cache.set(CHAT, [{ id: 'aad-1', displayName: 'Berggren, Mikael' }]); // fetchedAt stamped at clock=0
       clock = 999; // just inside the TTL
 
-      cache.merge(CHAT, [{ id: 'aad-1', displayName: 'Garg, Shivankit' }]);
+      cache.merge(CHAT, [{ id: 'aad-1', displayName: 'Berggren, Mikael' }]);
       clock = 1500; // past the TTL measured from the ORIGINAL fetchedAt (0) — merge must not have moved it
 
       // Before the fix this stayed fresh forever (merge() restamped fetchedAt to 999). Now the
       // COMPLETE roster expires on its OWN real-fetch schedule, unaffected by the reconfirming merge.
       expect(cache.getComplete(CHAT)).toBeUndefined();
       // get() (mention resolution) DOES still count the merge's harvestedAt as fresh evidence.
-      expect(cache.get(CHAT)).toEqual([{ id: 'aad-1', displayName: 'Garg, Shivankit' }]);
+      expect(cache.get(CHAT)).toEqual([{ id: 'aad-1', displayName: 'Berggren, Mikael' }]);
     });
 
     it('a departed member is not kept in a PARTIAL roster\'s grant path forever: getComplete() never serves a partial entry regardless of how recently traffic confirmed it', () => {
       let clock = 0;
       const cache = new MembersCache({ path, now: () => clock });
-      cache.merge(CHAT, [{ id: 'aad-1', displayName: 'Garg, Shivankit' }]);
+      cache.merge(CHAT, [{ id: 'aad-1', displayName: 'Berggren, Mikael' }]);
       clock = 1; // freshly harvested a moment ago — get() would happily serve this
 
-      expect(cache.get(CHAT)).toEqual([{ id: 'aad-1', displayName: 'Garg, Shivankit' }]);
+      expect(cache.get(CHAT)).toEqual([{ id: 'aad-1', displayName: 'Berggren, Mikael' }]);
       expect(cache.getComplete(CHAT)).toBeUndefined();
     });
 
@@ -279,7 +279,7 @@ describe('MembersCache — disk-persisted, per-chat, TTL-bounded (0.4.1)', () =>
 
     it('getStaleComplete() refuses a PARTIAL (harvest-only) entry even though getStale() would serve it', () => {
       const cache = new MembersCache({ path });
-      cache.merge(CHAT, [{ id: 'aad-1', displayName: 'Garg, Shivankit' }]);
+      cache.merge(CHAT, [{ id: 'aad-1', displayName: 'Berggren, Mikael' }]);
 
       expect(cache.getStale(CHAT)).toBeDefined();
       expect(cache.getStaleComplete(CHAT)).toBeUndefined();

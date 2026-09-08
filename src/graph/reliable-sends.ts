@@ -143,7 +143,7 @@ export class ReliableTeamsChats implements TeamsChatsPort {
 
   sendMessage(chatId: string, text: string, mentions: readonly MentionTarget[] = []): Promise<ChatMessage> {
     // A mention rewrites its occurrence in the text into an <at> tag whose readback shows the
-    // RESOLVED displayName ("Garg, Shivankit"), not the caller's search string ("Shiv") — so the
+    // RESOLVED displayName ("Berggren, Mikael"), not the caller's search string ("Mika") — so the
     // match key has to be built the same way the actual send will render it (renderTextWithMentions,
     // reduced through htmlToText same as any html readback), or a landed mention-bearing send would
     // never match its own readback and retry into a real duplicate. Mirrors sendHtmlMessage's own
