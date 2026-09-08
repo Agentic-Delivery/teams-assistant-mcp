@@ -16,6 +16,7 @@ import type {
   OutboundFile,
   OutboundImage,
   PinnedMessage,
+  SendFileOptions,
   TeamsChatsPort,
 } from './graph/teams-chats.js';
 import { renderHtmlWithMentions, resolveMentionTargets } from './graph/mentions.js';
@@ -154,7 +155,12 @@ class FakeTeamsChats implements TeamsChatsPort {
   }
 
   readonly sentImages: Array<{ chatId: string; image: OutboundImage; text?: string }> = [];
-  readonly sentFiles: Array<{ chatId: string; file: OutboundFile; text?: string }> = [];
+  readonly sentFiles: Array<{
+    chatId: string;
+    file: OutboundFile;
+    text?: string;
+    options?: SendFileOptions;
+  }> = [];
 
   async sendImage(chatId: string, image: OutboundImage, text?: string) {
     this.sentImages.push({ chatId, image, ...(text !== undefined ? { text } : {}) });
@@ -164,8 +170,13 @@ class FakeTeamsChats implements TeamsChatsPort {
     );
   }
 
-  async sendFile(chatId: string, file: OutboundFile, text?: string) {
-    this.sentFiles.push({ chatId, file, ...(text !== undefined ? { text } : {}) });
+  async sendFile(chatId: string, file: OutboundFile, text?: string, options?: SendFileOptions) {
+    this.sentFiles.push({
+      chatId,
+      file,
+      ...(text !== undefined ? { text } : {}),
+      ...(options !== undefined ? { options } : {}),
+    });
     return toChatMessage(
       { id: 'file-1', chatId, createdDateTime: '2026-08-19T10:00:00Z', body: { content: '' } },
       chatId,
@@ -861,6 +872,48 @@ describe('send_chat_file', () => {
 
     expect(result.isError).toBe(true);
     expect(chats.sentFiles).toEqual([]);
+  });
+
+  // 0.6.0, live 2026-09-08: grantTo/noGrant on the MCP tool — the same escape hatch the CLI's
+  // --grant-to/--no-grant give, threaded through as sendFile's options argument.
+  it('grantTo is forwarded to sendFile as options.grantTo, untouched', async () => {
+    const path = join(downloadDir, 'note2.txt');
+    writeFileSync(path, 'hi');
+
+    const result = await call(client, 'send_chat_file', {
+      chatId: PILOT,
+      path,
+      grantTo: ['aad-explicit-1', 'aad-explicit-2'],
+    });
+
+    expect(result.isError).toBe(false);
+    expect(chats.sentFiles).toHaveLength(1);
+    expect(chats.sentFiles[0]?.options).toEqual({ grantTo: ['aad-explicit-1', 'aad-explicit-2'] });
+  });
+
+  it('noGrant is forwarded to sendFile as options.noGrant, and the tool result says so', async () => {
+    const path = join(downloadDir, 'note3.txt');
+    writeFileSync(path, 'hi');
+
+    const result = await call(client, 'send_chat_file', { chatId: PILOT, path, noGrant: true });
+
+    expect(result.isError).toBe(false);
+    expect(chats.sentFiles[0]?.options).toEqual({ noGrant: true });
+    const json = result.json() as { granted: boolean; note?: string };
+    expect(json.granted).toBe(false);
+    expect(json.note).toMatch(/only the sender can open/);
+  });
+
+  it('the default path (neither grantTo nor noGrant) reports granted: true and forwards no options', async () => {
+    const path = join(downloadDir, 'note4.txt');
+    writeFileSync(path, 'hi');
+
+    const result = await call(client, 'send_chat_file', { chatId: PILOT, path });
+
+    expect(result.isError).toBe(false);
+    expect(chats.sentFiles[0]?.options).toBeUndefined();
+    const json = result.json() as { granted: boolean };
+    expect(json.granted).toBe(true);
   });
 });
 
