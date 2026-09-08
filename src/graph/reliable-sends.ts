@@ -161,26 +161,7 @@ export class ReliableTeamsChats implements TeamsChatsPort {
   }
 
   sendHtmlMessage(chatId: string, html: string, mentions: readonly MentionTarget[] = []): Promise<ChatMessage> {
-    // renderHtmlWithMentions is pure and deterministic, so recomputing it here (rather than
-    // threading the rendered string through) costs nothing and keeps this class ignorant of the
-    // send stack's inner shape — same reasoning as sendMessage above, applied before htmlMatchText.
-    const rendered = mentions.length > 0 ? renderHtmlWithMentions(html, mentions) : html;
-    const matchText = htmlMatchText(rendered);
-    if (normalized(matchText) === '') {
-      // html like '<img src="...">' or '<hr>' reduces to no text at all — there is no readback
-      // key to guard with. Worse than merely "no retry": an EMPTY wanted string is a match
-      // against EVERY candidate whose own text also reduces to empty (findLandedCopy compares
-      // by equality), so a genuinely failed send could claim an EARLIER own message — an
-      // unrelated image, say — sent minutes ago as "this attempt's landed copy". Same shape as
-      // sendImage's own comment below: one attempt, honest error, no blind retry.
-      return this.inner.sendHtmlMessage(chatId, html, mentions);
-    }
-    // sendGuarded's second argument is the MATCH text, not necessarily what gets posted: a
-    // landed copy's readback always comes back as htmlToText(body) (toChatMessage runs every
-    // html body through it — see messages.ts), so comparing raw markup against that readback
-    // would never match and every retry would re-post a duplicate. htmlMatchText reduces the
-    // caller's html the same way (see its own doc comment for the empirically-found subtlety).
-    return this.sendGuarded(chatId, matchText, 'whole-message', () =>
+    return this.guardedHtmlSend(chatId, html, mentions, 'whole-message', () =>
       this.inner.sendHtmlMessage(chatId, html, mentions),
     );
   }
@@ -212,11 +193,10 @@ export class ReliableTeamsChats implements TeamsChatsPort {
   }
 
   /**
-   * Reply --html parity (0.6.x): same htmlMatchText reduction as sendHtmlMessage above (a
-   * landed copy's readback always comes back through htmlToText — see that method's own
-   * comment), but matched with the 'reply-tail' shape (ends-with, not equality) — same reason
-   * as replyToMessage above: the quote card's own preview text sits BEFORE our content in the
-   * readback.
+   * Reply --html parity (0.6.x): same htmlMatchText reduction and empty-match-text hazard as
+   * sendHtmlMessage — see guardedHtmlSend's own doc comment — but matched with the 'reply-tail'
+   * shape (ends-with, not equality), same reason as replyToMessage above: the quote card's own
+   * preview text sits BEFORE our content in the readback.
    */
   replyToHtmlMessage(
     chatId: string,
@@ -224,14 +204,7 @@ export class ReliableTeamsChats implements TeamsChatsPort {
     html: string,
     mentions: readonly MentionTarget[] = [],
   ): Promise<ChatMessage> {
-    const rendered = mentions.length > 0 ? renderHtmlWithMentions(html, mentions) : html;
-    const matchText = htmlMatchText(rendered);
-    if (normalized(matchText) === '') {
-      // Same empty-match-text hazard as sendHtmlMessage above: no readback key to guard with,
-      // so one honest attempt rather than a retry that could claim an unrelated earlier reply.
-      return this.inner.replyToHtmlMessage(chatId, replyToMessageId, html, mentions);
-    }
-    return this.sendGuarded(chatId, matchText, 'reply-tail', () =>
+    return this.guardedHtmlSend(chatId, html, mentions, 'reply-tail', () =>
       this.inner.replyToHtmlMessage(chatId, replyToMessageId, html, mentions),
     );
   }
@@ -298,10 +271,45 @@ export class ReliableTeamsChats implements TeamsChatsPort {
   }
 
   /**
+   * Shared guard for every raw-HTML write with a readback hazard (sendHtmlMessage,
+   * replyToHtmlMessage) — extracted (review round 1 MAJOR 1) so the empty-match-text case below
+   * is proven once, for both callers, instead of being reimplemented (and separately, unevenly,
+   * tested) per method.
+   *
+   * `rendered` (mentions substituted via renderHtmlWithMentions — pure and deterministic, so
+   * recomputing it here rather than threading it through costs nothing) is reduced through
+   * htmlMatchText the same way a landed copy's own readback will be (toChatMessage runs every
+   * html body through htmlToText — see messages.ts; htmlMatchText's own doc comment covers the
+   * empirically-found table-boundary subtlety).
+   *
+   * html like `<img src="...">` or `<hr>` (or a reply carrying only one of those) reduces to no
+   * text at all — there is no readback key to guard with. Worse than merely "no retry": an EMPTY
+   * wanted string is a match against EVERY candidate whose own text also reduces to empty
+   * (findLandedCopy compares by equality/endsWith), so a genuinely failed send/reply could claim
+   * an EARLIER own message — an unrelated image, say — sent minutes ago as "this attempt's
+   * landed copy". Same shape as sendImage's own comment below: one attempt, honest error, no
+   * blind retry.
+   */
+  private guardedHtmlSend(
+    chatId: string,
+    html: string,
+    mentions: readonly MentionTarget[],
+    shape: MatchShape,
+    doSend: () => Promise<ChatMessage>,
+  ): Promise<ChatMessage> {
+    const rendered = mentions.length > 0 ? renderHtmlWithMentions(html, mentions) : html;
+    const matchText = htmlMatchText(rendered);
+    if (normalized(matchText) === '') {
+      return doSend();
+    }
+    return this.sendGuarded(chatId, matchText, shape, doSend);
+  }
+
+  /**
    * matchText is what the readback is compared against, not necessarily what doSend actually
-   * posts: for a plain send it IS the sent text, but sendHtmlMessage passes htmlToText(html)
+   * posts: for a plain send it IS the sent text, but guardedHtmlSend passes htmlToText(html)
    * here because a landed copy's readback always comes back through that same converter (see
-   * sendHtmlMessage's own comment). Keeping the two separate is what lets one guard mechanism
+   * guardedHtmlSend's own comment). Keeping the two separate is what lets one guard mechanism
    * serve both formats honestly.
    */
   private async sendGuarded(

@@ -309,6 +309,13 @@ describe('teams chats over graph', () => {
       body: { contentType: string; content: string };
       attachments: Array<{ id: string; contentType: string; content: string }>;
     };
+    // Review round 1 MINOR: closes a pre-existing gap — the outgoing POST's own contentType was
+    // never asserted here. It is 'html' even on this plain-text-input path (same "Always HTML"
+    // doctrine as sendMessage/sendImage above: a 'text' body renders as one unbroken blob, no
+    // line breaks or clickable links — see sendMessage's own comment in teams-chats.ts), not
+    // 'text' — this is content-agnostic wire behaviour, unrelated to the format:'text'/'html'
+    // input choice this reply --html parity work adds.
+    expect(body.body.contentType).toBe('html');
     expect(body.body.content).toContain('<attachment id="orig-1">');
     expect(body.body.content).toContain('In the ai-test folder');
     expect(body.attachments[0]?.id).toBe('orig-1');
@@ -352,6 +359,7 @@ describe('teams chats over graph', () => {
       body: { contentType: string; content: string };
       attachments: Array<{ id: string; contentType: string; content: string }>;
     };
+    expect(body.body.contentType).toBe('html');
     // Verbatim: no <p> wrapping added, the caller's own <b> markup survives untouched.
     expect(body.body.content).toBe('<attachment id="orig-1"></attachment><b>In the ai-test folder</b>');
     expect(body.attachments[0]?.id).toBe('orig-1');

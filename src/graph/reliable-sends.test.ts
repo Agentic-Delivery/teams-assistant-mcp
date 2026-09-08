@@ -854,6 +854,33 @@ describe('reliable sends — html reply format: readback dedup compares TEXT, no
     expect(inner.replyToHtmlMessage).toHaveBeenCalledTimes(1);
   });
 
+  // Review round 1 MAJOR 1: mirrors sendHtmlMessage's own "image/hr-only" test above — same
+  // hazard, through the reply door. Before guardedHtmlSend existed, replyToHtmlMessage recomputed
+  // this empty-match-text check itself and this specific case had no test: deleting the check was
+  // green. An empty match key equality/endsWith-matches ANY earlier own message whose text also
+  // reduces to empty (an unrelated reply carrying only an image, say) — a genuine failure on a
+  // mid-flight POST would be reported as success with THAT message's id via findLandedCopy.
+  it('an html reply that reduces to no text at all (image/hr-only) gets no guard: one attempt, the reply failure itself, no readback', async () => {
+    const earlierEmpty = message({
+      id: 'earlier-empty-reply',
+      text: '',
+      createdDateTime: '2026-08-25T05:59:50Z', // inside the attempt window
+    });
+    const replyToHtmlMessage = vi.fn(async () => {
+      throw new GraphError('hang up', 0);
+    });
+    const readMessages = vi.fn(async () => ({ messages: [earlierEmpty] }) as unknown as ReadResult);
+    const inner = portWith({ replyToHtmlMessage, readMessages });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
+
+    await expect(
+      chats.replyToHtmlMessage('19:a@thread.v2', 'orig-1', '<img src="https://example.test/x.png">'),
+    ).rejects.toThrow(/hang up/);
+
+    expect(readMessages).not.toHaveBeenCalled(); // no blind readback against an empty match key
+    expect(replyToHtmlMessage).toHaveBeenCalledTimes(1); // one attempt, never a retry
+  });
+
   it('a short html reply is not satisfied by the quoted ORIGINAL containing the same words (reply-tail shape, not whole-message)', async () => {
     // Same hazard as replyToMessage's own "not satisfied by the quoted ORIGINAL" test above,
     // through the html door: the guard must use the 'reply-tail' shape (ends-with), never

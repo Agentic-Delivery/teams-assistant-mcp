@@ -26,7 +26,7 @@ text; reach for styling when the content has structure a reader must scan:
 
 | Content | Format |
 |---|---|
-| Short conversational reply, answer to a question | Plain text — no styling |
+| Short conversational reply, answer to a question (1–2 sentences) | Plain text — no styling |
 | Medium answer to a person (3–8 sentences, usually with an ask) | HTML: one `<b>` lead line, `<div>&nbsp;</div>` air between ideas, bullets for parallel items, the question/ask on its own last line — never a plain-text paragraph block |
 | Comparison across items with SHORT cells (ids, labels, verdicts, numbers) | `<table>` — never plain-text pipe walls |
 | Findings with prose explanations | Headed sections, NOT a table: one `<b>` heading line per item, `<ul>` bullets under it, a bold `→ Fix:`/`→ Action:` closing bullet |
