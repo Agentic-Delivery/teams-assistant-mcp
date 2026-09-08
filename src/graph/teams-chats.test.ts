@@ -21,7 +21,7 @@ function json(body: unknown, status = 200, headers: Record<string, string> = {})
 function membersPage(): Response {
   return json({
     value: [
-      { userId: 'aad-shiv', displayName: 'Garg, Shivankit' },
+      { userId: 'aad-mika', displayName: 'Berggren, Mikael' },
       { userId: 'aad-johan', displayName: 'Spännare, Johan' },
     ],
   });
@@ -62,15 +62,15 @@ describe('GraphTeamsChats.resolveMentions — member cache (0.4.1, live-diagnose
   it('resolves a mention straight from a pre-warmed cache — ZERO calls to /members', async () => {
     const cache = new MembersCache({ path });
     cache.set(CHAT, [
-      { id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+      { id: 'aad-mika', displayName: 'Berggren, Mikael' },
       { id: 'aad-johan', displayName: 'Spännare, Johan' },
     ]);
     const { fetchFn, calls } = countingMembersFetch(membersPage);
     const chats = subject(fetchFn as unknown as typeof fetch, cache);
 
-    const resolved = await chats.resolveMentions(CHAT, ['Shiv']);
+    const resolved = await chats.resolveMentions(CHAT, ['Mika']);
 
-    expect(resolved).toEqual([{ name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' }]);
+    expect(resolved).toEqual([{ name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' }]);
     expect(calls).toHaveLength(0);
   });
 
@@ -79,13 +79,13 @@ describe('GraphTeamsChats.resolveMentions — member cache (0.4.1, live-diagnose
     const { fetchFn, calls } = countingMembersFetch(membersPage);
     const chats = subject(fetchFn as unknown as typeof fetch, cache);
 
-    const resolved = await chats.resolveMentions(CHAT, ['Shiv']);
+    const resolved = await chats.resolveMentions(CHAT, ['Mika']);
 
-    expect(resolved).toEqual([{ name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' }]);
+    expect(resolved).toEqual([{ name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' }]);
     expect(calls).toHaveLength(1);
     // The refresh's result is now on disk — a second resolution needs no further call.
     expect(cache.get(CHAT)).toEqual([
-      { id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+      { id: 'aad-mika', displayName: 'Berggren, Mikael' },
       { id: 'aad-johan', displayName: 'Spännare, Johan' },
     ]);
   });
@@ -97,15 +97,15 @@ describe('GraphTeamsChats.resolveMentions — member cache (0.4.1, live-diagnose
     const { fetchFn } = countingMembersFetch(() => json({ value: [] }));
     const chats = subject(fetchFn as unknown as typeof fetch, cache);
 
-    await expect(chats.resolveMentions(CHAT, ['Shiv'])).rejects.toThrow(
-      /No chat member matches mention "Shiv"/,
+    await expect(chats.resolveMentions(CHAT, ['Mika'])).rejects.toThrow(
+      /No chat member matches mention "Mika"/,
     );
     expect(cache.get(CHAT)).toBeUndefined();
   });
 
   it('a name the cache does not have refreshes once, then still fails with the existing clear error', async () => {
     const cache = new MembersCache({ path });
-    cache.set(CHAT, [{ id: 'aad-shiv', displayName: 'Garg, Shivankit' }]);
+    cache.set(CHAT, [{ id: 'aad-mika', displayName: 'Berggren, Mikael' }]);
     const { fetchFn, calls } = countingMembersFetch(membersPage); // fresh list still has no "Nobody"
     const chats = subject(fetchFn as unknown as typeof fetch, cache);
 
@@ -127,7 +127,7 @@ describe('GraphTeamsChats.resolveMentions — member cache (0.4.1, live-diagnose
     );
     const chats = subject(fetchFn as unknown as typeof fetch, cache);
 
-    const error = await chats.resolveMentions(CHAT, ['Shiv']).catch((caught: unknown) => caught);
+    const error = await chats.resolveMentions(CHAT, ['Mika']).catch((caught: unknown) => caught);
 
     expect(error).toBeInstanceOf(GraphError);
     expect((error as GraphError).status).toBe(429);
@@ -158,7 +158,7 @@ describe('GraphTeamsChats.resolveMentions — member cache (0.4.1, live-diagnose
     );
     const chats = subject(fetchFn as unknown as typeof fetch, cache);
 
-    const error = await chats.resolveMentions(CHAT, ['Shiv']).catch((caught: unknown) => caught);
+    const error = await chats.resolveMentions(CHAT, ['Mika']).catch((caught: unknown) => caught);
 
     expect((error as GraphError).throttleScope).toBe('Tenant_Application');
     expect((error as GraphError).message).toContain('Tenant_Application');
@@ -170,19 +170,19 @@ describe('GraphTeamsChats.resolveMentions — member cache (0.4.1, live-diagnose
   it('an ambiguous name against the cached roster rethrows immediately — no refresh call spent on a caller error', async () => {
     const cache = new MembersCache({ path });
     cache.set(CHAT, [
-      { id: 'aad-shiv', displayName: 'Garg, Shivankit' },
-      { id: 'aad-shiv2', displayName: 'Shivam, Kumar' },
+      { id: 'aad-mika', displayName: 'Berggren, Mikael' },
+      { id: 'aad-mika2', displayName: 'Mikaelsen, Trond' },
     ]);
     const { fetchFn, calls } = countingMembersFetch(membersPage);
     const chats = subject(fetchFn as unknown as typeof fetch, cache);
 
-    await expect(chats.resolveMentions(CHAT, ['Shiv'])).rejects.toThrow(/ambiguous/);
+    await expect(chats.resolveMentions(CHAT, ['Mika'])).rejects.toThrow(/ambiguous/);
     expect(calls).toHaveLength(0);
   });
 
   it('an empty mention name rethrows immediately — no refresh call spent on a caller error', async () => {
     const cache = new MembersCache({ path });
-    cache.set(CHAT, [{ id: 'aad-shiv', displayName: 'Garg, Shivankit' }]);
+    cache.set(CHAT, [{ id: 'aad-mika', displayName: 'Berggren, Mikael' }]);
     const { fetchFn, calls } = countingMembersFetch(membersPage);
     const chats = subject(fetchFn as unknown as typeof fetch, cache);
 
@@ -225,14 +225,14 @@ describe('GraphTeamsChats.resolveMentions — stale-serve on a throttled/unavail
   it('TRIGGERING: an expired cache entry + a 429 on the refresh resolves the mention from the stale roster and logs one line saying so', async () => {
     let clock = 0;
     const cache = new MembersCache({ path, ttlMs: 1000, now: () => clock });
-    cache.set(CHAT, [{ id: 'aad-shiv', displayName: 'Garg, Shivankit' }]);
+    cache.set(CHAT, [{ id: 'aad-mika', displayName: 'Berggren, Mikael' }]);
     clock = 5000; // well past the TTL — cache.get(CHAT) is now a miss
     const { fetchFn, calls } = countingMembersFetch(throttled429);
     const { chats, lines } = subjectWithLog(fetchFn as unknown as typeof fetch, cache);
 
-    const resolved = await chats.resolveMentions(CHAT, ['Shiv']);
+    const resolved = await chats.resolveMentions(CHAT, ['Mika']);
 
-    expect(resolved).toEqual([{ name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' }]);
+    expect(resolved).toEqual([{ name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' }]);
     expect(calls).toHaveLength(1); // the one refresh attempt that came back throttled
     expect(lines.some((line) => /stale/i.test(line) && line.includes(CHAT))).toBe(true);
   });
@@ -240,7 +240,7 @@ describe('GraphTeamsChats.resolveMentions — stale-serve on a throttled/unavail
   it('NON-TRIGGERING: an expired cache entry + a 429 on the refresh still fails the post when the name is absent from the stale roster too', async () => {
     let clock = 0;
     const cache = new MembersCache({ path, ttlMs: 1000, now: () => clock });
-    cache.set(CHAT, [{ id: 'aad-shiv', displayName: 'Garg, Shivankit' }]); // no "Nobody" in the stale roster
+    cache.set(CHAT, [{ id: 'aad-mika', displayName: 'Berggren, Mikael' }]); // no "Nobody" in the stale roster
     clock = 5000;
     const { fetchFn } = countingMembersFetch(throttled429);
     const { chats, lines } = subjectWithLog(fetchFn as unknown as typeof fetch, cache);
@@ -259,7 +259,7 @@ describe('GraphTeamsChats.resolveMentions — stale-serve on a throttled/unavail
     const { fetchFn } = countingMembersFetch(throttled429);
     const { chats } = subjectWithLog(fetchFn as unknown as typeof fetch, cache);
 
-    const error = await chats.resolveMentions(CHAT, ['Shiv']).catch((caught: unknown) => caught);
+    const error = await chats.resolveMentions(CHAT, ['Mika']).catch((caught: unknown) => caught);
 
     expect(error).toBeInstanceOf(GraphError);
     expect((error as GraphError).code).toBe('MembersRefreshThrottled');
@@ -301,7 +301,7 @@ describe('buildChats — the composition actually wires the members cache (0.4.1
 
     // Pre-warm exactly where buildChats will look for it.
     new MembersCache({ path: config.membersCachePath }).set(CHAT, [
-      { id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+      { id: 'aad-mika', displayName: 'Berggren, Mikael' },
     ]);
 
     const { calls } = countingMembersFetch(membersPage);
@@ -324,9 +324,9 @@ describe('buildChats — the composition actually wires the members cache (0.4.1
       const { chats, tokenProvider } = buildChats(config);
       vi.spyOn(tokenProvider, 'getAccessToken').mockResolvedValue('fake-token');
 
-      const resolved = await chats.resolveMentions(CHAT, ['Shiv']);
+      const resolved = await chats.resolveMentions(CHAT, ['Mika']);
 
-      expect(resolved).toEqual([{ name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' }]);
+      expect(resolved).toEqual([{ name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' }]);
       expect(calls).toHaveLength(0);
     } finally {
       globalThis.fetch = originalFetch;
@@ -382,7 +382,7 @@ describe('buildChats — the composition wires GraphClient throttle-scope diagno
       const { chats, tokenProvider } = buildChats(config);
       vi.spyOn(tokenProvider, 'getAccessToken').mockResolvedValue('fake-token');
 
-      await chats.resolveMentions(CHAT, ['Shiv']).catch(() => undefined);
+      await chats.resolveMentions(CHAT, ['Mika']).catch(() => undefined);
 
       const lines = stderrWrite.mock.calls.map((call) => String(call[0]));
       expect(lines.some((line) => line.includes('x-ms-throttle-scope') && line.includes('Tenant_Application'))).toBe(
@@ -695,7 +695,7 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
     const cache = new MembersCache({ path });
     cache.set(CHAT, [
       { id: 'aad-self', displayName: 'Assistant (AI)' },
-      { id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+      { id: 'aad-mika', displayName: 'Berggren, Mikael' },
       { id: 'aad-johan', displayName: 'Spännare, Johan' },
     ]);
     const callOrder: string[] = [];
@@ -713,7 +713,7 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
       if (u.includes('/drive/items/drive-item-1/invite')) {
         callOrder.push('invite');
         inviteBody = JSON.parse(String(init?.body));
-        return grantsFor(['aad-shiv', 'aad-johan']);
+        return grantsFor(['aad-mika', 'aad-johan']);
       }
       if (u.includes('/messages') && method === 'POST') {
         callOrder.push('message');
@@ -733,7 +733,7 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
     expect(callOrder).toEqual(['upload', 'invite', 'message']);
     expect(inviteBody).toEqual({
       // Self excluded: it already owns the item — see resolveSelfId's doc comment.
-      recipients: [{ objectId: 'aad-shiv' }, { objectId: 'aad-johan' }],
+      recipients: [{ objectId: 'aad-mika' }, { objectId: 'aad-johan' }],
       requireSignIn: true,
       sendInvitation: false,
       roles: ['read'],
@@ -745,7 +745,7 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
     const cache = new MembersCache({ path });
     cache.set(CHAT, [
       { id: 'aad-self', displayName: 'Assistant (AI)' },
-      { id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+      { id: 'aad-mika', displayName: 'Berggren, Mikael' },
     ]);
     const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
       const u = String(url);
@@ -807,7 +807,7 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
     const cache = new MembersCache({ path });
     cache.set(CHAT, [
       { id: 'aad-self', displayName: 'Assistant (AI)' },
-      { id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+      { id: 'aad-mika', displayName: 'Berggren, Mikael' },
       { id: 'aad-johan', displayName: 'Spännare, Johan' },
     ]);
     const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
@@ -816,7 +816,7 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
       if (u.includes('/me?') && u.includes('select=id')) return selfIdResponse();
       if (u.includes('/root:') && method === 'PUT') return uploadResponse();
       if (u.includes('/invite')) {
-        return grantsFor(['aad-shiv']); // aad-johan never got a grant
+        return grantsFor(['aad-mika']); // aad-johan never got a grant
       }
       if (u.includes('/messages') && method === 'POST') {
         throw new Error('TEST-ONLY GUARD: sendFile must not reach the chat message post on this path');
@@ -839,7 +839,7 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
     const cache = new MembersCache({ path });
     cache.set(CHAT, [
       { id: 'aad-self', displayName: 'Assistant (AI)' },
-      { id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+      { id: 'aad-mika', displayName: 'Berggren, Mikael' },
       { id: 'aad-johan', displayName: 'Spännare, Johan' },
     ]);
     const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
@@ -851,7 +851,7 @@ describe('GraphTeamsChats.sendFile — grants chat members read access on the up
         return json({
           value: [
             {
-              grantedToIdentitiesV2: [{ user: { id: 'aad-shiv' } }, { user: { id: 'aad-johan' } }],
+              grantedToIdentitiesV2: [{ user: { id: 'aad-mika' } }, { user: { id: 'aad-johan' } }],
             },
           ],
         });
@@ -1689,8 +1689,8 @@ describe('GraphTeamsChats.sendImage — hosted content, no OneDrive item, no gra
 });
 
 // GH-14 (https://github.com/Agentic-Delivery/teams-assistant-mcp/issues/14): observed 2026-09-02,
-// `teams-post --html --mention "Kleivdal, Celine"` with the name written plainly (no `@{Kleivdal,
-// Celine}` token) reportedly posted raw markup instead of refusing. Reproduced against HEAD first
+// `teams-post --html --mention "Nordqvist, Maja"` with the name written plainly (no `@{Nordqvist,
+// Maja}` token) reportedly posted raw markup instead of refusing. Reproduced against HEAD first
 // (per pragmatic-tdd doctrine): the orphaned-mention throw inside renderHtmlWithMentions is called
 // directly inline in the POST/PATCH body construction below, so it already fires before any
 // network call reaches Graph — this file had no adapter-level test proving that wiring, only
@@ -1702,7 +1702,7 @@ describe('GraphTeamsChats.sendHtmlMessage / editHtmlMessage — the orphaned-men
     return new GraphTeamsChats(graph, { membersCache: new MembersCache({ path: '/dev/null/unused' }) });
   }
 
-  const celine = { name: 'Kleivdal, Celine', id: 'aad-celine', displayName: 'Kleivdal, Celine' };
+  const maja = { name: 'Nordqvist, Maja', id: 'aad-maja', displayName: 'Nordqvist, Maja' };
 
   it('GH-14a: sendHtmlMessage refuses BEFORE any POST when a resolved mention has no @{Name} token in the html', async () => {
     const fetchFn = vi.fn(async () => {
@@ -1711,7 +1711,7 @@ describe('GraphTeamsChats.sendHtmlMessage / editHtmlMessage — the orphaned-men
     const chats = subject(fetchFn as unknown as typeof fetch);
 
     await expect(
-      chats.sendHtmlMessage(CHAT, '<p>Please review Kleivdal, Celine</p>', [celine]),
+      chats.sendHtmlMessage(CHAT, '<p>Please review Nordqvist, Maja</p>', [maja]),
     ).rejects.toThrow(/no @\{Name\}-style placeholder/);
     expect(fetchFn).not.toHaveBeenCalled();
   });
@@ -1720,13 +1720,13 @@ describe('GraphTeamsChats.sendHtmlMessage / editHtmlMessage — the orphaned-men
     const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
       expect(init?.method).toBe('POST');
       const body = JSON.parse(String(init?.body)) as { body: { content: string }; mentions?: unknown[] };
-      expect(body.body.content).toContain('<at id="0">Kleivdal, Celine</at>');
+      expect(body.body.content).toContain('<at id="0">Nordqvist, Maja</at>');
       expect(body.mentions).toHaveLength(1);
       return json({ id: 'sent-1', chatId: CHAT, createdDateTime: '2026-09-04T10:00:00Z', body: { contentType: 'html', content: body.body.content } });
     });
     const chats = subject(fetchFn as unknown as typeof fetch);
 
-    const sent = await chats.sendHtmlMessage(CHAT, '<p>Please review @{Kleivdal, Celine}</p>', [celine]);
+    const sent = await chats.sendHtmlMessage(CHAT, '<p>Please review @{Nordqvist, Maja}</p>', [maja]);
 
     expect(sent.id).toBe('sent-1');
     expect(fetchFn).toHaveBeenCalledTimes(1);
@@ -1739,7 +1739,7 @@ describe('GraphTeamsChats.sendHtmlMessage / editHtmlMessage — the orphaned-men
     const chats = subject(fetchFn as unknown as typeof fetch);
 
     await expect(
-      chats.editHtmlMessage(CHAT, 'msg-1', '<p>Please review Kleivdal, Celine</p>', [celine]),
+      chats.editHtmlMessage(CHAT, 'msg-1', '<p>Please review Nordqvist, Maja</p>', [maja]),
     ).rejects.toThrow(/no @\{Name\}-style placeholder/);
     expect(fetchFn).not.toHaveBeenCalled();
   });

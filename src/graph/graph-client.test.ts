@@ -420,7 +420,7 @@ describe('teams chats over graph', () => {
             chatType: 'group',
             topic: 'Pilot',
             members: [
-              { id: 'MEMBERSHIP-COMPOSITE-ID', displayName: 'Garg, Shivankit', userId: 'aad-shiv' },
+              { id: 'MEMBERSHIP-COMPOSITE-ID', displayName: 'Berggren, Mikael', userId: 'aad-mika' },
             ],
           },
         ],
@@ -430,7 +430,7 @@ describe('teams chats over graph', () => {
       new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
     expect((await chats.listChats())[0]?.members).toEqual([
-      { id: 'aad-shiv', displayName: 'Garg, Shivankit' },
+      { id: 'aad-mika', displayName: 'Berggren, Mikael' },
     ]);
   });
 });
@@ -461,7 +461,7 @@ describe('teams chats — @mentions', () => {
     const fetchFn = vi.fn(async () =>
       json({
         value: [
-          { id: 'membership-1', displayName: 'Garg, Shivankit', userId: 'aad-shiv' },
+          { id: 'membership-1', displayName: 'Berggren, Mikael', userId: 'aad-mika' },
           { id: 'membership-2', displayName: 'Spännare, Johan', userId: 'aad-johan' },
         ],
       }),
@@ -469,11 +469,11 @@ describe('teams chats — @mentions', () => {
     const chats = new GraphTeamsChats(
       new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
-    const resolved = await chats.resolveMentions('19:a@thread.v2', ['Shiv']);
+    const resolved = await chats.resolveMentions('19:a@thread.v2', ['Mika']);
 
     const [url] = fetchFn.mock.calls[0] as unknown as [string];
     expect(url).toBe('https://graph.microsoft.com/v1.0/chats/19%3Aa%40thread.v2/members');
-    expect(resolved).toEqual([{ name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' }]);
+    expect(resolved).toEqual([{ name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' }]);
   });
 
   it('resolveMentions follows pagination on /members — a member on page 2 still resolves (review round 2, MINOR 3)', async () => {
@@ -490,15 +490,15 @@ describe('teams chats — @mentions', () => {
         }),
       )
       .mockResolvedValueOnce(
-        json({ value: [{ id: 'membership-2', displayName: 'Garg, Shivankit', userId: 'aad-shiv' }] }),
+        json({ value: [{ id: 'membership-2', displayName: 'Berggren, Mikael', userId: 'aad-mika' }] }),
       );
     const chats = new GraphTeamsChats(
       new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
 
-    const resolved = await chats.resolveMentions('19:a@thread.v2', ['Shiv']);
+    const resolved = await chats.resolveMentions('19:a@thread.v2', ['Mika']);
 
     expect(fetchFn).toHaveBeenCalledTimes(2);
-    expect(resolved).toEqual([{ name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' }]);
+    expect(resolved).toEqual([{ name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' }]);
   });
 
   it('sendMessage with mentions posts an <at> tag AND the parallel Graph mentions array', async () => {
@@ -507,18 +507,18 @@ describe('teams chats — @mentions', () => {
     );
     const chats = new GraphTeamsChats(
       new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
-    const mention = { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' };
+    const mention = { name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' };
 
-    await chats.sendMessage('19:a@thread.v2', 'Shiv please review', [mention]);
+    await chats.sendMessage('19:a@thread.v2', 'Mika please review', [mention]);
 
     const [, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
     const body = JSON.parse(init.body as string) as {
       body: { content: string };
       mentions: Array<{ id: number; mentionText: string; mentioned: { user: { id: string; displayName: string } } }>;
     };
-    expect(body.body.content).toBe('<p><at id="0">Garg, Shivankit</at> please review</p>');
+    expect(body.body.content).toBe('<p><at id="0">Berggren, Mikael</at> please review</p>');
     expect(body.mentions).toEqual([
-      { id: 0, mentionText: 'Garg, Shivankit', mentioned: { user: { id: 'aad-shiv', displayName: 'Garg, Shivankit' } } },
+      { id: 0, mentionText: 'Berggren, Mikael', mentioned: { user: { id: 'aad-mika', displayName: 'Berggren, Mikael' } } },
     ]);
   });
 
@@ -542,13 +542,13 @@ describe('teams chats — @mentions', () => {
     );
     const chats = new GraphTeamsChats(
       new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
-    const mention = { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' };
+    const mention = { name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' };
 
-    await chats.sendHtmlMessage('19:a@thread.v2', '<table><tr><td>@{Shiv}</td></tr></table>', [mention]);
+    await chats.sendHtmlMessage('19:a@thread.v2', '<table><tr><td>@{Mika}</td></tr></table>', [mention]);
 
     const [, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
     const body = JSON.parse(init.body as string) as { body: { content: string }; mentions: unknown[] };
-    expect(body.body.content).toBe('<table><tr><td><at id="0">Garg, Shivankit</at></td></tr></table>');
+    expect(body.body.content).toBe('<table><tr><td><at id="0">Berggren, Mikael</at></td></tr></table>');
     expect(body.mentions).toHaveLength(1);
   });
 
@@ -560,7 +560,7 @@ describe('teams chats — @mentions', () => {
           id: 'orig-1',
           createdDateTime: '2026-08-19T08:00:00Z',
           from: { user: { id: 'oid-9', displayName: 'Alice Anderson' } },
-          body: { contentType: 'html', content: '<p>Shiv already knows about this</p>' },
+          body: { contentType: 'html', content: '<p>Mika already knows about this</p>' },
         }),
       )
       .mockResolvedValueOnce(
@@ -568,15 +568,15 @@ describe('teams chats — @mentions', () => {
       );
     const chats = new GraphTeamsChats(
       new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
-    const mention = { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' };
+    const mention = { name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' };
 
-    await chats.replyToMessage('19:a@thread.v2', 'orig-1', 'Shiv can you confirm?', [mention]);
+    await chats.replyToMessage('19:a@thread.v2', 'orig-1', 'Mika can you confirm?', [mention]);
 
     const [, init] = fetchFn.mock.calls[1] as unknown as [string, RequestInit];
     const body = JSON.parse(init.body as string) as { body: { content: string } };
     // The quote card is untouched html; only OUR text after it carries the <at> tag.
     expect(body.body.content).toBe(
-      '<attachment id="orig-1"></attachment><p><at id="0">Garg, Shivankit</at> can you confirm?</p>',
+      '<attachment id="orig-1"></attachment><p><at id="0">Berggren, Mikael</at> can you confirm?</p>',
     );
   });
 
@@ -584,13 +584,13 @@ describe('teams chats — @mentions', () => {
     const fetchFn = vi.fn(async () => new Response(null, { status: 204 }));
     const chats = new GraphTeamsChats(
       new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never }), { membersCache: noMembersCache });
-    const mention = { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' };
+    const mention = { name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' };
 
-    await chats.editMessage('19:a@thread.v2', 'm1', 'Shiv see above', [mention]);
+    await chats.editMessage('19:a@thread.v2', 'm1', 'Mika see above', [mention]);
 
     const [, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
     const body = JSON.parse(init.body as string) as { body: { content: string }; mentions: unknown[] };
-    expect(body.body.content).toBe('<p><at id="0">Garg, Shivankit</at> see above</p>');
+    expect(body.body.content).toBe('<p><at id="0">Berggren, Mikael</at> see above</p>');
     expect(body.mentions).toHaveLength(1);
   });
 });
@@ -1079,7 +1079,7 @@ describe('graph client — the gate is per resource family (2026-08-25: single-m
 
 describe('teams chats — single-message fetch falls back to the list under throttle', () => {
   const throttled = () => new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 't' } }), { status: 429, headers: { 'retry-after': '60', 'content-type': 'application/json' } });
-  const raw = (id: string, text: string) => ({ id, createdDateTime: '2026-08-25T07:48:25Z', from: { user: { displayName: 'Kleivdal, Celine', id: 'u1' } }, body: { contentType: 'text', content: text }, attachments: [] });
+  const raw = (id: string, text: string) => ({ id, createdDateTime: '2026-08-25T07:48:25Z', from: { user: { displayName: 'Nordqvist, Maja', id: 'u1' } }, body: { contentType: 'text', content: text }, attachments: [] });
 
   it('replyToMessage: the original is found in the recent list and the quoted reply is posted', async () => {
     const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
@@ -1144,7 +1144,7 @@ describe('graph client — global vs family gates, drive paths (review round 1 o
 describe('teams chats — getAttachment under the single-message throttle', () => {
   it('falls back to the list, finds the attachment there, and downloads it', async () => {
     const throttled = () => new Response(JSON.stringify({ error: { code: 'TooManyRequests', message: 't' } }), { status: 429, headers: { 'retry-after': '60', 'content-type': 'application/json' } });
-    const listed = { id: 'm-1', createdDateTime: '2026-08-25T07:48:25Z', from: { user: { displayName: 'Celine', id: 'u1' } }, body: { contentType: 'html', content: 'Logo:' }, attachments: [{ id: 'att-1', contentType: 'image/png', name: 'logo.png', contentUrl: null }] };
+    const listed = { id: 'm-1', createdDateTime: '2026-08-25T07:48:25Z', from: { user: { displayName: 'Maja', id: 'u1' } }, body: { contentType: 'html', content: 'Logo:' }, attachments: [{ id: 'att-1', contentType: 'image/png', name: 'logo.png', contentUrl: null }] };
     const fetchFn = vi.fn(async (url: string) => {
       if (url.endsWith('/messages/m-1')) return throttled();
       if (url.includes('/hostedContents/')) return new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { 'content-type': 'image/png' } });
@@ -1187,7 +1187,7 @@ describe('teams chats — the fallback is for throttles only (the non-triggering
 
 describe('teams chats — getAttachment without an id skips the quote card', () => {
   it('on a quoted reply carrying a file, "the attachment" is the file, never the messageReference', async () => {
-    const msg = { id: 'm-2', createdDateTime: '2026-08-25T07:48:25Z', from: { user: { displayName: 'Celine', id: 'u1' } }, body: { contentType: 'html', content: 'Logo:' },
+    const msg = { id: 'm-2', createdDateTime: '2026-08-25T07:48:25Z', from: { user: { displayName: 'Maja', id: 'u1' } }, body: { contentType: 'html', content: 'Logo:' },
       attachments: [{ id: 'quote-1', contentType: 'messageReference', name: null, contentUrl: null }, { id: 'file-1', contentType: 'reference', name: 'logo.png', contentUrl: 'https://tenant-my.sharepoint.com/personal/x/Documents/logo.png' }] };
     const fetchFn = vi.fn(async (url: string) => {
       if (url.endsWith('/messages/m-2')) return json(msg);
@@ -1206,7 +1206,7 @@ describe('teams chats — getAttachment without an id skips the quote card', () 
 
 describe('teams chats — a quoted reply with no file says so honestly', () => {
   it('reports "only a quoted-message card", never "no attachments"', async () => {
-    const msg = { id: 'm-3', createdDateTime: '2026-08-25T07:48:25Z', from: { user: { displayName: 'Celine', id: 'u1' } }, body: { contentType: 'html', content: 'see above' },
+    const msg = { id: 'm-3', createdDateTime: '2026-08-25T07:48:25Z', from: { user: { displayName: 'Maja', id: 'u1' } }, body: { contentType: 'html', content: 'see above' },
       attachments: [{ id: 'quote-1', contentType: 'messageReference', name: null, contentUrl: null }] };
     const fetchFn = vi.fn(async () => json(msg));
     const chats = new GraphTeamsChats(new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as never, sleepFn: async () => {}, nowFn: () => 0 }), { membersCache: noMembersCache });
@@ -1274,7 +1274,7 @@ describe('graph client — binary downloads retry throttles like every other rea
 
 describe('teams chats — a 403 on the SharePoint download names the missing permission (0.5.0)', () => {
   it('says which file, what the token lacks, and that a custom app registration may need admin consent', async () => {
-    const msg = { id: 'm-4', createdDateTime: '2026-08-25T07:48:25Z', from: { user: { displayName: 'Celine', id: 'u1' } }, body: { contentType: 'html', content: 'plan attached' },
+    const msg = { id: 'm-4', createdDateTime: '2026-08-25T07:48:25Z', from: { user: { displayName: 'Maja', id: 'u1' } }, body: { contentType: 'html', content: 'plan attached' },
       attachments: [{ id: 'file-1', contentType: 'reference', name: 'plan.xlsx', contentUrl: 'https://tenant-my.sharepoint.com/personal/x/Documents/plan.xlsx' }] };
     const fetchFn = vi.fn(async (url: string) => {
       if (url.includes('/shares/')) {
@@ -1295,7 +1295,7 @@ describe('teams chats — a 403 on the SharePoint download names the missing per
   });
 
   it('leaves the licence 403 alone — that one has its own name and its own fix', async () => {
-    const msg = { id: 'm-5', createdDateTime: '2026-08-25T07:48:25Z', from: { user: { displayName: 'Celine', id: 'u1' } }, body: { contentType: 'html', content: 'plan attached' },
+    const msg = { id: 'm-5', createdDateTime: '2026-08-25T07:48:25Z', from: { user: { displayName: 'Maja', id: 'u1' } }, body: { contentType: 'html', content: 'plan attached' },
       attachments: [{ id: 'file-1', contentType: 'reference', name: 'plan.xlsx', contentUrl: 'https://tenant-my.sharepoint.com/personal/x/Documents/plan.xlsx' }] };
     const fetchFn = vi.fn(async (url: string) => {
       if (url.includes('/shares/')) {
@@ -1313,7 +1313,7 @@ describe('teams chats — a 403 on the SharePoint download names the missing per
 });
 
 describe('teams chats — getAttachments downloads a whole message in one pass (0.5.0)', () => {
-  const msg = { id: 'm-6', createdDateTime: '2026-08-25T07:48:25Z', from: { user: { displayName: 'Celine', id: 'u1' } },
+  const msg = { id: 'm-6', createdDateTime: '2026-08-25T07:48:25Z', from: { user: { displayName: 'Maja', id: 'u1' } },
     body: { contentType: 'html', content: 'both files <img src="https://g/chats/c/messages/m-6/hostedContents/hc-9/$value">' },
     attachments: [
       { id: 'quote-1', contentType: 'messageReference', name: null, contentUrl: null },

@@ -317,7 +317,7 @@ calls, and the server passes Graph's refusal through verbatim rather than pre-ch
 
 `mentions` (`send_chat_message`/`reply_chat_message`/`edit_chat_message`) is a list of display
 names to actually NOTIFY, not just reference — resolved case-insensitively as an unambiguous
-substring against the chat's member list ("Shiv" matches "Garg, Shivankit"; zero or multiple
+substring against the chat's member list ("Mika" matches "Berggren, Mikael"; zero or multiple
 matches is refused, never silently dropped). With `format: 'text'` (default), each mention's
 name must occur in the message text — that occurrence becomes the notifying tag. With `format:
 'html'`, place a literal `@{Name}` token at each spot to mention instead; every declared mention

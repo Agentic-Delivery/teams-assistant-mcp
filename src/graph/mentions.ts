@@ -15,7 +15,7 @@ export interface ChatMember {
  * One resolved @mention: the caller's own search string plus the chat member it matched.
  * `name` is kept (not just id/displayName) because the text-substitution passes need the
  * ORIGINAL string to search for in the caller's text/HTML — the thing typed is not necessarily
- * the member's full displayName ("Shiv" resolves to "Garg, Shivankit", but "Shiv" is what
+ * the member's full displayName ("Mika" resolves to "Berggren, Mikael", but "Mika" is what
  * appears in the message).
  */
 export interface MentionTarget {
@@ -29,8 +29,8 @@ function escapeRegExp(value: string): string {
 }
 
 /**
- * `name` matched only when NOT tight against another letter/number on either side ("Shiv" must
- * not match inside "Shivankit") — Unicode-aware (`\p{L}`/`\p{N}` with the `u` flag) so an accented
+ * `name` matched only when NOT tight against another letter/number on either side ("Mika" must
+ * not match inside "Mikael") — Unicode-aware (`\p{L}`/`\p{N}` with the `u` flag) so an accented
  * name like "Spännare" gets correct boundaries too. Built fresh per call: a shared `g`-flagged
  * RegExp instance would carry `lastIndex` state across the separate `.test()` calls this is used
  * for (existence checks over several segments), silently skipping real matches.
@@ -52,7 +52,7 @@ interface TextSegment {
  * merely happens to appear inside a URL's path/query is part of the link's literal text, not a
  * mention, and tokenizing it there used to land <at> markup inside the href attribute value,
  * whose own quote character terminates the attribute early (malformed HTML) — verified 2026-08-26
- * review round with `see https://x.com/shiv/pr Shiv` and mention "Shiv".
+ * review round with `see https://x.com/mika/pr Mika` and mention "Mika".
  */
 function splitOnUrls(text: string): TextSegment[] {
   const segments: TextSegment[] = [];
@@ -72,7 +72,7 @@ function splitOnUrls(text: string): TextSegment[] {
 
 /**
  * Resolves each of `names` against `members`: case-insensitive substring match against
- * displayName, required to be unambiguous. This is what lets "Shiv" find "Garg, Shivankit"
+ * displayName, required to be unambiguous. This is what lets "Mika" find "Berggren, Mikael"
  * without the caller ever seeing Graph's "Lastname, Firstname" convention.
  *
  * Every failure mode throws a specific, actionable message — no match, an ambiguous match, or a
@@ -142,7 +142,7 @@ const PLACEHOLDER_GUARD = '\uE000';
  * 2026-08-26 review round found them missing:
  *  - never inside a URL span (splitOnUrls) — a name that is really part of a link's path/query is
  *    the link's own text, not a mention, and tokenizing it there corrupts the eventual href;
- *  - only at a word boundary (wordBoundaryPattern) — "Shiv" must not match inside "Shivankit",
+ *  - only at a word boundary (wordBoundaryPattern) — "Mika" must not match inside "Mikael",
  *    which would silently mangle the VISIBLE text, not just misplace the tag.
  *
  * Throws if a mention's name has zero ELIGIBLE occurrences (whole-word, outside any URL): a

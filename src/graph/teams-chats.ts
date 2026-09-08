@@ -63,7 +63,7 @@ export interface TeamsChatsPort {
   readMessages(chatId: string, since?: string, limit?: number): Promise<ReadResult>;
   /**
    * Resolves each of `names` against the chat's CURRENT member list — case-insensitive,
-   * unambiguous-substring ("Shiv" matches "Garg, Shivankit"; a name matching zero or more than
+   * unambiguous-substring ("Mika" matches "Berggren, Mikael"; a name matching zero or more than
    * one member throws) — into the id/displayName pairs the send/reply/edit methods below need to
    * build a mention that actually notifies. Call this before any of them when the caller supplied
    * mention names; pass the result straight through as `mentions`.
@@ -485,7 +485,7 @@ export class GraphTeamsChats implements TeamsChatsPort {
    * refresh-once-on-miss, SIMILAR to resolveMentions's path (see its doc comment for the shared
    * rationale) but deliberately NOT the same read: this method requires a COMPLETE roster (a real
    * `/members` fetch), NEVER a PARTIAL, traffic-harvested-only one (0.5.2 BLOCKER 1 fix,
-   * 2026-09-04 review, reproduced live against the Guidewire Management chat — see
+   * 2026-09-04 review, reproduced live against a customer chat — see
    * docs/throttling-mitigation.md §1.2 — which had no `/members` entry, ever, only harvested
    * traffic from whoever happened to speak). A harvested roster used verbatim here silently
    * omitted real, silent chat members from the grant — exactly the "no dead cards, ever" contract

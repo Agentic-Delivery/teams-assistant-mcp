@@ -312,7 +312,7 @@ describe('reliable sends — html format: readback dedup compares TEXT, not raw 
 });
 
 describe('reliable sends — html match key vs a REAL captured Teams readback (fixture, 2026-08-25)', () => {
-  // Capture provenance (re-runnable): chat 19:8af48977045e48c9b9ed5049ba8f94ad@thread.v2
+  // Capture provenance (re-runnable): chat 19:8af48977…
   // ("MCP dev test", allowlisted canPost), message id 1787666759027, captured 2026-08-25.
   // Sent this MINIFIED table (no whitespace between adjacent tags) via a real sendHtmlMessage
   // call, then GET the message back off Graph and read RAW body.content — bypassing
@@ -367,7 +367,7 @@ describe('reliable sends — html match key vs a REAL captured Teams readback (f
 });
 
 describe('reliable sends — html match key vs a REAL captured Teams readback, INLINE adjacency (fixture, 2026-08-25)', () => {
-  // Capture provenance (re-runnable): chat 19:8af48977045e48c9b9ed5049ba8f94ad@thread.v2
+  // Capture provenance (re-runnable): chat 19:8af48977…
   // ("MCP dev test", allowlisted canPost), message id 1787667664136, captured 2026-08-25.
   // Sent `<p><b>a</b><i>b</i></p>` — zero whitespace at three bare boundaries (p→b, b→i, i→p) —
   // via a real sendHtmlMessage call, then GET the message back and read RAW body.content.
@@ -746,14 +746,14 @@ describe('the real assembly — MessageFetchThrottled through the decorator', ()
 });
 
 describe('reliable sends — @mentions rewrite the match key, not just the sent text', () => {
-  const MENTION: MentionTarget = { name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' };
+  const MENTION: MentionTarget = { name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' };
 
   it('sendMessage with a mention matches a landed copy by the RESOLVED displayName, not the caller\'s search string', async () => {
-    // "Shiv" was typed, but the <at> tag (and so the readback) carries "Garg, Shivankit" — a
-    // match key built from the raw input text ("Shiv please review") would never equal a landed
-    // copy's readback ("Garg, Shivankit please review") and would retry a genuinely landed send
+    // "Mika" was typed, but the <at> tag (and so the readback) carries "Berggren, Mikael" — a
+    // match key built from the raw input text ("Mika please review") would never equal a landed
+    // copy's readback ("Berggren, Mikael please review") and would retry a genuinely landed send
     // into a real duplicate.
-    const landed = message({ text: 'Garg, Shivankit please review' });
+    const landed = message({ text: 'Berggren, Mikael please review' });
     const sendMessage = vi.fn(async () => {
       throw new GraphError('socket hang up mid-response', 0);
     });
@@ -763,7 +763,7 @@ describe('reliable sends — @mentions rewrite the match key, not just the sent 
     });
     const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
 
-    const result = await chats.sendMessage('19:a@thread.v2', 'Shiv please review', [MENTION]);
+    const result = await chats.sendMessage('19:a@thread.v2', 'Mika please review', [MENTION]);
 
     expect(result).toBe(landed);
     expect(sendMessage).toHaveBeenCalledTimes(1); // found the landed copy — no duplicate
@@ -784,7 +784,7 @@ describe('reliable sends — @mentions rewrite the match key, not just the sent 
   });
 
   it('replyToMessage with a mention matches on the resolved displayName in the reply tail', async () => {
-    const landed = message({ text: 'quoted original text\nGarg, Shivankit can you confirm?' });
+    const landed = message({ text: 'quoted original text\nBerggren, Mikael can you confirm?' });
     const replyToMessage = vi.fn(async () => {
       throw new GraphError('socket hang up mid-response', 0);
     });
@@ -794,14 +794,14 @@ describe('reliable sends — @mentions rewrite the match key, not just the sent 
     });
     const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
 
-    const result = await chats.replyToMessage('19:a@thread.v2', 'orig-1', 'Shiv can you confirm?', [MENTION]);
+    const result = await chats.replyToMessage('19:a@thread.v2', 'orig-1', 'Mika can you confirm?', [MENTION]);
 
     expect(result).toBe(landed);
     expect(replyToMessage).toHaveBeenCalledTimes(1);
   });
 
   it('sendHtmlMessage with a mention placeholder matches on the resolved displayName', async () => {
-    const landed = message({ text: 'Garg, Shivankit see the table below' });
+    const landed = message({ text: 'Berggren, Mikael see the table below' });
     const sendHtmlMessage = vi.fn(async () => {
       throw new GraphError('socket hang up mid-response', 0);
     });
@@ -811,7 +811,7 @@ describe('reliable sends — @mentions rewrite the match key, not just the sent 
     });
     const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {}, nowFn: fixedNow });
 
-    const result = await chats.sendHtmlMessage('19:a@thread.v2', '<p>@{Shiv} see the table below</p>', [MENTION]);
+    const result = await chats.sendHtmlMessage('19:a@thread.v2', '<p>@{Mika} see the table below</p>', [MENTION]);
 
     expect(result).toBe(landed);
     expect(sendHtmlMessage).toHaveBeenCalledTimes(1);
@@ -819,7 +819,7 @@ describe('reliable sends — @mentions rewrite the match key, not just the sent 
 });
 
 describe('reliable sends — @mention match key vs a REAL captured Teams readback (fixture, 2026-08-26)', () => {
-  // Capture provenance (re-runnable): chat 19:8af48977045e48c9b9ed5049ba8f94ad@thread.v2
+  // Capture provenance (re-runnable): chat 19:8af48977…
   // ("MCP dev test", allowlisted canPost), message id 1787722849960, captured 2026-08-26. Sent
   // via a real sendMessage call mentioning "Johan" (resolved to "Spännare, Johan"), then GET the
   // message back off Graph and read RAW body.content — bypassing toChatMessage/htmlToText
@@ -832,7 +832,7 @@ describe('reliable sends — @mention match key vs a REAL captured Teams readbac
   // entry in REWRITTEN_TAG_BOUNDARY, and plain htmlToText reduction is exactly right for it.
   const MENTION: MentionTarget = {
     name: 'Johan',
-    id: '47588e53-8923-487c-a5db-6f5157a9d97b',
+    id: '00000000-1111-2222-3333-444444444444',
     displayName: 'Spännare, Johan',
   };
   const SENT_TEXT =
@@ -885,14 +885,14 @@ describe('reliable sends — @mention match key vs a REAL captured Teams readbac
 
 describe('reliable sends — resolveMentions and pin/unpin/list are pure passthroughs', () => {
   it('resolveMentions delegates untouched — a read against the member list, nothing to guard', async () => {
-    const resolveMentions = vi.fn(async () => [{ name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' }]);
+    const resolveMentions = vi.fn(async () => [{ name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' }]);
     const inner = portWith({ resolveMentions });
     const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {} });
 
-    const result = await chats.resolveMentions('19:a@thread.v2', ['Shiv']);
+    const result = await chats.resolveMentions('19:a@thread.v2', ['Mika']);
 
-    expect(resolveMentions).toHaveBeenCalledWith('19:a@thread.v2', ['Shiv']);
-    expect(result).toEqual([{ name: 'Shiv', id: 'aad-shiv', displayName: 'Garg, Shivankit' }]);
+    expect(resolveMentions).toHaveBeenCalledWith('19:a@thread.v2', ['Mika']);
+    expect(result).toEqual([{ name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' }]);
   });
 
   it('pinMessage, unpinMessage and listPinnedMessages all delegate untouched', async () => {
