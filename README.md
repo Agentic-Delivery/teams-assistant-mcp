@@ -48,7 +48,7 @@ The server speaks MCP over stdio and exposes sixteen tools:
 | `read_chat_messages` | Messages from one chat, oldest first, with a watermark for the next call |
 | `send_chat_message` | Posts to a chat whose allowlist entry has `canPost: true`; `format: 'text'` (default) escapes and renders, `format: 'html'` posts raw HTML verbatim; optional `mentions` — see "@mentions" below |
 | `send_chat_image` | Posts a PNG/JPEG that renders inline, from a local path or base64 bytes |
-| `send_chat_file` | Uploads a local file to the account's OneDrive (`TEAMS_MCP_UPLOAD_DIR`, default `ai-test`) and shares it into the chat, granting every other chat member read access on the uploaded item |
+| `send_chat_file` | Uploads a local file to the account's OneDrive (`TEAMS_MCP_UPLOAD_DIR`, default `ai-test`) and shares it into the chat, granting every other chat member read access on the uploaded item; optional `grantTo` (explicit AAD ids, skips roster resolution) or `noGrant` (post with no grant at all) — see "@mentions" below |
 | `reply_chat_message` | Posts a quoted reply to a specific message — chats have no reply threads, so this is the quote card the Teams UI produces; optional `mentions` |
 | `edit_chat_message` | Replaces the text of a message this account sent (Graph refuses anyone else's); same `format` and `mentions` options as `send_chat_message` |
 | `react_to_chat_message` | Puts an emoji reaction on a message — the receipt gesture for "seen, being handled" |
@@ -104,8 +104,12 @@ Mention resolution reads a per-chat member cache (disk-persisted next to the tok
 every send — that endpoint shares a throttle budget across every process signed in with the same
 client id (see "Throttle budgets are per client id" below), and a chat's membership in this fixed
 pilot allowlist effectively never changes. A cache hit resolves with zero Graph calls; a miss (no
-entry, an expired one, or a name the cached roster does not have) refreshes once and re-checks — a
-name still unresolved after that gets the usual clear error.
+entry, an expired one, or a name the cached roster does not have) refreshes — since 0.6.0, with a
+bounded retry budget (up to 3 tries total, each honouring Graph's own Retry-After) rather than a
+single never-retried attempt, live-diagnosed 2026-09-08 (KNOWN-ISSUES.md): a single 429 used to
+refuse the send outright even on a chat with real traffic, if the specific person mentioned simply
+had not spoken yet. A name still unresolved after the budget is exhausted gets the usual clear
+error.
 
 **A cache hit never becomes a hard dependency on the throttled endpoint (0.5.2).** Live-diagnosed
 2026-09-04 (KNOWN-ISSUES.md): a `/members` refresh 429ing on an expired cache used to mean the
@@ -130,13 +134,26 @@ sender Graph could not fully identify (an id with no display name — the `from:
 below) is never merged, so a gap in Graph's own response can't poison the roster with a junk entry.
 
 A roster built only from traffic is PARTIAL, not COMPLETE: it only knows who has spoken, not who
-is silently in the chat. `send_chat_file`'s permission grant (below) never trusts a partial roster
-— it always forces one real `/members` call for a chat that has no COMPLETE roster on disk yet
-(refusing the send loudly, never granting a partial list, if that call itself is throttled), and a
-COMPLETE roster's own freshness is judged only against its real `fetchedAt`, unaffected by
-intervening traffic. **Operators: no action is needed on a restart or an upgrade to 0.5.2 — a
-harvested roster on disk from an earlier build simply never drives a file grant; the very next
-`send_chat_file` into that chat pays one real `/members` call and moves on.**
+is silently in the chat. `send_chat_file`'s permission grant never trusts a partial roster — it
+always forces a real `/members` call (the same bounded retry budget as mention resolution's, 3
+tries) for a chat that has no COMPLETE roster on disk yet, and a COMPLETE roster's own freshness
+is judged only against its real `fetchedAt`, unaffected by intervening traffic. If the budget is
+exhausted and no COMPLETE/stale-COMPLETE roster exists to fall back to, the send still refuses
+loudly (THROTTLED, never a partial grant) — but the error now names the concrete next step: retry
+with `--grant-to <ids>` (grant exactly those AAD ids, no roster lookup at all) or `--no-grant`
+(post with no grant; only the sender can open it). **Operators: no action is needed on a restart
+or an upgrade — a harvested roster on disk from an earlier build simply never drives a file grant;
+the very next `send_chat_file` into that chat pays one real (now retried) `/members` call and
+moves on.**
+
+**Since 0.6.0 the background inbox poller also warms a cold roster proactively.** The FIRST poll
+of any newly-allowlisted chat, if its roster cache has no entry at all (complete or partial), now
+tries one real `/members` fetch (`GraphTeamsChats.warmMembers`, same throttle/gate discipline and
+retry budget as every other refresh, best-effort — a throttled warm-up just leaves the roster cold
+for the next real caller to retry, never fails the poll) so a chat's very first `send_chat_file`
+does not have to pay that call live. This is what actually shortens the gap the bounded retry
+above cannot fully close: a chat created and used within the SAME poll interval the roster warms
+in.
 
 ## Retry-After
 
@@ -356,7 +373,8 @@ need Teams without a running MCP session: `teams-post <chatId> [--html] [--menti
 `teams-edit <chatId> <messageId> [--html] [--mention "Name"]...` (new text on stdin), `teams-react
 <chatId> <messageId> <emoji>`, `teams-read <chatId> [--limit N] [--since ISO]`, `teams-pin
 <chatId> <messageId>`, `teams-unpin <chatId> <messageId>`, `teams-send-file <chatId> <path>
-[more paths...] [--caption "text"]` and `teams-attachments <chatId> <messageId> [--list]
+[more paths...] [--caption "text"] [--grant-to <id>[,<id>...] | --no-grant]` and
+`teams-attachments <chatId> <messageId> [--list]
 [--name <filter>] [--out <dir>]`. Same allowlist, same auth, same
 code paths as the server tools — including the send reliability below. `--html` on
 `teams-post`/`teams-edit` posts stdin as raw Teams-subset HTML, verbatim — the caller is
@@ -365,7 +383,13 @@ verified vocabulary. `--mention
 "Name"` (repeatable) @mentions that person, same resolution and placement rules as the
 `mentions` tool parameter — see "@mentions" above. `teams-send-file` uploads and shares one or
 more files in one call (one `send_chat_file` per path); `--caption` (optional, anywhere in argv)
-is shown above the FIRST file's card only, never repeated on every card. `teams-attachments`
+is shown above the FIRST file's card only, never repeated on every card. `--grant-to
+<id>[,<id>...]` (0.6.0) skips roster resolution entirely and grants read access to exactly the
+given AAD ids; `--no-grant` (0.6.0, mutually exclusive with `--grant-to`) uploads and posts with
+no permission grant at all — only the sender can open it, and the printed JSON line says so
+(`granted: false`). Both exist for when the chat's roster is throttled/unavailable — see
+"@mentions" above for the retry behaviour that makes reaching for either one the exception, not
+the rule. `teams-attachments`
 downloads every downloadable attachment on a message into `--out` (else
 `TEAMS_MCP_DOWNLOAD_DIR`, else a tmpdir) and prints the absolute paths; `--list` prints the
 metadata instead and downloads nothing; `--name` narrows the download by case-insensitive
