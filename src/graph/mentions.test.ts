@@ -150,7 +150,7 @@ describe('renderTextWithMentions — plain-text path (send_chat_message default 
 
   // Review round 2, MAJOR 2 (2026-08-26): no word-boundary requirement meant "Mika" matched
   // inside "Mikael's", silently corrupting the VISIBLE text (not just misplacing the tag) —
-  // the rendered message would read "...<at>Berggren, Mikael</at>ankit's branch...".
+  // the rendered message would read "...<at>Berggren, Mikael</at>el's branch...".
   it('requires a word boundary — does not match "Mika" inside "Mikael\'s"', () => {
     const target: MentionTarget = { name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' };
 

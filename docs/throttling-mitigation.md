@@ -61,8 +61,8 @@ TTL ran out.** That is not a coincidence; it is the mechanism:
 
 So the 24 h TTL does not bound staleness risk at the cost of one refresh; under contention it
 converts a working cached path into a **permanent** hard dependency on the throttled endpoint.
-The third chat is worse still: it has no entry at all, so *every* mention into the <deployment>
-Management chat has always been a live `/members` call.
+The third chat is worse still: it has no entry at all, so *every* mention into chat C has
+always been a live `/members` call.
 
 ### 1.3 Our actual call volume — and why it cannot be the cause
 
@@ -320,7 +320,7 @@ but which is a formal ask of the customer's IT and highly visible in the Teams a
 **On visibility, for the record.** Neither option 8 nor option 10 is covert, and neither should
 be. A consent creates a service principal in Enterprise Applications plus a `Consent to
 application` audit event; an app install appears in Teams admin centre → Manage apps. That is
-consistent with how we already work — nothing here gets done without If knowing it was done.
+consistent with how we already work — nothing here gets done without the customer knowing it was done.
 
 ## 4. Recommendation — a staged plan
 
@@ -350,7 +350,7 @@ consistent with how we already work — nothing here gets done without If knowin
    poll interval to 180 s. Neither is a fix; both are free insurance against the sustained-83 %
    rule and the per-chat 1 rps ceiling.
 
-### Stage 2 — next, on Agentic Delivery's own account, still nothing asked of If
+### Stage 2 — next, on Agentic Delivery's own account, still nothing asked of the customer
 
 5. **Register `Agentic Delivery Teams Assistant`** as a multi-tenant Entra app in the Agentic
    Delivery tenant, requesting **only user-consentable delegated scopes**: `Chat.ReadWrite`,
