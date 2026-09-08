@@ -72,8 +72,10 @@ only what arrived since. When nothing is new no watermark comes back, so the cal
 it already had.
 
 Graph returns message bodies as HTML even for plain typed text, so `messages.ts` flattens that to
-text. Mentions keep their visible name and lose the markup. This is not a general HTML renderer
-and does not try to be.
+text. Mentions keep their visible name and lose the markup. A pasted link keeps its URL — `<a
+href="URL">LABEL</a>` becomes `LABEL (URL)` when the label differs from the URL, or just the URL
+when it doesn't (a bare pasted link isn't doubled up). This is not a general HTML renderer and
+does not try to be.
 
 ## @mentions
 

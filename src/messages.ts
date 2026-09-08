@@ -37,6 +37,13 @@ export interface ReadResult {
 const BLOCK_END = /(?:<\/(?:p|div|li|tr|h[1-6])\s*>|<br\b[^>]*>)/gi;
 const ANY_TAG = /<[^>]*>/g;
 
+// Teams renders a pasted link as <a href="URL" title="URL">LABEL</a>. LABEL is often a page
+// title or link-preview text, not the URL itself — everything ANY_TAG below would keep, silently
+// dropping the href. Matched (and rewritten to "LABEL (URL)") before the generic tag strip runs,
+// while the href attribute is still present. Requires a quoted href (Teams always quotes it); an
+// unquoted href="X" is not matched and degrades to the pre-fix behaviour (label kept, URL lost).
+const ANCHOR = /<a\b[^>]*\bhref\s*=\s*(["'])([\s\S]*?)\1[^>]*>([\s\S]*?)<\/a\s*>/gi;
+
 const ENTITIES: Record<string, string> = {
   amp: '&',
   lt: '<',
@@ -47,30 +54,66 @@ const ENTITIES: Record<string, string> = {
   nbsp: ' ',
 };
 
+function decodeEntities(text: string): string {
+  return text.replace(/&(#?\w+);/g, (match, entity: string) => {
+    const key = entity.toLowerCase();
+    if (ENTITIES[key] !== undefined) {
+      return ENTITIES[key];
+    }
+    if (/^#\d+$/.test(entity)) {
+      return String.fromCodePoint(Number(entity.slice(1)));
+    }
+    return match;
+  });
+}
+
+/**
+ * href vs label equality check only, never used for the text that ends up in the message: HTML
+ * entities and URL percent-encoding are two independent ways the same character can show up (a
+ * label shows an entity, an href shows the percent-encoded bytes), so both are undone before
+ * comparing. Malformed percent-encoding (not actually a URL, just text containing "%") is left
+ * as-is rather than thrown on.
+ */
+function normalizeForCompare(text: string): string {
+  const decoded = decodeEntities(text);
+  try {
+    return decodeURIComponent(decoded);
+  } catch {
+    return decoded;
+  }
+}
+
 /**
  * Teams messages arrive as HTML even when the user typed plain text. The orchestrator reads these
  * as text, so tags become newlines or disappear. This is not a general HTML renderer and does not
  * need to be — mentions, emoji and images degrade to their text content or to nothing.
  */
 export function htmlToText(html: string): string {
-  return html
+  const stripped = html
     .replace(/<\s*(script|style)\b[^>]*>[\s\S]*?<\/\s*\1\s*>/gi, '')
     // Raw newlines in HTML source are ordinary whitespace, not line breaks — and Teams
     // pretty-prints stored bodies with them (after <br>, between <p> elements). Line breaks in
     // the text come only from the tags handled below.
     .replace(/[\r\n]+/g, ' ')
-    .replace(BLOCK_END, '\n')
-    .replace(ANY_TAG, '')
-    .replace(/&(#?\w+);/g, (match, entity: string) => {
-      const key = entity.toLowerCase();
-      if (ENTITIES[key] !== undefined) {
-        return ENTITIES[key];
+    .replace(ANCHOR, (_match, _quote, hrefRaw: string, innerRaw: string) => {
+      const href = hrefRaw.trim();
+      // A block tag inside the label (rare, but seen with rich-preview cards) would otherwise
+      // glue adjacent words together once ANY_TAG below drops it; turn it into a space first,
+      // same as BLOCK_END does for the rest of the message.
+      const text = innerRaw.replace(BLOCK_END, ' ').replace(ANY_TAG, '').replace(/\s+/g, ' ').trim();
+      if (!href) {
+        return text;
       }
-      if (/^#\d+$/.test(entity)) {
-        return String.fromCodePoint(Number(entity.slice(1)));
-      }
-      return match;
+      // A bare pasted URL comes through as label === href; keep it plain instead of "URL (URL)".
+      // Compared after normalising both sides — href and label are encoded independently by
+      // Teams (a non-ASCII character in the URL may show as an HTML entity in the label but be
+      // percent-encoded in the href), so a raw-string comparison can miss a same-URL match.
+      return text && normalizeForCompare(text) !== normalizeForCompare(href) ? `${text} (${href})` : href;
     })
+    .replace(BLOCK_END, '\n')
+    .replace(ANY_TAG, '');
+
+  return decodeEntities(stripped)
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n[ \t]+/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
