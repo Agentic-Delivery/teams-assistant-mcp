@@ -1,3 +1,51 @@
+## Inbound links pasted as rich text lost their URL, keeping only the visible label (live 2026-09-08, fixed 0.5.5)
+
+Live hit 2026-09-08: a chat message reached the inbox with `attachments: 0` and text that kept a
+link's visible label but not the link itself — the sender had pasted a link into the message, and
+its URL was nowhere in the delivered text. The direct Graph fetch of the raw message stayed
+429-throttled at the time, so this was root-caused from code, not the live message: reproduced
+with a realistic Graph body shape instead (see `messages.test.ts`, "keeps a pasted link's URL
+when the visible label differs from it").
+
+**Root cause**: Teams sends a pasted link as `<a href="URL" title="URL">LABEL</a>` in the HTML
+message body, where LABEL is a page title or link-preview text, not the URL. `htmlToText`'s
+generic tag strip (`src/messages.ts`, the `ANY_TAG` regex) removes every tag outright, keeping
+only the text node between `<a>` and `</a>` and discarding the `href` attribute — and therefore
+the URL — entirely. This is a plain-text label that happens to differ from its target, not a card
+or rich attachment, so `attachments` on the Graph message was genuinely empty (0): the existing
+`reference`-type attachment handling in `toChatMessage` (`src/messages.ts`, already covered by
+`messages.test.ts`'s "carries attachments through..." case) was never in play here and needed no
+fix.
+
+**Fixed 0.5.5**: a new `ANCHOR` pattern in `htmlToText` matches `<a href="…">…</a>` before the
+generic tag strip runs, while the href is still present, and rewrites it to `LABEL (URL)` when
+the label differs from the URL, or leaves a bare pasted URL (`<a href="X">X</a>`) unchanged so it
+is never doubled as "X (X)". href and label are left HTML-entity-encoded at that point and flow
+through the same decode pass as the rest of the message, so `&amp;` in a query string comes back
+out as `&` exactly like anywhere else in the text (`messages.test.ts`, "decodes an ampersand in
+the href..."). Nested markup inside the label (e.g. `<b>`) is stripped before insertion
+(`messages.test.ts`, "strips nested markup from a link label..."), and a block tag inside the
+label (e.g. `<br>`) becomes a space instead of gluing the two sides together (`messages.test.ts`,
+"turns a block tag inside a link label into a space..."). The label/href equality check that
+decides whether to dedupe a bare URL normalises both HTML entities and URL percent-encoding
+before comparing, so a URL whose non-ASCII character shows as an entity in the label but as
+percent-encoded bytes in the href is still recognised as the same URL (`messages.test.ts`,
+"dedupes a bare pasted URL whose non-ASCII character is percent-encoded..."). An unquoted
+`href=X` (Teams always quotes) is not matched by `ANCHOR` and degrades to the pre-fix behaviour.
+
+Of the six link-handling tests this fix adds, five fail on 0.5.4 (main) and pass here; the sixth
+(a bare pasted URL) already passed on main too — kept as a doubling-regression guard, not
+evidence of the original bug.
+
+Before: a link's label survives, its URL is silently dropped.
+After: `LABEL (URL)`, or the bare URL alone when the label is just the URL.
+
+Affects every surface that reads inbound text through `toChatMessage`/`htmlToText`: the inbox
+poller (`~/.teams-assistant/inbox.jsonl` by default, overridable with `TEAMS_INBOX_PATH`), the
+`read.mjs` CLI, and the MCP `read_chat_messages`/`poll_chats` tools — they all share this one
+conversion. A running daemon must be rebuilt and restarted to pick this up; it does not
+auto-update.
+
 ## teams-post --html --mention posting raw markup instead of refusing on an orphaned placeholder — investigated, not reproducible against 0.5.2, closed by hardening test coverage (reported live 2026-09-02, closed 2026-09-04, GH-14)
 
 Reported: `teams-post --html --mention "Nordqvist, Maja"` with the name written plainly in the
