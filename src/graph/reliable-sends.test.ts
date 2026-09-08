@@ -895,6 +895,23 @@ describe('reliable sends — resolveMentions and pin/unpin/list are pure passthr
     expect(result).toEqual([{ name: 'Mika', id: 'aad-mika', displayName: 'Berggren, Mikael' }]);
   });
 
+  it('warmMembers delegates untouched (0.6.0) — a best-effort read/cache-fill, nothing to guard', async () => {
+    const warmMembers = vi.fn(async () => undefined);
+    const inner = portWith({ warmMembers });
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {} });
+
+    await chats.warmMembers('19:a@thread.v2');
+
+    expect(warmMembers).toHaveBeenCalledWith('19:a@thread.v2');
+  });
+
+  it('warmMembers on an inner port that does not implement it resolves without throwing', async () => {
+    const inner = portWith({}); // sendFile etc. still `reject`, warmMembers simply absent
+    const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {} });
+
+    await expect(chats.warmMembers('19:a@thread.v2')).resolves.toBeUndefined();
+  });
+
   it('pinMessage, unpinMessage and listPinnedMessages all delegate untouched', async () => {
     const pinMessage = vi.fn(async () => [{ id: 'pin-1', messageId: 'm1', preview: 'x' }]);
     const unpinMessage = vi.fn(async () => undefined);

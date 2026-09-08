@@ -266,6 +266,70 @@ describe('GraphTeamsChats.resolveMentions — stale-serve on a throttled/unavail
   });
 });
 
+// Behaviour 4, live 2026-09-08: the daemon-side warm-up — when an allowlisted chat's roster cache
+// is cold, fetch it ONCE (subject to the same throttle/gate discipline as every other refresh) so
+// a later sendFile/mention resolution does not pay the live call. Best-effort: a throttled/failed
+// warm-up leaves the roster cold, exactly as if this method did not exist, never throws.
+describe('GraphTeamsChats.warmMembers — daemon-side cache warm-up on an empty roster (0.6.0, live 2026-09-08)', () => {
+  let dir: string;
+  let path: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'teams-chats-warm-'));
+    path = join(dir, 'members-cache.json');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function subject(fetchFn: typeof fetch, cache: MembersCache, log: (line: string) => void = () => {}) {
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn });
+    return new GraphTeamsChats(graph, { membersCache: cache, log });
+  }
+
+  it('a cold cache (no entry at all) fetches once and caches the result', async () => {
+    const cache = new MembersCache({ path });
+    const { fetchFn, calls } = countingMembersFetch(membersPage);
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    await chats.warmMembers(CHAT);
+
+    expect(calls).toHaveLength(1);
+    expect(cache.get(CHAT)).toEqual([
+      { id: 'aad-mika', displayName: 'Berggren, Mikael' },
+      { id: 'aad-johan', displayName: 'Spännare, Johan' },
+    ]);
+  });
+
+  it('a warm cache (already has an entry, complete OR partial) makes NO /members call', async () => {
+    const cache = new MembersCache({ path });
+    cache.merge(CHAT, [{ id: 'aad-mika', displayName: 'Berggren, Mikael' }]); // partial is enough to skip
+    const { fetchFn, calls } = countingMembersFetch(membersPage);
+    const chats = subject(fetchFn as unknown as typeof fetch, cache);
+
+    await chats.warmMembers(CHAT);
+
+    expect(calls).toHaveLength(0);
+  });
+
+  it('a throttled warm-up never throws — leaves the roster cold and logs one line', async () => {
+    const cache = new MembersCache({ path });
+    const { fetchFn } = countingMembersFetch(() =>
+      json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
+        'retry-after': '100', // past the sleep cap, fails fast — no real wait in this test
+      }),
+    );
+    const lines: string[] = [];
+    const chats = subject(fetchFn as unknown as typeof fetch, cache, (line) => lines.push(line));
+
+    await expect(chats.warmMembers(CHAT)).resolves.toBeUndefined();
+
+    expect(cache.get(CHAT)).toBeUndefined();
+    expect(lines.some((line) => line.includes('warm-up'))).toBe(true);
+  });
+});
+
 describe('buildChats — the composition actually wires the members cache (0.4.1 review round 1)', () => {
   // MAJOR 1: an optional membersCache let the wiring in build-chats.ts be silently dropped with
   // no test noticing (mutation-verified: deleting the wiring left the full suite green). This

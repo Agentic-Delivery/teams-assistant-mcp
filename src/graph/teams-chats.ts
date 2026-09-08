@@ -141,6 +141,12 @@ export interface TeamsChatsPort {
   pinMessage(chatId: string, messageId: string): Promise<PinnedMessage[]>;
   unpinMessage(chatId: string, messageId: string): Promise<void>;
   listPinnedMessages(chatId: string): Promise<PinnedMessage[]>;
+  /**
+   * Daemon-side roster warm-up (0.6.0, live 2026-09-08) — see GraphTeamsChats.warmMembers's own
+   * doc comment. Optional: a caller with no reason to warm anything (every CLI, most of the MCP
+   * tool surface) simply never calls it; the inbox poller (inbox.ts) is the one real caller.
+   */
+  warmMembers?(chatId: string): Promise<void>;
 }
 
 export type { ChatMember, MentionTarget };
@@ -618,6 +624,33 @@ export class GraphTeamsChats implements TeamsChatsPort {
         }
       }
       throw error;
+    }
+  }
+
+  /**
+   * Daemon-side warm-up (behaviour 4, live 2026-09-08 — see KNOWN-ISSUES.md): when an allowlisted
+   * chat's roster cache is COLD (no entry at all, complete or partial — `get()`), fetches it ONCE
+   * so a later sendFile/mention resolution does not pay the live call. A chat with ANY cached
+   * roster is left alone — this exists to avoid a cold miss, not to upgrade a PARTIAL roster to
+   * COMPLETE (membersForInvite's own live refresh already does that when sendFile actually needs
+   * one). Best-effort and NEVER throws: a throttled/failed warm-up leaves the roster exactly as
+   * cold as it would be without this method, logged once for diagnosis — the inbox poller this is
+   * called from must never be taken down by it (same posture as every other poller failure path,
+   * see InboxPoller's own class doc comment).
+   */
+  async warmMembers(chatId: string): Promise<void> {
+    if (this.membersCache.get(chatId)) {
+      return;
+    }
+    try {
+      const fresh = await this.refreshMembers(chatId, 'for daemon warm-up');
+      this.cacheIfNonEmpty(chatId, fresh);
+    } catch (error) {
+      this.log(
+        `warmMembers: /members warm-up for ${chatId} failed ` +
+          `(${error instanceof Error ? error.message : String(error)}); leaving the roster cold ` +
+          'for the next real caller to retry.',
+      );
     }
   }
 
