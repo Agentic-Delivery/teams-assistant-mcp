@@ -5,8 +5,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const CHAT = '19:pilot@thread.v2';
 
-function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+function json(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json', ...headers },
+  });
 }
 
 /** A 429 with a Retry-After long enough that a retry inside this test's own process would sleep
@@ -63,7 +66,7 @@ describe('buildInboxPoller — the real composition, driven end to end (MAJOR 3,
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (url: string) => {
       const u = String(url);
-      if (u.includes('/me?')) {
+      if (u.includes('/me?') && u.includes('select=id')) {
         return json({ id: 'me-id' });
       }
       // Throttled rather than left unhandled: this test's point is that this route is never
@@ -272,6 +275,376 @@ describe('buildInboxPoller — the real composition, driven end to end (MAJOR 3,
       expect(meCalls).toBe(1);
       // /members is never called at all — roster warm-up no longer runs on the poll path.
       expect(membersCalls).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+// Issue #28 (live 2026-09-09): before 0.6.4 the poller's `self` dependency called a raw, unwired
+// `/me?$select=id,displayName` on the graph client — bypassing TEAMS_MCP_SELF_ID and the persisted
+// self-id cache entirely. Under a tenant-wide `/me` 429 with neither available, every poll failed
+// and, after three cycles, forced a token re-authentication for a condition that was never
+// auth-shaped. These tests drive the REAL composition (buildChats + buildInboxPoller), mirroring
+// the sendFile-side proofs in teams-chats.test.ts's "buildChats — the composition wires the self
+// id cache" describe block, but for the poller's own delivery/filtering path.
+describe('buildInboxPoller — self id resolution reuses the seed/cache/live chain (0.6.4, issue #28)', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'build-inbox-poller-selfid-'));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  /** A `/messages` responder that delivers nothing on its first call (the bootstrap/settling poll
+   *  — see inbox.ts's own isBootstrap comment) and the given messages on every call after that. */
+  function messagesAfterSettle(messages: unknown[]) {
+    let calls = 0;
+    return () => {
+      calls += 1;
+      return json({ value: calls === 1 ? [] : messages });
+    };
+  }
+
+  it('TEAMS_MCP_SELF_ID reaches the real poller end to end: a 429ing /me is never even called, and the seeded id filters the assistant\'s own post', async () => {
+    const { loadConfig } = await import('./config.js');
+    const { buildChats } = await import('./build-chats.js');
+    const { buildInboxPoller } = await import('./build-inbox-poller.js');
+
+    const SELF_ID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const configPath = join(dir, 'teams-mcp.config.json');
+    await writeFile(configPath, JSON.stringify({ allowedChats: [{ id: CHAT, label: 'pilot', canPost: true }] }));
+    const config = loadConfig({
+      TEAMS_MCP_CONFIG: configPath,
+      TEAMS_MCP_TENANT_ID: 'tenant',
+      TEAMS_MCP_USERNAME: 'assistant@example.com',
+      TEAMS_MCP_PASSWORD: 'secret',
+      TEAMS_MCP_TOKEN_CACHE: join(dir, '.token-cache.json'),
+      TEAMS_MCP_SELF_ID: SELF_ID,
+    });
+    expect(config.selfIdOverride).toBe(SELF_ID);
+
+    const respondMessages = messagesAfterSettle([
+      {
+        id: 'msg-own',
+        chatId: CHAT,
+        createdDateTime: '2026-09-09T10:00:00Z',
+        from: { user: { id: SELF_ID, displayName: 'Assistant (AI)' } },
+        body: { contentType: 'text', content: 'my own earlier post' },
+      },
+      {
+        id: 'msg-bob',
+        chatId: CHAT,
+        createdDateTime: '2026-09-09T10:01:00Z',
+        from: { user: { id: 'aad-bob', displayName: 'Bob Brown' } },
+        body: { contentType: 'text', content: 'hello from Bob' },
+      },
+    ]);
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string) => {
+      const u = String(url);
+      if (u.includes('/me?') && u.includes('select=id')) {
+        throw new Error('must never call /me — TEAMS_MCP_SELF_ID must win outright');
+      }
+      if (u.includes(`/chats/${encodeURIComponent(CHAT)}/members`)) {
+        // 2026-09-09: /members is never expected to be reached — roster warm-up no longer runs on
+        // the poll path at all. Throttled rather than left unhandled, same convention as the top
+        // describe block: a regression back to the old warm-up would fail loudly, not pass quietly.
+        return throttled();
+      }
+      if (u.includes(`/chats/${encodeURIComponent(CHAT)}/messages`)) {
+        return respondMessages();
+      }
+      throw new Error(`unexpected call in this test: ${u}`);
+    }) as typeof fetch;
+    try {
+      const { chats, tokenProvider, membersCache } = buildChats(config);
+      vi.spyOn(tokenProvider, 'getAccessToken').mockResolvedValue('fake-token');
+
+      const poller = buildInboxPoller({
+        chats,
+        tokenProvider,
+        membersCache,
+        allowlist: config.allowlist,
+        inboxPath: join(dir, 'inbox.jsonl'),
+      });
+
+      await poller.pollOnce(); // settles the watermark, delivers nothing
+      const clean = await poller.pollOnce(); // the two messages above are now "new"
+
+      expect(clean).toBe(true);
+      const inboxRaw = await readFile(join(dir, 'inbox.jsonl'), 'utf8');
+      const delivered = inboxRaw
+        .split('\n')
+        .filter((line) => line.trim() !== '')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(delivered).toHaveLength(1);
+      expect(delivered[0]?.['from']).toBe('Bob Brown'); // the seeded id's OWN post was filtered
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('a persisted self-id cache (no operator seed) reaches the real poller end to end: a 429ing /me is never called, same filtering', async () => {
+    const { loadConfig } = await import('./config.js');
+    const { buildChats } = await import('./build-chats.js');
+    const { buildInboxPoller } = await import('./build-inbox-poller.js');
+    const { FileSelfIdCache } = await import('./graph/self-id-cache.js');
+
+    const configPath = join(dir, 'teams-mcp.config.json');
+    await writeFile(configPath, JSON.stringify({ allowedChats: [{ id: CHAT, label: 'pilot', canPost: true }] }));
+    const config = loadConfig({
+      TEAMS_MCP_CONFIG: configPath,
+      TEAMS_MCP_TENANT_ID: 'tenant',
+      TEAMS_MCP_USERNAME: 'assistant@example.com',
+      TEAMS_MCP_PASSWORD: 'secret',
+      TEAMS_MCP_TOKEN_CACHE: join(dir, '.token-cache.json'),
+    });
+    expect(config.selfIdOverride).toBeUndefined();
+    new FileSelfIdCache({ path: config.selfIdCachePath, expectedUsername: config.username }).write({
+      id: 'aad-cached-self',
+      resolvedAt: 1,
+    });
+
+    const respondMessages = messagesAfterSettle([
+      {
+        id: 'msg-own',
+        chatId: CHAT,
+        createdDateTime: '2026-09-09T10:00:00Z',
+        from: { user: { id: 'aad-cached-self', displayName: 'Assistant (AI)' } },
+        body: { contentType: 'text', content: 'my own earlier post' },
+      },
+      {
+        id: 'msg-bob',
+        chatId: CHAT,
+        createdDateTime: '2026-09-09T10:01:00Z',
+        from: { user: { id: 'aad-bob', displayName: 'Bob Brown' } },
+        body: { contentType: 'text', content: 'hello from Bob' },
+      },
+    ]);
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string) => {
+      const u = String(url);
+      if (u.includes('/me?') && u.includes('select=id')) {
+        throw new Error('must never call /me — the persisted self-id cache is warm');
+      }
+      if (u.includes(`/chats/${encodeURIComponent(CHAT)}/members`)) {
+        return throttled(); // never expected to be reached — see the top describe block's own comment
+      }
+      if (u.includes(`/chats/${encodeURIComponent(CHAT)}/messages`)) {
+        return respondMessages();
+      }
+      throw new Error(`unexpected call in this test: ${u}`);
+    }) as typeof fetch;
+    try {
+      const { chats, tokenProvider, membersCache } = buildChats(config);
+      vi.spyOn(tokenProvider, 'getAccessToken').mockResolvedValue('fake-token');
+
+      const poller = buildInboxPoller({
+        chats,
+        tokenProvider,
+        membersCache,
+        allowlist: config.allowlist,
+        inboxPath: join(dir, 'inbox.jsonl'),
+      });
+
+      await poller.pollOnce();
+      const clean = await poller.pollOnce();
+
+      expect(clean).toBe(true);
+      const inboxRaw = await readFile(join(dir, 'inbox.jsonl'), 'utf8');
+      const delivered = inboxRaw
+        .split('\n')
+        .filter((line) => line.trim() !== '')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(delivered).toHaveLength(1);
+      expect(delivered[0]?.['from']).toBe('Bob Brown');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  // 2026-09-09 (poll-path throttle fix) supersedes this test's original claim (issue #28's own
+  // fix: "a persistently-THROTTLED /me delivers nothing, but never forces a re-auth"). Under the
+  // later fix self-id resolution no longer fails the cycle AT ALL, so messages ARE delivered
+  // throughout — the "never forces a token re-authentication" half still holds, now trivially
+  // (self-id resolution is no longer a cycle failure for trackAuthHealth to ever see), and this
+  // version proves it across SIX cycles, further than the top describe block's own two-cycle
+  // version of the same scenario.
+  it('no operator seed and no persisted cache: a persistently-THROTTLED /me never blocks delivery and never forces a token re-authentication, across six cycles', async () => {
+    const { loadConfig } = await import('./config.js');
+    const { buildChats } = await import('./build-chats.js');
+    const { buildInboxPoller } = await import('./build-inbox-poller.js');
+    const { FileSelfIdCache } = await import('./graph/self-id-cache.js');
+
+    const configPath = join(dir, 'teams-mcp.config.json');
+    await writeFile(configPath, JSON.stringify({ allowedChats: [{ id: CHAT, label: 'pilot', canPost: true }] }));
+    const config = loadConfig({
+      TEAMS_MCP_CONFIG: configPath,
+      TEAMS_MCP_TENANT_ID: 'tenant',
+      TEAMS_MCP_USERNAME: 'assistant@example.com',
+      TEAMS_MCP_PASSWORD: 'secret',
+      TEAMS_MCP_TOKEN_CACHE: join(dir, '.token-cache.json'),
+    });
+    expect(config.selfIdOverride).toBeUndefined();
+    expect(new FileSelfIdCache({ path: config.selfIdCachePath }).read()).toBeUndefined(); // cold
+
+    let meCalls = 0;
+    let messagesCalls = 0;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string) => {
+      const u = String(url);
+      if (u.includes('/me?') && u.includes('select=id')) {
+        meCalls += 1;
+        return throttled();
+      }
+      if (u.includes(`/chats/${encodeURIComponent(CHAT)}/messages`)) {
+        messagesCalls += 1;
+        // Empty on the settling poll only — every cycle after that gets the SAME message id
+        // again on purpose: it is not new after the first delivery, so a bug that re-delivered
+        // it would show up as extra lines, not just a missing one.
+        return json({
+          value:
+            messagesCalls === 1
+              ? []
+              : [
+                  {
+                    id: 'msg-bob',
+                    chatId: CHAT,
+                    createdDateTime: '2026-09-09T10:01:00Z',
+                    from: { user: { id: 'aad-bob', displayName: 'Bob Brown' } },
+                    body: { contentType: 'text', content: 'hello from Bob' },
+                  },
+                ],
+        });
+      }
+      throw new Error(`unexpected call in this test: ${u}`);
+    }) as typeof fetch;
+    try {
+      const { chats, tokenProvider, membersCache } = buildChats(config);
+      vi.spyOn(tokenProvider, 'getAccessToken').mockResolvedValue('fake-token');
+      const invalidateSpy = vi.spyOn(tokenProvider, 'invalidate');
+
+      const poller = buildInboxPoller({
+        chats,
+        tokenProvider,
+        membersCache,
+        allowlist: config.allowlist,
+        inboxPath: join(dir, 'inbox.jsonl'),
+      });
+
+      const firstClean = await poller.pollOnce(); // settle — establishes the watermark
+      expect(firstClean).toBe(true);
+
+      for (let i = 0; i < 5; i += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        const clean = await poller.pollOnce();
+        expect(clean).toBe(true);
+      }
+
+      expect(messagesCalls).toBe(6); // every cycle reads messages regardless of self-id status
+      expect(meCalls).toBe(1); // resolved at most once per process, not retried every cycle
+      expect(invalidateSpy).not.toHaveBeenCalled(); // the forced re-auth path never trips
+
+      const delivered = (await readFile(join(dir, 'inbox.jsonl'), 'utf8'))
+        .split('\n')
+        .filter((line) => line.trim() !== '')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      // The SAME message id every cycle after the settle is not new past its first delivery —
+      // exactly one delivered line, not five.
+      expect(delivered).toHaveLength(1);
+      expect(delivered[0]?.['from']).toBe('Bob Brown');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  // Point 4 of issue #28: the old raw `/me?$select=id,displayName` call also fetched displayName
+  // for isSelf's fallback (a message reporting no fromId at all). That live fetch is dropped;
+  // `assistantDisplayName` — already known from config, unrelated to `/me` — is threaded through
+  // instead. This is the wire proof for that: BuildInboxPollerOptions.assistantDisplayName ->
+  // InboxPollerDeps.self()'s returned `displayName` -> isSelf's fallback match, driven through the
+  // REAL composition so a dropped wire here (not just an inline literal) would fail this test,
+  // same shape as the `roster: membersCache`/`warmupBackoffMs` wire proofs above.
+  it('assistantDisplayName reaches the real InboxPoller and is used by isSelf\'s no-fromId fallback', async () => {
+    const { loadConfig } = await import('./config.js');
+    const { buildChats } = await import('./build-chats.js');
+    const { buildInboxPoller } = await import('./build-inbox-poller.js');
+
+    const SELF_ID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const configPath = join(dir, 'teams-mcp.config.json');
+    await writeFile(configPath, JSON.stringify({ allowedChats: [{ id: CHAT, label: 'pilot', canPost: true }] }));
+    const config = loadConfig({
+      TEAMS_MCP_CONFIG: configPath,
+      TEAMS_MCP_TENANT_ID: 'tenant',
+      TEAMS_MCP_USERNAME: 'assistant@example.com',
+      TEAMS_MCP_PASSWORD: 'secret',
+      TEAMS_MCP_TOKEN_CACHE: join(dir, '.token-cache.json'),
+      TEAMS_MCP_SELF_ID: SELF_ID,
+    });
+
+    // Graph itself reports no `user.id` for this message (an id-less sender shape Graph can
+    // produce) but the SAME displayName the assistant is configured under — only the displayName
+    // fallback, not the id check, can catch this one.
+    const respondMessages = messagesAfterSettle([
+      {
+        id: 'msg-own-no-id',
+        chatId: CHAT,
+        createdDateTime: '2026-09-09T10:00:00Z',
+        from: { user: { displayName: config.assistantDisplayName } },
+        body: { contentType: 'text', content: 'my own post, no fromId reported' },
+      },
+      {
+        id: 'msg-bob',
+        chatId: CHAT,
+        createdDateTime: '2026-09-09T10:01:00Z',
+        from: { user: { id: 'aad-bob', displayName: 'Bob Brown' } },
+        body: { contentType: 'text', content: 'hello from Bob' },
+      },
+    ]);
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string) => {
+      const u = String(url);
+      if (u.includes('/me?') && u.includes('select=id')) {
+        throw new Error('must never call /me — TEAMS_MCP_SELF_ID must win outright');
+      }
+      if (u.includes(`/chats/${encodeURIComponent(CHAT)}/members`)) {
+        return throttled(); // never expected to be reached — see the top describe block's own comment
+      }
+      if (u.includes(`/chats/${encodeURIComponent(CHAT)}/messages`)) {
+        return respondMessages();
+      }
+      throw new Error(`unexpected call in this test: ${u}`);
+    }) as typeof fetch;
+    try {
+      const { chats, tokenProvider, membersCache } = buildChats(config);
+      vi.spyOn(tokenProvider, 'getAccessToken').mockResolvedValue('fake-token');
+
+      const poller = buildInboxPoller({
+        chats,
+        tokenProvider,
+        membersCache,
+        allowlist: config.allowlist,
+        inboxPath: join(dir, 'inbox.jsonl'),
+        assistantDisplayName: config.assistantDisplayName,
+      });
+
+      await poller.pollOnce(); // settles the watermark
+      await poller.pollOnce(); // the two messages above are now "new"
+
+      const inboxRaw = await readFile(join(dir, 'inbox.jsonl'), 'utf8');
+      const delivered = inboxRaw
+        .split('\n')
+        .filter((line) => line.trim() !== '')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(delivered).toHaveLength(1);
+      expect(delivered[0]?.['from']).toBe('Bob Brown'); // the id-less "own" post was still filtered
     } finally {
       globalThis.fetch = originalFetch;
     }

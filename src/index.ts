@@ -68,6 +68,11 @@ async function main(): Promise<void> {
       membersCache,
       allowlist: config.allowlist,
       inboxYieldPath,
+      // Best-effort isSelf displayName fallback (build-inbox-poller.ts) — the id-based check from
+      // resolveSelfId is the primary one; this also covers a message that reports no fromId at
+      // all, or a process whose self-id resolution never succeeds (2026-09-09, poll-path throttle
+      // fix: that no longer blocks the poll either way).
+      assistantDisplayName: config.assistantDisplayName,
       ...(Number.isFinite(pollSeconds) && pollSeconds > 0 ? { pollMs: pollSeconds * 1000 } : {}),
     },
   });

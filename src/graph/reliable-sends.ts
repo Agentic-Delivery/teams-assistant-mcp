@@ -6,6 +6,7 @@ import type {
   OutboundFile,
   OutboundImage,
   PinnedMessage,
+  SelfIdResolution,
   SendFileOptions,
   TeamsChatsPort,
   WarmMembersResult,
@@ -154,6 +155,12 @@ export class ReliableTeamsChats implements TeamsChatsPort {
    *  need the exact same passthrough first. */
   resolveSelfId(): Promise<string | undefined> {
     return this.inner.resolveSelfId?.() ?? Promise.resolve(undefined);
+  }
+
+  /** Pure passthrough — see TeamsChatsPort.resolveSelfIdStatus's own doc comment (0.6.4). Same
+   *  "would silently read as undefined without it" reasoning as resolveSelfId above. */
+  resolveSelfIdStatus(): Promise<SelfIdResolution> {
+    return this.inner.resolveSelfIdStatus?.() ?? Promise.resolve({});
   }
 
   sendMessage(chatId: string, text: string, mentions: readonly MentionTarget[] = []): Promise<ChatMessage> {

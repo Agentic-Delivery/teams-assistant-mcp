@@ -980,6 +980,103 @@ describe('inbox poller — stuck-auth self-healing (0.4.1, live-diagnosed: only 
   });
 });
 
+// Issue #28 (live 2026-09-09): the poller's own `self` dependency used to call a raw `/me` on the
+// graph client, bypassing the operator seed (TEAMS_MCP_SELF_ID) and the persisted self-id cache
+// entirely. Under a tenant-wide `/me` 429 with neither available, every poll failed as an
+// "unrecognised shape" failure and, after three consecutive cycles, forced a token
+// re-authentication for a condition that was never auth-shaped. Issue #28's own first fix made a
+// throttled self-id resolution a properly-classified (but still cycle-FAILING) THROTTLED cycle,
+// exempted from the auth-stuck streak specifically. The SAME-DAY poll-path throttle fix below
+// (see the next describe block) goes further: self-id resolution no longer fails the cycle AT
+// ALL, so it can no longer contribute to the auth-stuck streak either — these two tests keep
+// issue #28's actual regression proof (the forced-re-auth path must never fire on a throttled
+// self-id resolution) but through the CURRENT mechanism, not the superseded one; see
+// KNOWN-ISSUES.md for the full history of both fixes.
+describe('inbox poller — self id resolution never trips the forced-re-auth path (issue #28, live 2026-09-09)', () => {
+  let dir: string;
+  let inboxPath: string;
+  let statePath: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'inbox-selfid-'));
+    inboxPath = join(dir, 'inbox.jsonl');
+    statePath = join(dir, 'inbox-state.json');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function throttledSelfError(): Error {
+    return Object.assign(new Error('Too many requests'), { status: 429 });
+  }
+
+  // The core regression proof for issue #28, re-pointed at the current mechanism: a permanently
+  // throttled self-id resolution must never, across any number of cycles, trip the forced
+  // re-authentication path — and (2026-09-09) must also never stop a single chat being read.
+  it('a self() that stays THROTTLED across six cycles never trips forced re-auth, and every cycle still reads messages', async () => {
+    let onAuthStuckCalls = 0;
+    let readCalls = 0;
+    let selfCalls = 0;
+    const readMessages = () => {
+      readCalls += 1;
+      return Promise.resolve(applyWatermark([], undefined));
+    };
+    const lines: string[] = [];
+    const p = new InboxPoller({
+      chats: { readMessages },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
+      self: () => {
+        selfCalls += 1;
+        return Promise.reject(throttledSelfError());
+      },
+      inboxPath,
+      statePath,
+      authFailureThreshold: 3,
+      onAuthStuck: () => {
+        onAuthStuckCalls += 1;
+      },
+      log: (line) => lines.push(line),
+    });
+
+    for (let i = 0; i < 6; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      const clean = await p.pollOnce();
+      expect(clean).toBe(true);
+    }
+
+    expect(onAuthStuckCalls).toBe(0);
+    expect(lines.some((l) => /forced token re-authentication/.test(l))).toBe(false);
+    expect(readCalls).toBe(6); // every cycle reached readMessages regardless of self-id status
+    expect(selfCalls).toBe(1); // resolved at most once per process, not retried every cycle
+  });
+
+  // A throttled self-id resolution running throughout must not mask or interfere with the
+  // REAL auth-stuck detector reacting to an unrelated, genuinely auth-shaped failure — self-id
+  // resolution and the per-chat read failure streak are fully independent under the current
+  // design (self-id issues never reach trackAuthHealth as a failure at all).
+  it('a permanently-throttled self() does not suppress the auth-stuck detector for a genuine, unrelated auth-shaped read failure', async () => {
+    let onAuthStuckCalls = 0;
+    const p = new InboxPoller({
+      chats: { readMessages: () => Promise.reject(Object.assign(new Error('token expired'), { status: 401 })) },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
+      self: () => Promise.reject(throttledSelfError()),
+      inboxPath,
+      statePath,
+      authFailureThreshold: 3,
+      onAuthStuck: () => {
+        onAuthStuckCalls += 1;
+      },
+    });
+
+    await p.pollOnce(); // 1st auth-shaped read failure
+    await p.pollOnce(); // 2nd
+    expect(onAuthStuckCalls).toBe(0);
+    await p.pollOnce(); // 3rd — fires
+    expect(onAuthStuckCalls).toBe(1);
+  });
+});
+
 describe('inbox poller — the quota yield (0.5.0: the poller starved ad-hoc readers, measured 2026-09-02)', () => {
   let dir: string;
   let inboxPath: string;

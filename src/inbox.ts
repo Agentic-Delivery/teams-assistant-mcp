@@ -69,13 +69,20 @@ export interface InboxPollerDeps {
    * MUST NOT block, and must never fail, a poll cycle (2026-09-09, poll-path throttle fix,
    * live-diagnosed the same day: a throttled `/me` used to fail the WHOLE cycle before a single
    * chat's messages were read — "Graph 429 on /me" followed by "inbox poll failed: Too many
-   * requests" in the daemon log). `build-inbox-poller.ts`'s real implementation wires this to
-   * `GraphTeamsChats.resolveSelfId` — the same operator-seed (`TEAMS_MCP_SELF_ID`) ->
-   * persisted-cache -> live `/me` chain `sendFile` already uses — which never throws. This class
-   * also wraps the call in its own try/catch (see pollAllowlistedChats) as insurance against a
+   * requests" in the daemon log; a related same-day incident (issue #28) diagnosed the same raw,
+   * seed/cache-blind `/me` call as ALSO forcing a token re-authentication for a condition that was
+   * never auth-shaped, three throttled cycles in). `build-inbox-poller.ts`'s real implementation
+   * wires this to `GraphTeamsChats.resolveSelfId` — the same operator-seed (`TEAMS_MCP_SELF_ID`)
+   * -> persisted-cache -> live `/me` chain `sendFile` already uses — which never throws, plus a
+   * config-sourced `assistantDisplayName` that rides along regardless of whether the id itself
+   * resolved (zero Graph cost, so it can never be the reason a poll blocks). This class also wraps
+   * the call in its own try/catch (see pollAllowlistedChats) as insurance against a
    * differently-behaved implementation, same posture as the roster-harvest `.catch` elsewhere in
    * this file: a self implementation that DOES throw or reject degrades self-message filtering
-   * for this cycle rather than skipping any chat's message read.
+   * for this cycle rather than skipping any chat's message read — and because that degrades
+   * filtering rather than failing the cycle, it structurally can never trip the forced re-auth
+   * path either (trackAuthHealth only ever sees a WHOLE-cycle failure, and self-id resolution no
+   * longer produces one).
    */
   self: () => Promise<SignedInAccount>;
   inboxPath: string;
@@ -440,14 +447,19 @@ export class InboxPoller {
     // to be `this.me ??= await this.deps.self()` with NO try/catch — a throttled `/me` threw
     // straight out of this method, so the poll failed before a single chat's messages were read
     // ("Graph 429 on /me" followed by "inbox poll failed: Too many requests" in the daemon log).
+    // A related same-day incident (issue #28) diagnosed the SAME raw call as also forcing a token
+    // re-authentication for a condition that was never auth-shaped, three throttled cycles in.
     // Message reads must never wait on, or be skipped because of, self-id resolution (requirement
     // 1) — so this is now attempted AT MOST ONCE per process (`selfResolutionAttempted`), always
     // wrapped, and a failure here only degrades self-message filtering for chats read below, it
-    // never stops them being read. Retried only once, not every cycle: `deps.self`
-    // (build-inbox-poller.ts) already walks the operator-seed -> persisted-cache -> live `/me`
-    // chain sendFile uses, so a repeat attempt while still unresolved would only ever repeat the
-    // same throttled live call against the same shared budget this whole fix exists to stop
-    // feeding.
+    // never stops them being read; because it can no longer fail the CYCLE at all, it structurally
+    // can never trip the forced re-auth path either — issue #28's fix (exempting a throttled
+    // self-id resolution from the auth-stuck streak specifically) is superseded here, not needed
+    // beside it: trackAuthHealth only ever sees a whole-cycle failure, and self-id resolution no
+    // longer produces one. Retried only once, not every cycle: `deps.self` (build-inbox-poller.ts)
+    // already walks the operator-seed -> persisted-cache -> live `/me` chain sendFile uses, so a
+    // repeat attempt while still unresolved would only ever repeat the same throttled live call
+    // against the same shared budget this whole fix exists to stop feeding.
     if (this.me === undefined && !this.selfResolutionAttempted) {
       this.selfResolutionAttempted = true;
       const resolved = await this.deps.self().catch(() => undefined);
@@ -465,10 +477,10 @@ export class InboxPoller {
 
     const failures: string[] = [];
     const lines: string[] = [];
-
     let throttled = false;
-    let attempted = 0;
     let authShapedFailure = false;
+
+    let attempted = 0;
     for (const entry of this.deps.allowlist.entries()) {
       if (throttled) {
         break; // one 429 ends the cycle — every further request would feed the penalty window
@@ -638,6 +650,15 @@ export class InboxPoller {
    * result. Resetting the streak the instant onAuthStuck is called would therefore claim a
    * recovery the code cannot know yet; the streak (and authRemedyFired) resets ONLY when a
    * subsequent poll actually comes back clean.
+   *
+   * A throttled/unreachable `/me` (issue #28, live 2026-09-09: a tenant-wide `/me` 429 with no
+   * operator seed and no persisted cache used to fail every poll as an "unrecognised shape"
+   * failure and, after three cycles, force a token re-authentication that could never clear a
+   * Graph rate limit) never reaches this method as a failure at ALL any more, rather than being
+   * exempted from the streak here — see the self-id resolution block in pollAllowlistedChats
+   * (2026-09-09, poll-path throttle fix): self-id resolution degrades self-message filtering, it
+   * no longer fails the cycle, so `clean`/`authShaped` above never carry a self-id-only failure in
+   * the first place.
    */
   private trackAuthHealth(clean: boolean, authShaped: boolean): void {
     if (clean) {
