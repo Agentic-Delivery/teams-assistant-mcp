@@ -54,11 +54,6 @@ async function main(): Promise<void> {
   // also does ad-hoc reads slow the poller down; garbage or non-positive values fall back to
   // the default, same posture as every other best-effort env knob.
   const pollSeconds = Number(process.env['TEAMS_INBOX_POLL_SECONDS']);
-  // Per-chat warm-up back-off window (issue a, live-diagnosed 2026-09-08: the SAME chat's roster
-  // warm-up was throttled on two consecutive poll cycles 4 minutes apart). Defaults to
-  // DEFAULT_WARMUP_BACKOFF_MS (15 minutes, see inbox.ts) when unset or garbage — same
-  // best-effort posture as TEAMS_INBOX_POLL_SECONDS above.
-  const warmupBackoffSeconds = Number(process.env['TEAMS_INBOX_WARMUP_BACKOFF_SECONDS']);
   await startInboxSupervision({
     env: process.env,
     inboxPath,
@@ -74,12 +69,11 @@ async function main(): Promise<void> {
       allowlist: config.allowlist,
       inboxYieldPath,
       // Best-effort isSelf displayName fallback (build-inbox-poller.ts) — the id-based check from
-      // resolveSelfIdStatus is authoritative; this only helps a message that reports no fromId.
+      // resolveSelfId is the primary one; this also covers a message that reports no fromId at
+      // all, or a process whose self-id resolution never succeeds (2026-09-09, poll-path throttle
+      // fix: that no longer blocks the poll either way).
       assistantDisplayName: config.assistantDisplayName,
       ...(Number.isFinite(pollSeconds) && pollSeconds > 0 ? { pollMs: pollSeconds * 1000 } : {}),
-      ...(Number.isFinite(warmupBackoffSeconds) && warmupBackoffSeconds > 0
-        ? { warmupBackoffMs: warmupBackoffSeconds * 1000 }
-        : {}),
     },
   });
 }

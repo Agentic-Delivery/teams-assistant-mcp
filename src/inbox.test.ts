@@ -1,11 +1,10 @@
 import { mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ChatAllowlist } from './allowlist.js';
 import {
   DEFAULT_POLL_MS,
-  DEFAULT_WARMUP_BACKOFF_MS,
   InboxPoller,
   PARK_FORBIDDEN_CHAT_MS,
   markThrottled,
@@ -983,13 +982,17 @@ describe('inbox poller — stuck-auth self-healing (0.4.1, live-diagnosed: only 
 
 // Issue #28 (live 2026-09-09): the poller's own `self` dependency used to call a raw `/me` on the
 // graph client, bypassing the operator seed (TEAMS_MCP_SELF_ID) and the persisted self-id cache
-// entirely (build-inbox-poller.ts wires the fix; these tests drive InboxPoller's own reaction to
-// what `self` reports/throws). Under a tenant-wide `/me` 429 with neither available, every poll
-// failed as an "unrecognised shape" failure and, after three consecutive cycles, forced a token
-// re-authentication for a condition that was never auth-shaped. `build-inbox-poller.test.ts`
-// covers the seed/cache SHORT-CIRCUIT end to end through the real composition; these tests pin
-// InboxPoller's own handling once `self` reports the throttle (or a violating, empty success).
-describe('inbox poller — self id resolution reuses the resolveSelfId chain, not a raw /me (issue #28, live 2026-09-09)', () => {
+// entirely. Under a tenant-wide `/me` 429 with neither available, every poll failed as an
+// "unrecognised shape" failure and, after three consecutive cycles, forced a token
+// re-authentication for a condition that was never auth-shaped. Issue #28's own first fix made a
+// throttled self-id resolution a properly-classified (but still cycle-FAILING) THROTTLED cycle,
+// exempted from the auth-stuck streak specifically. The SAME-DAY poll-path throttle fix below
+// (see the next describe block) goes further: self-id resolution no longer fails the cycle AT
+// ALL, so it can no longer contribute to the auth-stuck streak either — these two tests keep
+// issue #28's actual regression proof (the forced-re-auth path must never fire on a throttled
+// self-id resolution) but through the CURRENT mechanism, not the superseded one; see
+// KNOWN-ISSUES.md for the full history of both fixes.
+describe('inbox poller — self id resolution never trips the forced-re-auth path (issue #28, live 2026-09-09)', () => {
   let dir: string;
   let inboxPath: string;
   let statePath: string;
@@ -1004,56 +1007,17 @@ describe('inbox poller — self id resolution reuses the resolveSelfId chain, no
     await rm(dir, { recursive: true, force: true });
   });
 
-  function throttledSelfError(retryAfterSeconds?: number): Error {
-    return Object.assign(new Error('Too many requests'), {
-      status: 429,
-      ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}),
-    });
+  function throttledSelfError(): Error {
+    return Object.assign(new Error('Too many requests'), { status: 429 });
   }
 
-  it('a THROTTLED self-id resolution (no operator seed, no persisted cache) is reported as a throttled cycle — never as "unrecognised shape" — and its Retry-After floors the next delay', async () => {
-    let readCalls = 0;
-    const readMessages = () => {
-      readCalls += 1;
-      return Promise.resolve(applyWatermark([], undefined));
-    };
-    const p = new InboxPoller({
-      chats: { readMessages },
-      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
-      self: () => Promise.reject(throttledSelfError(45)),
-      inboxPath,
-      statePath,
-    });
-
-    const clean = await p.pollOnce();
-
-    expect(clean).toBe(false);
-    // With no known self id, nothing is delivered — including never even ASKING a chat, since
-    // isSelf could not safely filter anything without it (unchanged intent, "a failed /me fails
-    // the whole poll rather than delivering wrongly").
-    expect(readCalls).toBe(0);
-
-    const lines = await inboxLinesAt(inboxPath);
-    expect(lines).toHaveLength(1);
-    expect(String(lines[0]?.['error'])).toMatch(/self id resolution/i);
-    expect(String(lines[0]?.['error'])).not.toMatch(/unrecognised shape/i);
-
-    const health = JSON.parse(
-      await readFile(join(dirname(inboxPath), 'poller-health.json'), 'utf8'),
-    ) as { backoffMs: number };
-    expect(health.backoffMs).toBe(45_000); // Graph's own named wait, not the plain 30s default
-  });
-
-  // The core regression proof for issue #28: before this fix, ANY self() failure (throttled or
-  // not) reached pollOnce's generic catch and counted as an "unrecognised shape" failure exactly
-  // like the shapeless-network-error last-resort tier already tested above — three of them forced
-  // a token re-authentication that could never clear a Graph rate limit. This drives the SAME
-  // "three consecutive failures" shape those tests use, but through a THROTTLED self-id
-  // resolution specifically, and proves the remedy never fires — for six consecutive cycles, not
-  // just three, ruling out "it only takes longer" as an alternate explanation.
-  it('N consecutive THROTTLED self-id-resolution failures never trip the forced re-auth path', async () => {
+  // The core regression proof for issue #28, re-pointed at the current mechanism: a permanently
+  // throttled self-id resolution must never, across any number of cycles, trip the forced
+  // re-authentication path — and (2026-09-09) must also never stop a single chat being read.
+  it('a self() that stays THROTTLED across six cycles never trips forced re-auth, and every cycle still reads messages', async () => {
     let onAuthStuckCalls = 0;
     let readCalls = 0;
+    let selfCalls = 0;
     const readMessages = () => {
       readCalls += 1;
       return Promise.resolve(applyWatermark([], undefined));
@@ -1062,7 +1026,10 @@ describe('inbox poller — self id resolution reuses the resolveSelfId chain, no
     const p = new InboxPoller({
       chats: { readMessages },
       allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
-      self: () => Promise.reject(throttledSelfError()),
+      self: () => {
+        selfCalls += 1;
+        return Promise.reject(throttledSelfError());
+      },
       inboxPath,
       statePath,
       authFailureThreshold: 3,
@@ -1074,29 +1041,26 @@ describe('inbox poller — self id resolution reuses the resolveSelfId chain, no
 
     for (let i = 0; i < 6; i += 1) {
       // eslint-disable-next-line no-await-in-loop
-      await p.pollOnce();
+      const clean = await p.pollOnce();
+      expect(clean).toBe(true);
     }
 
     expect(onAuthStuckCalls).toBe(0);
-    expect(readCalls).toBe(0);
     expect(lines.some((l) => /forced token re-authentication/.test(l))).toBe(false);
+    expect(readCalls).toBe(6); // every cycle reached readMessages regardless of self-id status
+    expect(selfCalls).toBe(1); // resolved at most once per process, not retried every cycle
   });
 
-  // A poll that fails for BOTH a throttled self-id resolution AND some other, unrelated reason on
-  // different cycles must still progress normally — the exemption above is scoped to a cycle
-  // whose ONLY failure is the self-id throttle, not to the poller's auth-stuck detector overall.
-  it('a self-id throttle streak does not suppress the auth-stuck detector for a DIFFERENT, non-throttled failure', async () => {
+  // A throttled self-id resolution running throughout must not mask or interfere with the
+  // REAL auth-stuck detector reacting to an unrelated, genuinely auth-shaped failure — self-id
+  // resolution and the per-chat read failure streak are fully independent under the current
+  // design (self-id issues never reach trackAuthHealth as a failure at all).
+  it('a permanently-throttled self() does not suppress the auth-stuck detector for a genuine, unrelated auth-shaped read failure', async () => {
     let onAuthStuckCalls = 0;
-    let selfCalls = 0;
     const p = new InboxPoller({
       chats: { readMessages: () => Promise.reject(Object.assign(new Error('token expired'), { status: 401 })) },
       allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
-      self: () => {
-        selfCalls += 1;
-        // First two cycles: self-id throttled (exempt). Third onward: self resolves fine, so the
-        // failure moves to the (auth-shaped) chat read — which must still count normally.
-        return selfCalls <= 2 ? Promise.reject(throttledSelfError()) : Promise.resolve(me);
-      },
+      self: () => Promise.reject(throttledSelfError()),
       inboxPath,
       statePath,
       authFailureThreshold: 3,
@@ -1105,63 +1069,13 @@ describe('inbox poller — self id resolution reuses the resolveSelfId chain, no
       },
     });
 
-    await p.pollOnce(); // self-id throttled — exempt
-    await p.pollOnce(); // self-id throttled — exempt
-    expect(onAuthStuckCalls).toBe(0);
-    await p.pollOnce(); // self resolves; chat read is 401 — 1st real auth-shaped failure
+    await p.pollOnce(); // 1st auth-shaped read failure
     await p.pollOnce(); // 2nd
+    expect(onAuthStuckCalls).toBe(0);
     await p.pollOnce(); // 3rd — fires
     expect(onAuthStuckCalls).toBe(1);
   });
-
-  // Violating-double guard: a `self` implementation is an external-facing seam (build-inbox-
-  // poller.ts backs it with a live Graph call) and this poller must not trust a value from it
-  // that violates the "resolved means a real id" contract — a RESOLUTION (not a rejection)
-  // reporting no id at all is exactly that shape. Before this guard, `this.me ??= await
-  // this.deps.self()` would have memoized `{}` forever and isSelf's `undefined === undefined`
-  // comparisons would never have matched, so EVERY message — including a genuine other member's —
-  // would have been delivered unfiltered for the rest of the process's life.
-  it('a `self` that resolves (not throws) with no id at all is not trusted — nothing is delivered, and the next poll retries it', async () => {
-    let selfCalls = 0;
-    let readCalls = 0;
-    const readMessages = () => {
-      readCalls += 1;
-      return Promise.resolve(
-        applyWatermark([message({ id: 'alice-1', text: 'hi', fromId: 'alice-id', from: 'Alice' })], undefined),
-      );
-    };
-    const p = new InboxPoller({
-      chats: { readMessages },
-      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
-      self: () => {
-        selfCalls += 1;
-        return Promise.resolve({}); // VIOLATES the contract: a "success" with no id at all
-      },
-      inboxPath,
-      statePath,
-    });
-
-    const clean = await p.pollOnce();
-
-    expect(clean).toBe(false);
-    expect(readCalls).toBe(0); // the loop never runs without a KNOWN self id — Alice's message
-    // above is never even fetched, let alone delivered unfiltered.
-    const lines = await inboxLinesAt(inboxPath);
-    expect(lines.every((line) => !('from' in line))).toBe(true); // no delivered MESSAGE line
-    expect(String(lines[0]?.['error'])).toMatch(/self id resolution/i);
-
-    await p.pollOnce();
-    expect(selfCalls).toBe(2); // never memoized on an id-less "success" — retried every cycle
-  });
 });
-
-async function inboxLinesAt(inboxPath: string): Promise<Array<Record<string, unknown>>> {
-  const raw = await readFile(inboxPath, 'utf8').catch(() => '');
-  return raw
-    .split('\n')
-    .filter((line) => line.trim() !== '')
-    .map((line) => JSON.parse(line) as Record<string, unknown>);
-}
 
 describe('inbox poller — the quota yield (0.5.0: the poller starved ad-hoc readers, measured 2026-09-02)', () => {
   let dir: string;
@@ -1398,17 +1312,22 @@ describe('inbox poller — roster harvest from poll results (mitigation 2)', () 
   });
 });
 
-// Behaviour 4, live 2026-09-08: when an allowlisted chat appears and its roster cache is cold,
-// warm it once (GraphTeamsChats.warmMembers, teams-chats.ts) so a later sendFile/mention
-// resolution does not pay the live call. `chats.warmMembers` is optional on the poller's own dep
-// type (TeamsChatsPort) — a double without it must not make the poller misbehave either.
-describe('inbox poller — daemon-side roster warm-up (0.6.0)', () => {
+// 2026-09-09 (poll-path throttle fix, live-diagnosed the same day): a throttled `/me` or
+// `/chats/{id}/members` call used to fail or stall the WHOLE poll cycle before a single chat's
+// messages were read — "Graph 429 on /me" followed by "inbox poll failed: Too many requests", and
+// separately "warmMembers: /members warm-up ... failed (THROTTLED ...)" followed by "inbox poll
+// failed: <chat>: THROTTLED (member roster warm-up)" (that second coupling closed by DELETING the
+// poll-path warm-up entirely — see the now-removed "daemon-side roster warm-up (0.6.0)" describe
+// block, replaced by nothing, since there is nothing left on the poll path to warm). Message reads
+// must never wait on, or be skipped because of, self-id resolution — see docs/throttling-
+// mitigation.md's dated section.
+describe('inbox poller — self-id resolution never blocks a message read (2026-09-09, poll-path throttle fix)', () => {
   let dir: string;
   let inboxPath: string;
   let statePath: string;
 
   beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), 'inbox-warmup-test-'));
+    dir = await mkdtemp(join(tmpdir(), 'inbox-selfid-test-'));
     inboxPath = join(dir, 'inbox.jsonl');
     statePath = join(dir, 'inbox-state.json');
   });
@@ -1417,103 +1336,146 @@ describe('inbox poller — daemon-side roster warm-up (0.6.0)', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  function pollerWithWarm(
-    chats: Pick<ReturnType<typeof chatStore>, 'readMessages'> & {
-      warmMembers: (chatId: string) => Promise<{ throttled: boolean; retryAfterSeconds?: number }>;
-    },
-    chatIds = [CHAT],
-  ) {
-    return new InboxPoller({
-      chats,
-      allowlist: new ChatAllowlist(chatIds.map((id) => ({ id, label: id, canPost: true }))),
-      self: () => Promise.resolve(me),
+  async function inboxLines(): Promise<Array<Record<string, unknown>>> {
+    const raw = await readFile(inboxPath, 'utf8').catch(() => '');
+    return raw
+      .split('\n')
+      .filter((line) => line.trim() !== '')
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+  }
+
+  it('a self() that ALWAYS throws (a 429-shaped error, standing in for a throttled /me) never fails the poll, and messages are still delivered', async () => {
+    const store = chatStore({});
+    let selfCalls = 0;
+    const throwingSelf = (): Promise<{ id?: string; displayName?: string }> => {
+      selfCalls += 1;
+      return Promise.reject(Object.assign(new Error('Too many requests'), { status: 429 }));
+    };
+    const settlingPoller = new InboxPoller({
+      chats: store,
+      allowlist: new ChatAllowlist([{ id: CHAT, label: CHAT, canPost: true }]),
+      self: throwingSelf,
       inboxPath,
       statePath,
     });
-  }
+    await settlingPoller.pollOnce(); // bootstrap/settling poll — establishes the watermark
 
-  it('TRIGGERING: warms each allowlisted chat exactly once, even across several poll cycles', async () => {
-    const store = chatStore({});
-    const warmed: string[] = [];
-    const chats = {
-      ...store,
-      warmMembers: async (chatId: string) => {
-        warmed.push(chatId);
-        return { throttled: false };
-      },
-    };
-    const p = pollerWithWarm(chats);
+    store.add(CHAT, message({ id: 'a', text: 'still here?', createdDateTime: '2026-09-09T10:00:00Z' }));
+    const clean = await settlingPoller.pollOnce();
 
-    await p.pollOnce();
-    await p.pollOnce();
-    await p.pollOnce();
-
-    expect(warmed).toEqual([CHAT]); // once, not once per cycle
+    expect(clean).toBe(true);
+    expect(await inboxLines()).toEqual([
+      { chat: CHAT, id: 'a', from: 'Alice', at: '2026-09-09T10:00:00Z', text: 'still here?', attachments: 0 },
+    ]);
+    // Retried at most once per process, not once per cycle — see the class doc comment on
+    // selfResolutionAttempted for why: `self` (build-inbox-poller.ts) already walks the
+    // operator-seed -> persisted-cache -> live /me chain, so repeating a failed attempt every
+    // cycle would only ever repeat the same throttled call against the same shared budget.
+    expect(selfCalls).toBe(1);
   });
 
-  it('NON-TRIGGERING: a chats double with no warmMembers at all does not throw and polls normally', async () => {
+  it('the health file reports ok when only self-id resolution is throttled and every chat reads cleanly', async () => {
     const store = chatStore({});
-    store.add(CHAT, message({ id: 'a', from: 'Alice', fromId: 'alice-id' }));
     const poller = new InboxPoller({
-      chats: store, // deliberately no warmMembers property at all
+      chats: store,
+      allowlist: new ChatAllowlist([{ id: CHAT, label: CHAT, canPost: true }]),
+      self: () => Promise.reject(Object.assign(new Error('Too many requests'), { status: 429 })),
+      inboxPath,
+      statePath,
+      healthPath: join(dir, 'poller-health.json'),
+      pid: 4242,
+    });
+
+    await poller.pollOnce();
+
+    const health = JSON.parse(await readFile(join(dir, 'poller-health.json'), 'utf8')) as { ok: boolean };
+    expect(health.ok).toBe(true);
+  });
+
+  it('a self() that rejects logs the degradation exactly once across many cycles, not once per cycle', async () => {
+    const store = chatStore({});
+    const lines: string[] = [];
+    const poller = new InboxPoller({
+      chats: store,
+      allowlist: new ChatAllowlist([{ id: CHAT, label: CHAT, canPost: true }]),
+      self: () => Promise.reject(new Error('throttled')),
+      inboxPath,
+      statePath,
+      log: (line) => lines.push(line),
+    });
+
+    await poller.pollOnce();
+    await poller.pollOnce();
+    await poller.pollOnce();
+
+    const degradedLines = lines.filter((line) => line.includes('self id could not be resolved'));
+    expect(degradedLines).toHaveLength(1);
+  });
+
+  it('a self() that eventually resolves logs the resolution exactly once, as its own state transition', async () => {
+    const store = chatStore({});
+    const lines: string[] = [];
+    const poller = new InboxPoller({
+      chats: store,
       allowlist: new ChatAllowlist([{ id: CHAT, label: CHAT, canPost: true }]),
       self: () => Promise.resolve(me),
       inboxPath,
       statePath,
+      log: (line) => lines.push(line),
     });
 
-    const clean = await poller.pollOnce();
+    await poller.pollOnce();
+    await poller.pollOnce();
 
-    expect(clean).toBe(true);
+    const resolvedLines = lines.filter((line) => line.includes('self id resolved'));
+    expect(resolvedLines).toHaveLength(1);
   });
 
-  // Defensive only: GraphTeamsChats.warmMembers's own contract is "never throws" (it reports
-  // throttling via its returned WarmMembersResult, not an exception) — this covers a
-  // DIFFERENTLY-BEHAVED TeamsChatsPort implementation (a test double, a future decorator) that
-  // violates that contract anyway, matching this poller's own "never take the server down"
-  // doctrine either way.
-  it("a warmMembers that THROWS (misbehaving port, not GraphTeamsChats's own contract) never fails the poll cycle", async () => {
+  it('a self() that resolves with neither id nor displayName is treated the same as an unresolved self — degrades, does not throw, does not stop message delivery', async () => {
     const store = chatStore({});
-    const chats = {
-      ...store,
-      warmMembers: async (): Promise<{ throttled: boolean }> => {
-        throw new Error('THROTTLED: the member list refresh for daemon warm-up was throttled');
-      },
-    };
+    const settlingPoller = new InboxPoller({
+      chats: store,
+      allowlist: new ChatAllowlist([{ id: CHAT, label: CHAT, canPost: true }]),
+      self: () => Promise.resolve({}),
+      inboxPath,
+      statePath,
+    });
+    await settlingPoller.pollOnce();
+    store.add(CHAT, message({ id: 'a', text: 'hello', createdDateTime: '2026-09-09T10:00:00Z' }));
 
-    const clean = await pollerWithWarm(chats).pollOnce();
+    const clean = await settlingPoller.pollOnce();
 
     expect(clean).toBe(true);
+    expect((await inboxLines()).map((line) => line['id'])).toEqual(['a']);
   });
 
-  // Review round 1 MAJOR 4 (fresh-context re-review of PR #24): warmMembers reporting `true`
-  // (throttled) must stop the CYCLE from asking for more — same "one 429 ends the cycle" rule
-  // readMessages's own 429 handling already follows — rather than proceeding to readMessages for
-  // the SAME chat, or warming/reading any LATER chat in the same cycle (the exact amplification
-  // shape: a second cold chat's warm-up issuing ANOTHER live 429 the same cycle).
-  it('TRIGGERING: a warmMembers reporting throttled:true stops the cycle — no readMessages for that chat or any later one', async () => {
-    const CHAT_B = '19:chat-b@thread.v2';
-    const readCalls: string[] = [];
-    const store = {
-      readMessages: async (chatId: string) => {
-        readCalls.push(chatId);
-        return applyWatermark([], undefined);
-      },
-    };
-    const warmCalls: string[] = [];
-    const chats = {
-      ...store,
-      warmMembers: async (chatId: string) => {
-        warmCalls.push(chatId);
-        return { throttled: true }; // the FIRST cold chat's warm-up was itself throttled
-      },
-    };
+  // Fix round 1, Opus review MAJOR 1: build-inbox-poller.ts's `self` always returns a
+  // `displayName` when `assistantDisplayName` is configured (which it always is in production —
+  // config.ts defaults it, index.ts always passes it), REGARDLESS of whether the id itself
+  // resolved. Before this fix, the OLD condition (`resolved.id !== undefined ||
+  // resolved.displayName !== undefined`) logged "self id resolved" on THIS exact shape — id
+  // undefined, displayName present — which is precisely what a persistently-throttled `/me` with
+  // no seed/cache produces through the real composition (see build-inbox-poller.test.ts's own
+  // composition test for the end-to-end reproduction). "Resolved" now means an id, nothing else:
+  // the degraded line fires, not the success one, even though `this.me` still gets set (a
+  // display-name-only fallback is still worth having for isSelf's no-fromId branch).
+  it('a self() that resolves with a displayName but no id logs the DEGRADED line, never "resolved" — "resolved" means an id, nothing else', async () => {
+    const store = chatStore({});
+    const lines: string[] = [];
+    const poller = new InboxPoller({
+      chats: store,
+      allowlist: new ChatAllowlist([{ id: CHAT, label: CHAT, canPost: true }]),
+      self: () => Promise.resolve({ displayName: 'Assistant (AI)' }),
+      inboxPath,
+      statePath,
+      log: (line) => lines.push(line),
+    });
 
-    const clean = await pollerWithWarm(chats, [CHAT, CHAT_B]).pollOnce();
+    await poller.pollOnce();
+    await poller.pollOnce();
 
-    expect(warmCalls).toEqual([CHAT]); // never reached chat B's warm-up either
-    expect(readCalls).toEqual([]); // readMessages never called for EITHER chat this cycle
-    expect(clean).toBe(false); // a throttled cycle is never clean (same rule as a messages 429)
+    expect(lines.some((line) => line.includes('self id resolved'))).toBe(false);
+    expect(lines.filter((line) => line.includes('self id could not be resolved'))).toHaveLength(1);
   });
 });
 
@@ -1541,225 +1503,5 @@ describe('markThrottled — the throttled/failures pairing cannot drift apart (0
     markThrottled(failures, 'second');
 
     expect(failures).toEqual(['first', 'second']);
-  });
-});
-
-// Issue (a), live 2026-09-08: the SAME chat's member-roster warm-up was THROTTLED on two
-// consecutive poll cycles 4 minutes apart (14:42Z, 14:46Z) — the old "warm once, ever" gate
-// (a Set marking a chat as attempted the moment warmMembers was FIRST called, whatever the
-// outcome) only prevented a second attempt within one process lifetime; two attempts that close
-// together meant the guard was not doing its job within a single lifetime either way this incident
-// was actually produced. A per-chat back-off window closes that gap: after a throttled warm-up,
-// the SAME chat is not re-warmed until the window elapses (Graph's own Retry-After when the 429
-// named one, else the configurable default `warmupBackoffMs` / `TEAMS_INBOX_WARMUP_BACKOFF_SECONDS`,
-// DEFAULT_WARMUP_BACKOFF_MS). A successful warm-up still marks the chat COMPLETE forever, unchanged
-// from 0.6.0 (see the "warms each allowlisted chat exactly once" test above, which still passes
-// unmodified against this change).
-describe('inbox poller — per-chat warm-up back-off window (0.6.3, live 2026-09-08 14:42Z/14:46Z)', () => {
-  let dir: string;
-  let inboxPath: string;
-  let statePath: string;
-  let clock: number;
-
-  beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), 'inbox-warmup-backoff-'));
-    inboxPath = join(dir, 'inbox.jsonl');
-    statePath = join(dir, 'inbox-state.json');
-    // 2026-09-08T14:42:00.000Z — the live incident's own first throttled timestamp.
-    clock = Date.parse('2026-09-08T14:42:00.000Z');
-  });
-
-  afterEach(async () => {
-    await rm(dir, { recursive: true, force: true });
-  });
-
-  function pollerOverWarm(
-    warmMembers: (chatId: string) => Promise<{ throttled: boolean; retryAfterSeconds?: number }>,
-    overrides: { warmupBackoffMs?: number } = {},
-  ) {
-    const readCalls: string[] = [];
-    const readMessages = async (chatId: string, since?: string) => {
-      readCalls.push(chatId);
-      return applyWatermark([], since);
-    };
-    const poller = new InboxPoller({
-      chats: { readMessages, warmMembers },
-      allowlist: new ChatAllowlist([{ id: CHAT, label: CHAT, canPost: true }]),
-      self: () => Promise.resolve(me),
-      inboxPath,
-      statePath,
-      nowFn: () => clock,
-      ...overrides,
-    });
-    return { poller, readCalls };
-  }
-
-  it('TRIGGERING: a cycle inside the back-off window (4 minutes after a throttled warm-up, well under the 15-minute default) does NOT call warmMembers again', async () => {
-    const warmCalls: string[] = [];
-    const warmMembers = async (chatId: string) => {
-      warmCalls.push(chatId);
-      return { throttled: true }; // Graph named no Retry-After — the incident's own log line
-    };
-    const { poller, readCalls } = pollerOverWarm(warmMembers);
-
-    const cycle1 = await poller.pollOnce(); // 14:42Z
-    expect(warmCalls).toEqual([CHAT]);
-    expect(cycle1).toBe(false); // a throttled warm-up ends the cycle, same as a throttled read
-
-    clock += 4 * 60_000; // 14:46Z — the live incident's own second attempt
-    const cycle2 = await poller.pollOnce();
-
-    expect(warmCalls).toEqual([CHAT]); // NOT re-warmed — still inside the 15-minute default window
-    expect(readCalls).toEqual([CHAT]); // the chat is not stuck: readMessages proceeds normally once warm-up is skipped
-    expect(cycle2).toBe(true); // no throttle THIS cycle since warm-up was never attempted
-  });
-
-  it('NON-TRIGGERING: the cycle after the back-off window elapses calls warmMembers again', async () => {
-    const warmCalls: string[] = [];
-    const warmMembers = async (chatId: string) => {
-      warmCalls.push(chatId);
-      return { throttled: true };
-    };
-    const { poller } = pollerOverWarm(warmMembers);
-
-    await poller.pollOnce(); // 14:42Z — opens the window
-    clock += 16 * 60_000; // 14:58Z — 16 minutes later, past the 15-minute default window
-    const cycle = await poller.pollOnce();
-
-    expect(warmCalls).toEqual([CHAT, CHAT]); // retried once the window elapsed
-    expect(cycle).toBe(false); // still throttled again in this test's fixture
-  });
-
-  // MAJOR 1 (review round 1, fresh-context re-review): Retry-After FLOORS the configured/default
-  // window rather than replacing it — a short named wait (GraphClient's LocallyThrottled gate can
-  // forward `retryAfterSeconds` as low as a handful of seconds, `ceil(remaining/1000)`) must not
-  // re-open the chat before the default window would have anyway. Reproduced live as 5 warm-up
-  // attempts in 5 consecutive 30s cycles before this fix.
-  it('TRIGGERING: a Retry-After SHORTER than the default (5s) never re-opens the chat sooner than the default window', async () => {
-    const warmCalls: string[] = [];
-    const warmMembers = async (chatId: string) => {
-      warmCalls.push(chatId);
-      return { throttled: true, retryAfterSeconds: 5 }; // far under the 15-minute default
-    };
-    const { poller } = pollerOverWarm(warmMembers);
-
-    await poller.pollOnce(); // 14:42Z
-    clock += 30_000; // one ordinary 30s poll cycle later — well past the named 5s, still far inside the default
-    await poller.pollOnce();
-
-    expect(warmCalls).toEqual([CHAT]); // NOT retried — the default window floors the short Retry-After
-  });
-
-  it('NON-TRIGGERING: a Retry-After LONGER than the default raises the window past the default instead of being ignored', async () => {
-    const warmCalls: string[] = [];
-    const warmMembers = async (chatId: string) => {
-      warmCalls.push(chatId);
-      return { throttled: true, retryAfterSeconds: 20 * 60 }; // 20 minutes — longer than the 15-minute default
-    };
-    const { poller } = pollerOverWarm(warmMembers);
-
-    await poller.pollOnce(); // 14:42Z
-    clock += 16 * 60_000; // 14:58Z — past the 15-minute DEFAULT, still short of the named 20 minutes
-    await poller.pollOnce();
-    expect(warmCalls).toEqual([CHAT]); // not yet — the longer named wait wins (a floor, not a default cap)
-
-    clock += 5 * 60_000; // 15:03Z — now past the named 20 minutes too
-    await poller.pollOnce();
-    expect(warmCalls).toEqual([CHAT, CHAT]); // retried once the LONGER of the two windows elapsed
-  });
-
-  it('a configured warmupBackoffMs overrides the default when Graph named no Retry-After', async () => {
-    const warmCalls: string[] = [];
-    const warmMembers = async (chatId: string) => {
-      warmCalls.push(chatId);
-      return { throttled: true };
-    };
-    const { poller } = pollerOverWarm(warmMembers, { warmupBackoffMs: 60_000 }); // 1 minute, not the 15-minute default
-
-    await poller.pollOnce(); // 14:42Z
-    clock += 90_000; // 90s later — past the configured 1-minute window
-    await poller.pollOnce();
-
-    expect(warmCalls).toEqual([CHAT, CHAT]);
-  });
-
-  it('DEFAULT_WARMUP_BACKOFF_MS is exported and is 15 minutes, matching the README/env.example default', () => {
-    expect(DEFAULT_WARMUP_BACKOFF_MS).toBe(15 * 60_000);
-  });
-
-  // MINOR (review round 1): retryAfterSeconds is data from an UNTRUSTED-ish source (a header
-  // Graph itself sends, but shaped by a numeric parse — see graph-client.ts's retryAfterSecondsOf)
-  // and warmupBackoffFor's own guard (typeof === 'number' && Number.isFinite && > 0) was previously
-  // untested at the boundary values that actually exercise it. Each of these three is mutation-
-  // silent without its own test: dropping the guard entirely would only show up on exactly these
-  // inputs, not on the "happy path" values (120, undefined) the tests above already use.
-  it('retryAfterSeconds 0 falls back to the configured default window, not "no back-off at all"', async () => {
-    const warmCalls: string[] = [];
-    const warmMembers = async (chatId: string) => {
-      warmCalls.push(chatId);
-      return { throttled: true, retryAfterSeconds: 0 };
-    };
-    const { poller } = pollerOverWarm(warmMembers);
-
-    await poller.pollOnce(); // 14:42Z
-    clock += 30_000; // one ordinary poll cycle later — nowhere near the 15-minute default
-    await poller.pollOnce();
-
-    expect(warmCalls).toEqual([CHAT]); // NOT retried — 0 must not collapse the window to nothing
-  });
-
-  it('retryAfterSeconds NaN falls back to the default window instead of wedging the chat cold forever', async () => {
-    // Without the Number.isFinite guard, `this.now() + NaN` computes to NaN; every later
-    // `backoffUntil <= this.now()` comparison against NaN is false, so the chat would NEVER be
-    // re-warmed again for the rest of the process's lifetime — silently worse than the 0.6.0
-    // "warm once, ever" behaviour this branch replaces.
-    const warmCalls: string[] = [];
-    const warmMembers = async (chatId: string) => {
-      warmCalls.push(chatId);
-      return { throttled: true, retryAfterSeconds: Number.NaN };
-    };
-    const { poller } = pollerOverWarm(warmMembers);
-
-    await poller.pollOnce(); // 14:42Z
-    clock += 20 * 60_000; // 20 minutes later — past the 15-minute default
-    await poller.pollOnce();
-
-    expect(warmCalls).toEqual([CHAT, CHAT]); // retried — NaN falls back to the default, not "never"
-  });
-
-  it('a pathological retryAfterSeconds (1e9) is capped at the 1-hour sanity ceiling, not used literally', async () => {
-    const warmCalls: string[] = [];
-    const warmMembers = async (chatId: string) => {
-      warmCalls.push(chatId);
-      return { throttled: true, retryAfterSeconds: 1e9 }; // ~31 years, uncapped
-    };
-    const { poller } = pollerOverWarm(warmMembers);
-
-    await poller.pollOnce(); // 14:42Z
-    clock += 59 * 60_000; // 59 minutes later — still inside the 1-hour cap
-    await poller.pollOnce();
-    expect(warmCalls).toEqual([CHAT]); // not yet
-
-    clock += 2 * 60_000; // 61 minutes total — past the 1-hour cap
-    await poller.pollOnce();
-    expect(warmCalls).toEqual([CHAT, CHAT]); // capped at 1 hour, not left cold indefinitely
-  });
-
-  // MINOR (review round 1): a warm-up 429 shares the SAME `/members` gate a message-read 429
-  // closes — readMessages's own 429 handling already floors the whole poll's NEXT delay via
-  // noteRetryAfter (see "Retry-After as the backoff floor" describe block above); a warm-up 429
-  // used not to, so the poller could come back for the NEXT cycle sooner than Graph itself asked.
-  it("a throttled warm-up's Retry-After also floors the whole poll cycle's own next delay, same as a throttled message read", async () => {
-    const warmMembers = async () => ({ throttled: true, retryAfterSeconds: 120 });
-    const { poller } = pollerOverWarm(warmMembers);
-
-    await poller.pollOnce();
-
-    const health = JSON.parse(await readFile(join(dir, 'poller-health.json'), 'utf8')) as {
-      backoffMs: number;
-    };
-    // Blind doubling alone would report DEFAULT_POLL_MS (30s); Graph asked for 120s via the
-    // warm-up's own throttled result.
-    expect(health.backoffMs).toBe(120_000);
   });
 });

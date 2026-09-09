@@ -266,111 +266,53 @@ describe('GraphTeamsChats.resolveMentions — stale-serve on a throttled/unavail
   });
 });
 
-// Behaviour 4, live 2026-09-08: the daemon-side warm-up — when an allowlisted chat's roster cache
-// is cold, fetch it ONCE (subject to the same throttle/gate discipline as every other refresh) so
-// a later sendFile/mention resolution does not pay the live call. Best-effort: a throttled/failed
-// warm-up leaves the roster cold, exactly as if this method did not exist, never throws.
-describe('GraphTeamsChats.warmMembers — daemon-side cache warm-up on an empty roster (0.6.0, live 2026-09-08)', () => {
-  let dir: string;
-  let path: string;
-
-  beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), 'teams-chats-warm-'));
-    path = join(dir, 'members-cache.json');
-  });
-
-  afterEach(async () => {
-    await rm(dir, { recursive: true, force: true });
-  });
-
-  function subject(fetchFn: typeof fetch, cache: MembersCache, log: (line: string) => void = () => {}) {
-    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn });
-    return new GraphTeamsChats(graph, { membersCache: cache, log });
-  }
-
-  it('a cold cache (no entry at all) fetches once, caches the result, and reports NOT throttled', async () => {
-    const cache = new MembersCache({ path });
-    const { fetchFn, calls } = countingMembersFetch(membersPage);
-    const chats = subject(fetchFn as unknown as typeof fetch, cache);
-
-    await expect(chats.warmMembers(CHAT)).resolves.toEqual({ throttled: false });
-
-    expect(calls).toHaveLength(1);
-    expect(cache.get(CHAT)).toEqual([
-      { id: 'aad-mika', displayName: 'Berggren, Mikael' },
-      { id: 'aad-johan', displayName: 'Spännare, Johan' },
-    ]);
-  });
-
-  it('a warm cache (already has an entry, complete OR partial) makes NO /members call, reports NOT throttled', async () => {
-    const cache = new MembersCache({ path });
-    cache.merge(CHAT, [{ id: 'aad-mika', displayName: 'Berggren, Mikael' }]); // partial is enough to skip
-    const { fetchFn, calls } = countingMembersFetch(membersPage);
-    const chats = subject(fetchFn as unknown as typeof fetch, cache);
-
-    await expect(chats.warmMembers(CHAT)).resolves.toEqual({ throttled: false });
-
-    expect(calls).toHaveLength(0);
-  });
-
-  it('a throttled warm-up never throws, leaves the roster cold, logs one line, and reports throttled: true with Graph\'s own Retry-After', async () => {
-    const cache = new MembersCache({ path });
-    const { fetchFn } = countingMembersFetch(() =>
-      json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
-        'retry-after': '100', // past the sleep cap, fails fast — no real wait in this test
-      }),
-    );
-    const lines: string[] = [];
-    const chats = subject(fetchFn as unknown as typeof fetch, cache, (line) => lines.push(line));
-
-    // 0.6.3: retryAfterSeconds now travels with the throttled result so a caller (inbox.ts's
-    // per-chat warm-up back-off window) can honour Graph's own named wait instead of a guess.
-    await expect(chats.warmMembers(CHAT)).resolves.toEqual({ throttled: true, retryAfterSeconds: 100 });
-
-    expect(cache.get(CHAT)).toBeUndefined();
-    expect(lines.some((line) => line.includes('warm-up'))).toBe(true);
-  });
-
-  // Review round 1 MAJOR 4 (fresh-context re-review of PR #24): warmMembers used to call
-  // refreshMembers with the SAME bounded retry budget (LIVE_MEMBERS_REFRESH_RETRIES, up to 2
-  // real Retry-After sleeps) as membersForInvite/resolveMentions — but unlike those two, this is
-  // called from INSIDE the poller's per-chat loop and AWAITED there, so a real (honourable, under
-  // the 90s cap) Retry-After genuinely slept the whole poll cycle. One attempt, no retry, is the
-  // fix: this proves it with a retry-after (30s) that WOULD have triggered a real sleep under the
-  // old readRetries default — the injected sleepFn must never be called at all.
-  it('a single (honourable, under-cap) Retry-After never triggers a sleep — one attempt, no retry, ever', async () => {
-    const cache = new MembersCache({ path });
-    let attempts = 0;
+// 2026-09-09 (poll-path throttle fix): resolveSelfId went from a private helper (used only by
+// sendFile, exercised only indirectly through it below) to a public TeamsChatsPort method the
+// inbox poller now calls directly (build-inbox-poller.ts). A direct test pins the one contract
+// the new caller actually relies on: a throttled/failed live /me degrades to `undefined`, it never
+// throws — sendFile's own tests already cover the seed/memo/cache short-circuits this shares.
+describe('GraphTeamsChats.resolveSelfId — public port method (2026-09-09, poll-path throttle fix)', () => {
+  it('a throttled live /me (no seed, no persisted cache) resolves to undefined rather than throwing', async () => {
     const fetchFn = vi.fn(async (url: string) => {
-      if (String(url).includes('/members')) {
-        attempts += 1;
+      if (String(url).includes('/me?')) {
         return json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
-          'retry-after': '30', // well under MAX_RETRY_SLEEP_MS (90s) — a retry loop WOULD sleep this
+          'retry-after': '100',
         });
       }
       throw new Error(`unexpected call: ${String(url)}`);
     });
-    const sleepFn = vi.fn(async () => {
-      throw new Error('warmMembers must never sleep — it runs inside the poller\'s awaited cycle');
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch });
+    const chats = new GraphTeamsChats(graph, { membersCache: new MembersCache({ path: '/dev/null' }) });
+
+    await expect(chats.resolveSelfId()).resolves.toBeUndefined();
+  });
+
+  it('TEAMS_MCP_SELF_ID (selfIdOverride) answers with zero /me calls, same as the private path sendFile uses', async () => {
+    const fetchFn = vi.fn(async (url: string) => {
+      throw new Error(`unexpected call: ${String(url)}`);
     });
-    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch, sleepFn });
-    const chats = new GraphTeamsChats(graph, { membersCache: cache });
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch });
+    const chats = new GraphTeamsChats(graph, {
+      membersCache: new MembersCache({ path: '/dev/null' }),
+      selfIdOverride: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+    });
 
-    await expect(chats.warmMembers(CHAT)).resolves.toEqual({ throttled: true, retryAfterSeconds: 30 });
-
-    expect(attempts).toBe(1); // exactly one live attempt — readRetries: 0, not the shared budget
-    expect(sleepFn).not.toHaveBeenCalled();
+    await expect(chats.resolveSelfId()).resolves.toBe('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+    expect(fetchFn).not.toHaveBeenCalled();
   });
 });
 
-// Port-level twin of resolveSelfId, added so the inbox poller (build-inbox-poller.ts) can resolve
-// "self" through this SAME chain instead of a raw, seed/cache-blind `/me` call of its own (0.6.4,
-// issue #28: a tenant-wide `/me` 429 with no operator seed/cache used to fail every poll and,
-// after three cycles, force a token re-authentication for a condition that was never auth-shaped).
-// resolveSelfId/resolveSelfIdLive (exercised extensively above via sendFile) are now thin wrappers
-// around this method and its live-only twin — these tests pin the NEW, richer return shape those
-// two never needed: distinguishing a THROTTLED live call from every other outcome.
-describe('GraphTeamsChats.resolveSelfIdStatus — port-level self-id resolution the inbox poller reuses (0.6.4, issue #28)', () => {
+// Port-level twin of resolveSelfId, added so a caller other than sendFile can resolve "self"
+// through this SAME chain instead of a raw, seed/cache-blind `/me` call of its own (0.6.4, issue
+// #28: a tenant-wide `/me` 429 with no operator seed/cache used to fail every poll and, after
+// three cycles, force a token re-authentication for a condition that was never auth-shaped).
+// resolveSelfId/resolveSelfIdLive (exercised extensively above via sendFile) are thin wrappers
+// around this method and its live-only twin — these tests pin the richer return shape those two
+// never needed: distinguishing a THROTTLED live call from every other outcome. NOT consumed by the
+// inbox poller as of 2026-09-09 (poll-path throttle fix) — see that describe block above and
+// build-inbox-poller.ts's own comment on the `self` wiring for why the plain resolveSelfId is what
+// the poll path uses instead.
+describe('GraphTeamsChats.resolveSelfIdStatus — port-level self-id resolution (0.6.4, issue #28)', () => {
   let dir: string;
   let path: string;
 
@@ -433,9 +375,7 @@ describe('GraphTeamsChats.resolveSelfIdStatus — port-level self-id resolution 
 
   // The genuinely NEW behaviour (0.6.4): resolveSelfId/resolveSelfIdLive used to fold a throttled
   // live /me into the same bare `undefined` as every other failure — a caller had no way to tell
-  // "Graph is rate-limiting this" from "this account genuinely has no id". A caller that needs
-  // that distinction (the inbox poller, to back off and report a THROTTLED cycle instead of an
-  // "unrecognised shape" failure) could not have gotten it from the old private methods at all.
+  // "Graph is rate-limiting this" from "this account genuinely has no id".
   it('a THROTTLED live /me (no seed, no cache) surfaces {throttled: true, retryAfterSeconds} instead of a bare undefined', async () => {
     const fetchFn = vi.fn(async (url: string) => {
       if (String(url).includes('/me?') && String(url).includes('select=id')) {

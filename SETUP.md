@@ -131,12 +131,6 @@ consumer of the account's per-mailbox Graph read budget; raise this if the same 
 serves ad-hoc reads and attachment downloads (README "Downloading attachments" has the
 measured story).
 
-**`TEAMS_INBOX_WARMUP_BACKOFF_SECONDS`** — how long a chat's daemon-side member-roster warm-up
-backs off after being throttled, default 900 (15 minutes); Graph's own `Retry-After` on the
-throttled attempt raises this when longer (a floor, not a replacement — a short named wait never
-re-opens the chat sooner than this window). The window is process-local and does not survive a
-restart. See README "The background inbox".
-
 **`TEAMS_MCP_DOWNLOAD_DIR`** — where attachment downloads land (`get_chat_attachment`,
 `download_chat_attachments`, `teams-attachments`). Defaults to a directory
 under the OS tmpdir, which may be cleaned between sessions.

@@ -1,3 +1,35 @@
+## The poll path depended on two throttled endpoints it never needed (fixed 2026-09-09)
+
+Live 2026-09-09, two shapes of the same problem, both in the SRP daemon's own log the same day:
+
+```
+warmMembers: /members warm-up for <chat> failed (THROTTLED ...)
+inbox poll failed: <chat>: THROTTLED (member roster warm-up)
+```
+
+```
+Graph 429 on /me: x-ms-throttle-scope=(none) retry-after=100s
+inbox poll failed: Too many requests
+```
+
+Neither `/me` nor `/chats/{id}/members` is needed to read `/chats/{id}/messages`, but a throttled
+call to either used to fail or stall the whole poll cycle before a single chat's messages were
+read — a throttled warm-up ended the cycle for every chat after (and including) the one that hit
+it, and a throttled `/me` failed the cycle before the per-chat loop even started. Message reads
+are now fully decoupled from both: the roster warm-up the 0.6.0/0.6.3 entries below describe is
+gone from the poll path entirely (mention resolution and `send_chat_file`'s grant still refresh
+`/members` on demand, unchanged), and self id resolves through the same operator-seed →
+persisted-cache → live `/me` chain `sendFile` already used, at most once per process, degrading
+self-message filtering rather than the poll on failure. See `docs/throttling-mitigation.md`'s
+dated section and `src/inbox.ts`'s class doc comment for the fuller account.
+
+This supersedes the mechanics (not the diagnosis) of the 0.6.4/issue #28 entry directly below:
+`resolveSelfIdStatus`'s throttled-429 throw, the `markThrottled`/`noteRetryAfter` reporting for a
+throttled self-id resolution, and `trackAuthHealth`'s `selfIdThrottled` exemption are all gone —
+self-id resolution no longer fails the poll cycle at all (throttled or otherwise), so there is no
+cycle failure left for an exemption to apply to. `resolveSelfIdStatus` itself, and the
+`assistantDisplayName` wiring 0.6.4 added, both stay; only what the poller DOES with them changed.
+
 ## Inbox poller bypassed the self-id seed/cache: a throttled `/me` failed every poll and forced a token re-authentication (issue #28, live 2026-09-09, fixed 0.6.4)
 
 **Observed (2026-09-09 10:18–10:25Z, CTP instance, 0.6.3), under a tenant-wide Graph throttle
@@ -67,6 +99,10 @@ go live, skipping the seed/cache short-circuit. A further test in the same block
 `assistantDisplayName` wire (config -> `buildInboxPoller` -> `InboxPollerDeps.self` ->
 `isSelf`'s no-`fromId` fallback), mutation-killed by dropping that field from `self()`'s returned
 account.
+
+(The `selfIdThrottled`/six-throttled-cycles tests naming the auth-stuck exemption above were
+replaced, not kept, by the 2026-09-09 fix directly above — that exemption's own mechanism is gone;
+the `resolveSelfIdStatus`/`assistantDisplayName` tests still hold.)
 
 ## Three follow-ups from live observation 2026-09-08 after 0.6.0/0.6.1 (fixed 0.6.3)
 

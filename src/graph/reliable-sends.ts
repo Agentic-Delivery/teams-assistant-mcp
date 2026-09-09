@@ -9,7 +9,6 @@ import type {
   SelfIdResolution,
   SendFileOptions,
   TeamsChatsPort,
-  WarmMembersResult,
 } from './teams-chats.js';
 import { htmlToText, type ChatAttachmentRef, type ChatMessage, type ReadResult } from '../messages.js';
 
@@ -144,12 +143,17 @@ export class ReliableTeamsChats implements TeamsChatsPort {
     return this.inner.resolveMentions(chatId, names);
   }
 
-  /** Pure passthrough — see TeamsChatsPort.warmMembers's own doc comment (0.6.0/0.6.3). */
-  warmMembers(chatId: string): Promise<WarmMembersResult> {
-    return this.inner.warmMembers?.(chatId) ?? Promise.resolve({ throttled: false });
+  /** Pure passthrough — see TeamsChatsPort.resolveSelfId's own doc comment (2026-09-09). Without
+   *  this, `chats.resolveSelfId` on the REAL stack (buildChats wraps GraphTeamsChats in THIS
+   *  class) silently reads as `undefined` (the same optional-method gap the now-removed
+   *  `warmMembers` passthrough existed to close, fix round 1: `warmMembers` deleted as dead
+   *  production code once the poll-path roster warm-up it backed was removed). */
+  resolveSelfId(): Promise<string | undefined> {
+    return this.inner.resolveSelfId?.() ?? Promise.resolve(undefined);
   }
 
-  /** Pure passthrough — see TeamsChatsPort.resolveSelfIdStatus's own doc comment (0.6.4). */
+  /** Pure passthrough — see TeamsChatsPort.resolveSelfIdStatus's own doc comment (0.6.4). Same
+   *  "would silently read as undefined without it" reasoning as resolveSelfId above. */
   resolveSelfIdStatus(): Promise<SelfIdResolution> {
     return this.inner.resolveSelfIdStatus?.() ?? Promise.resolve({});
   }
