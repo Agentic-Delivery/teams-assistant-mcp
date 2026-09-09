@@ -1,15 +1,12 @@
 import { dirname, join } from 'node:path';
 import type { ChatAllowlist } from './allowlist.js';
-import type { GraphClient } from './graph/graph-client.js';
 import type { MembersCache } from './graph/members-cache.js';
 import { InboxPoller, type SignedInAccount } from './inbox.js';
 import type { TeamsChatsPort } from './graph/teams-chats.js';
 import type { TokenProvider } from './auth/token-provider.js';
 
 export interface BuildInboxPollerOptions {
-  chats: Pick<TeamsChatsPort, 'readMessages' | 'warmMembers'>;
-  /** Only `/me` is used here (to learn who "self" is) — the raw client, not the chats wrapper. */
-  graph: GraphClient;
+  chats: Pick<TeamsChatsPort, 'readMessages' | 'warmMembers' | 'resolveSelfIdStatus'>;
   tokenProvider: TokenProvider;
   /**
    * The SAME MembersCache instance `buildChats` wires into `GraphTeamsChats` — deliberately the
@@ -27,6 +24,18 @@ export interface BuildInboxPollerOptions {
   /** Per-chat warm-up back-off window override — see InboxPollerDeps.warmupBackoffMs (inbox.ts)
    *  and TEAMS_INBOX_WARMUP_BACKOFF_SECONDS (index.ts) for where this comes from. */
   warmupBackoffMs?: number;
+  /**
+   * What the isSelf displayName fallback (inbox.ts) compares a message's `from` against when
+   * Graph reports no `fromId` on it at all — see config.assistantDisplayName's own doc comment.
+   * Sourced from config, not a live call: unlike the id (below), this value is already known at
+   * startup, so passing it through costs nothing and can never block a poll (0.6.4, issue #28,
+   * point 4 — the poller's old raw `/me?$select=id,displayName` fetched this live; dropping the
+   * live half and sourcing it from config instead is strictly cheaper and still best-effort:
+   * omitting it simply leaves that one fallback unavailable, same posture as every other optional
+   * field on this interface). Optional: a caller with no assistantDisplayName configured yet just
+   * loses that one fallback, never the id-based check the loop otherwise relies on.
+   */
+  assistantDisplayName?: string;
   log?: (line: string) => void;
 }
 
@@ -41,7 +50,41 @@ export function buildInboxPoller(options: BuildInboxPollerOptions): InboxPoller 
   return new InboxPoller({
     chats: options.chats,
     allowlist: options.allowlist,
-    self: () => options.graph.get<SignedInAccount>('/me?$select=id,displayName'),
+    // Reuses the SAME operator-seed (TEAMS_MCP_SELF_ID) -> persisted-cache -> live `/me` chain
+    // GraphTeamsChats.resolveSelfId already exposes to sendFile (teams-chats.ts's
+    // resolveSelfIdStatus) instead of a raw, seed/cache-blind `/me` call of this module's own.
+    // Before 0.6.4 this was `() => options.graph.get('/me?$select=id,displayName')` on the raw
+    // client — a tenant-wide `/me` 429 then failed every poll (nothing in the seed/cache chain
+    // was ever consulted) and, after three consecutive cycles, forced a token re-authentication
+    // for a condition that was never auth-shaped (issue #28, live 2026-09-09 — see
+    // KNOWN-ISSUES.md). A throttled resolution is surfaced here as a thrown, 429-shaped error so
+    // InboxPoller.pollOnce classifies it as a THROTTLED cycle (markThrottled/noteRetryAfter), the
+    // same treatment any other 429 already gets, rather than an "unrecognised shape" failure that
+    // would eventually trip the forced re-auth path on its own.
+    self: async (): Promise<SignedInAccount> => {
+      const resolved = (await options.chats.resolveSelfIdStatus?.()) ?? {};
+      if (resolved.id !== undefined) {
+        return {
+          id: resolved.id,
+          ...(options.assistantDisplayName !== undefined
+            ? { displayName: options.assistantDisplayName }
+            : {}),
+        };
+      }
+      throw Object.assign(
+        new Error(
+          resolved.throttled
+            ? 'self id resolution: Too many requests (throttled /me, no operator seed or persisted cache available)'
+            : 'self id resolution: could not be determined',
+        ),
+        {
+          ...(resolved.throttled ? { status: 429 } : {}),
+          ...(resolved.retryAfterSeconds !== undefined
+            ? { retryAfterSeconds: resolved.retryAfterSeconds }
+            : {}),
+        },
+      );
+    },
     inboxPath: options.inboxPath,
     // The state sidecar follows the inbox file, so a TEAMS_INBOX_PATH override moves both — and
     // the yield file with them (inboxYieldPathFor derives from the same inbox path, index.ts).

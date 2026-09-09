@@ -363,6 +363,122 @@ describe('GraphTeamsChats.warmMembers — daemon-side cache warm-up on an empty 
   });
 });
 
+// Port-level twin of resolveSelfId, added so the inbox poller (build-inbox-poller.ts) can resolve
+// "self" through this SAME chain instead of a raw, seed/cache-blind `/me` call of its own (0.6.4,
+// issue #28: a tenant-wide `/me` 429 with no operator seed/cache used to fail every poll and,
+// after three cycles, force a token re-authentication for a condition that was never auth-shaped).
+// resolveSelfId/resolveSelfIdLive (exercised extensively above via sendFile) are now thin wrappers
+// around this method and its live-only twin — these tests pin the NEW, richer return shape those
+// two never needed: distinguishing a THROTTLED live call from every other outcome.
+describe('GraphTeamsChats.resolveSelfIdStatus — port-level self-id resolution the inbox poller reuses (0.6.4, issue #28)', () => {
+  let dir: string;
+  let path: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'teams-chats-self-id-status-'));
+    path = join(dir, 'self-id-cache.json');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('the operator seed short-circuits with zero /me calls', async () => {
+    const fetchFn = vi.fn(async (url: string) => {
+      throw new Error(`must never call Graph — the override wins outright: ${String(url)}`);
+    });
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch });
+    const chats = new GraphTeamsChats(graph, {
+      membersCache: new MembersCache({ path: join(dir, 'members-cache.json') }),
+      selfIdOverride: 'aad-override-self',
+    });
+
+    await expect(chats.resolveSelfIdStatus()).resolves.toEqual({ id: 'aad-override-self' });
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('a warm persisted cache short-circuits with zero /me calls', async () => {
+    const selfIdCache = new FileSelfIdCache({ path });
+    selfIdCache.write({ id: 'aad-cached-self', resolvedAt: 1 });
+    const fetchFn = vi.fn(async (url: string) => {
+      throw new Error(`must never call Graph — the persisted cache wins: ${String(url)}`);
+    });
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch });
+    const chats = new GraphTeamsChats(graph, {
+      membersCache: new MembersCache({ path: join(dir, 'members-cache.json') }),
+      selfIdCache,
+    });
+
+    await expect(chats.resolveSelfIdStatus()).resolves.toEqual({ id: 'aad-cached-self' });
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('a successful live /me resolves {id} and writes it to the persisted cache', async () => {
+    const selfIdCache = new FileSelfIdCache({ path });
+    const fetchFn = vi.fn(async (url: string) => {
+      if (String(url).includes('/me?') && String(url).includes('select=id')) {
+        return json({ id: 'aad-live-self' });
+      }
+      throw new Error(`unexpected call: ${String(url)}`);
+    });
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch });
+    const chats = new GraphTeamsChats(graph, {
+      membersCache: new MembersCache({ path: join(dir, 'members-cache.json') }),
+      selfIdCache,
+    });
+
+    await expect(chats.resolveSelfIdStatus()).resolves.toEqual({ id: 'aad-live-self' });
+    expect(selfIdCache.read()).toEqual({ id: 'aad-live-self', resolvedAt: expect.any(Number) });
+  });
+
+  // The genuinely NEW behaviour (0.6.4): resolveSelfId/resolveSelfIdLive used to fold a throttled
+  // live /me into the same bare `undefined` as every other failure — a caller had no way to tell
+  // "Graph is rate-limiting this" from "this account genuinely has no id". A caller that needs
+  // that distinction (the inbox poller, to back off and report a THROTTLED cycle instead of an
+  // "unrecognised shape" failure) could not have gotten it from the old private methods at all.
+  it('a THROTTLED live /me (no seed, no cache) surfaces {throttled: true, retryAfterSeconds} instead of a bare undefined', async () => {
+    const fetchFn = vi.fn(async (url: string) => {
+      if (String(url).includes('/me?') && String(url).includes('select=id')) {
+        return json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
+          'retry-after': '37',
+        });
+      }
+      throw new Error(`unexpected call: ${String(url)}`);
+    });
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch });
+    const chats = new GraphTeamsChats(graph, {
+      membersCache: new MembersCache({ path: join(dir, 'members-cache.json') }),
+      selfIdCache: new FileSelfIdCache({ path }),
+    });
+
+    await expect(chats.resolveSelfIdStatus()).resolves.toEqual({ throttled: true, retryAfterSeconds: 37 });
+    expect(new FileSelfIdCache({ path }).read()).toBeUndefined(); // never written on a throttled attempt
+  });
+
+  it('a non-throttle live /me failure resolves {} (undetermined, not throttled) — never memoized', async () => {
+    let calls = 0;
+    const fetchFn = vi.fn(async (url: string) => {
+      if (String(url).includes('/me?') && String(url).includes('select=id')) {
+        calls += 1;
+        return calls === 1
+          ? json({ error: { code: 'Forbidden', message: 'insufficient privileges' } }, 403)
+          : json({ id: 'aad-recovered-self' });
+      }
+      throw new Error(`unexpected call: ${String(url)}`);
+    });
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch });
+    const chats = new GraphTeamsChats(graph, {
+      membersCache: new MembersCache({ path: join(dir, 'members-cache.json') }),
+      selfIdCache: new FileSelfIdCache({ path }),
+    });
+
+    await expect(chats.resolveSelfIdStatus()).resolves.toEqual({});
+    // Not memoized: the NEXT call retries rather than being stuck (same contract resolveSelfId's
+    // own doc comment already promises for sendFile).
+    await expect(chats.resolveSelfIdStatus()).resolves.toEqual({ id: 'aad-recovered-self' });
+  });
+});
+
 describe('buildChats — the composition actually wires the members cache (0.4.1 review round 1)', () => {
   // MAJOR 1: an optional membersCache let the wiring in build-chats.ts be silently dropped with
   // no test noticing (mutation-verified: deleting the wiring left the full suite green). This

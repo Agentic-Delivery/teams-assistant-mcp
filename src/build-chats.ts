@@ -23,7 +23,13 @@ import type { TeamsMcpConfig } from './config.js';
  */
 export interface ChatsStack {
   chats: ReliableTeamsChats;
-  /** The raw client, for the few callers that need Graph beyond chats (the inbox poller's /me). */
+  /**
+   * The raw client, for a caller that needs Graph beyond `chats`. No current caller does: the
+   * inbox poller used to fetch `/me` directly through this (bypassing the self-id seed/cache
+   * chain entirely, issue #28) — since 0.6.4 it resolves self through
+   * `chats.resolveSelfIdStatus()` instead, the same chain `sendFile` uses. Kept on the stack for
+   * whatever the next such caller turns out to need.
+   */
   graph: GraphClient;
   /** Exposed so a caller (the inbox poller's stuck-auth recovery, 0.4.1) can force a re-mint
    *  without reaching back into this module's private wiring. */

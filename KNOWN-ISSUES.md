@@ -1,3 +1,73 @@
+## Inbox poller bypassed the self-id seed/cache: a throttled `/me` failed every poll and forced a token re-authentication (issue #28, live 2026-09-09, fixed 0.6.4)
+
+**Observed (2026-09-09 10:18–10:25Z, CTP instance, 0.6.3), under a tenant-wide Graph throttle
+(shared first-party client id; `/me` answering 429 with retry-after 4–22s):**
+
+```
+Graph 429 on /me: x-ms-throttle-scope=(none) retry-after=20s
+inbox poll failed: Too many requests. Please try again later.
+… ×3
+inbox poller: 3 consecutive poll failures of unrecognised shape … requested a forced token re-authentication
+```
+
+`TEAMS_MCP_SELF_ID` was set in the instance `.env` and no `.self-id-cache.json` existed yet (the
+cache is only written after a successful `/me`).
+
+**Cause:** `build-inbox-poller.ts:44` gave the poller its own `self: () => graph.get('/me?$select=id,displayName')`
+on the raw Graph client, and `inbox.ts:468` did `this.me ??= await this.deps.self()` — memoized
+only on success. This bypassed `GraphTeamsChats.resolveSelfId`'s override (`TEAMS_MCP_SELF_ID`) →
+persisted-cache → live-`/me` chain (teams-chats.ts) entirely — the same chain `sendFile` already
+used since 0.5.1. While `/me` was throttled, the whole poll failed ("a failed /me fails the whole
+poll rather than delivering wrongly" — correct in isolation, but reached by a path that should
+never have needed a live `/me` call at all with a seed configured), the inbox went deaf, and after
+three consecutive failures the poller forced a token re-authentication — a credential submission —
+for a condition that was never auth-shaped.
+
+**Fixed (0.6.4):** `GraphTeamsChats` now exposes `resolveSelfIdStatus()` on `TeamsChatsPort`
+(optional, same posture as `warmMembers`) — the SAME override → memo → persisted-cache → live
+`/me` chain `resolveSelfId`/`resolveSelfIdLive` already used for `sendFile`, refactored into one
+shared private core (`resolveSelfIdStatus`/`resolveSelfIdLiveStatus`) so nothing is duplicated;
+those two private methods are now thin wrappers extracting `.id`. `build-inbox-poller.ts` wires
+the poller's `self` dependency through `chats.resolveSelfIdStatus()` instead of a raw `/me` call,
+throwing a 429-shaped error (`status: 429`, `retryAfterSeconds` when Graph named one) only when
+the resolution is genuinely THROTTLED with no seed/cache to fall back to.
+
+`inbox.ts`'s `pollAllowlistedChats` now resolves self id in its own try/catch: a throttled
+resolution is reported exactly like any other 429 (`markThrottled`/`noteRetryAfter`), and
+`trackAuthHealth` takes a new `selfIdThrottled` flag — a cycle whose ONLY failure was a throttled
+self-id resolution is exempted from the auth-stuck streak entirely (neither progressed nor reset),
+since forcing a token re-mint cannot clear a Graph rate limit. A cycle that ALSO fails for some
+other (non-throttle) reason still progresses the streak normally. The existing "with no known self
+id, nothing is delivered" rule is preserved and hardened: a `self` implementation that RESOLVES
+(rather than throws) with no id at all — a violating double for this seam — is treated exactly
+like a throw: never memoized, retried on the next poll, nothing delivered in the meantime.
+
+The raw `/me?$select=id,displayName` call also fetched `displayName` for `isSelf`'s fallback match
+(used when a message reports no `fromId`). That live fetch is dropped; `assistantDisplayName`
+(already known from config at startup, unrelated to `/me`) is threaded through
+`buildInboxPoller`/`index.ts` instead — best-effort, zero additional Graph cost, never blocks a
+poll.
+
+**Tests:** `src/graph/teams-chats.test.ts`'s "GraphTeamsChats.resolveSelfIdStatus" describe block
+(seed/cache short-circuit with zero `/me` calls, a successful live call writing the cache, a
+THROTTLED live call surfacing `{throttled: true, retryAfterSeconds}` instead of the old bare
+`undefined`, a non-throttle failure resolving `{}` without being memoized).
+`src/inbox.test.ts`'s "inbox poller — self id resolution reuses the resolveSelfId chain" describe
+block (a throttled self-id resolution reported as a throttled cycle with the Retry-After floor
+applied; six consecutive such cycles never trip the forced re-auth path, mutation-killed by
+removing the `selfIdThrottled` exemption in `trackAuthHealth`; a self-id throttle streak does not
+suppress the detector for a later, different auth-shaped failure; a violating-double `self` that
+resolves with no id is not trusted, mutation-killed by removing the `this.me = undefined` reset).
+`src/build-inbox-poller.test.ts`'s "buildInboxPoller — self id resolution reuses the seed/cache/
+live chain" describe block drives the REAL composition (`buildChats` + `buildInboxPoller`) with
+HTTP-level `/me` mocks that would 429 or throw if ever reached: `TEAMS_MCP_SELF_ID` set, a warm
+persisted cache (no seed), and neither present (asserting `tokenProvider.invalidate` is never
+called across six throttled cycles) — mutation-killed by reverting `resolveSelfIdStatus` to always
+go live, skipping the seed/cache short-circuit. A further test in the same block pins the
+`assistantDisplayName` wire (config -> `buildInboxPoller` -> `InboxPollerDeps.self` ->
+`isSelf`'s no-`fromId` fallback), mutation-killed by dropping that field from `self()`'s returned
+account.
+
 ## Three follow-ups from live observation 2026-09-08 after 0.6.0/0.6.1 (fixed 0.6.3)
 
 **(a) The daemon's member-roster warm-up for a chat was THROTTLED on two consecutive poll cycles

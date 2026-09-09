@@ -10,7 +10,7 @@ async function main(): Promise<void> {
   const config = loadConfig();
 
   const uploadDir = process.env['TEAMS_MCP_UPLOAD_DIR'];
-  const { chats, graph, tokenProvider, membersCache } = buildChats(config, uploadDir ? { uploadDir } : {});
+  const { chats, tokenProvider, membersCache } = buildChats(config, uploadDir ? { uploadDir } : {});
 
   // The yield file is passed even when THIS process runs no poller: the download tools write it
   // to quiet whichever poller shares the mailbox — possibly a daemon in another process — and a
@@ -69,11 +69,13 @@ async function main(): Promise<void> {
     // review).
     pollerOptions: {
       chats,
-      graph,
       tokenProvider,
       membersCache,
       allowlist: config.allowlist,
       inboxYieldPath,
+      // Best-effort isSelf displayName fallback (build-inbox-poller.ts) — the id-based check from
+      // resolveSelfIdStatus is authoritative; this only helps a message that reports no fromId.
+      assistantDisplayName: config.assistantDisplayName,
       ...(Number.isFinite(pollSeconds) && pollSeconds > 0 ? { pollMs: pollSeconds * 1000 } : {}),
       ...(Number.isFinite(warmupBackoffSeconds) && warmupBackoffSeconds > 0
         ? { warmupBackoffMs: warmupBackoffSeconds * 1000 }

@@ -1,6 +1,6 @@
 import { mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ChatAllowlist } from './allowlist.js';
 import {
@@ -980,6 +980,188 @@ describe('inbox poller — stuck-auth self-healing (0.4.1, live-diagnosed: only 
     expect(lines.some((l) => /recovered after a forced token re-authentication/.test(l))).toBe(true);
   });
 });
+
+// Issue #28 (live 2026-09-09): the poller's own `self` dependency used to call a raw `/me` on the
+// graph client, bypassing the operator seed (TEAMS_MCP_SELF_ID) and the persisted self-id cache
+// entirely (build-inbox-poller.ts wires the fix; these tests drive InboxPoller's own reaction to
+// what `self` reports/throws). Under a tenant-wide `/me` 429 with neither available, every poll
+// failed as an "unrecognised shape" failure and, after three consecutive cycles, forced a token
+// re-authentication for a condition that was never auth-shaped. `build-inbox-poller.test.ts`
+// covers the seed/cache SHORT-CIRCUIT end to end through the real composition; these tests pin
+// InboxPoller's own handling once `self` reports the throttle (or a violating, empty success).
+describe('inbox poller — self id resolution reuses the resolveSelfId chain, not a raw /me (issue #28, live 2026-09-09)', () => {
+  let dir: string;
+  let inboxPath: string;
+  let statePath: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'inbox-selfid-'));
+    inboxPath = join(dir, 'inbox.jsonl');
+    statePath = join(dir, 'inbox-state.json');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function throttledSelfError(retryAfterSeconds?: number): Error {
+    return Object.assign(new Error('Too many requests'), {
+      status: 429,
+      ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}),
+    });
+  }
+
+  it('a THROTTLED self-id resolution (no operator seed, no persisted cache) is reported as a throttled cycle — never as "unrecognised shape" — and its Retry-After floors the next delay', async () => {
+    let readCalls = 0;
+    const readMessages = () => {
+      readCalls += 1;
+      return Promise.resolve(applyWatermark([], undefined));
+    };
+    const p = new InboxPoller({
+      chats: { readMessages },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
+      self: () => Promise.reject(throttledSelfError(45)),
+      inboxPath,
+      statePath,
+    });
+
+    const clean = await p.pollOnce();
+
+    expect(clean).toBe(false);
+    // With no known self id, nothing is delivered — including never even ASKING a chat, since
+    // isSelf could not safely filter anything without it (unchanged intent, "a failed /me fails
+    // the whole poll rather than delivering wrongly").
+    expect(readCalls).toBe(0);
+
+    const lines = await inboxLinesAt(inboxPath);
+    expect(lines).toHaveLength(1);
+    expect(String(lines[0]?.['error'])).toMatch(/self id resolution/i);
+    expect(String(lines[0]?.['error'])).not.toMatch(/unrecognised shape/i);
+
+    const health = JSON.parse(
+      await readFile(join(dirname(inboxPath), 'poller-health.json'), 'utf8'),
+    ) as { backoffMs: number };
+    expect(health.backoffMs).toBe(45_000); // Graph's own named wait, not the plain 30s default
+  });
+
+  // The core regression proof for issue #28: before this fix, ANY self() failure (throttled or
+  // not) reached pollOnce's generic catch and counted as an "unrecognised shape" failure exactly
+  // like the shapeless-network-error last-resort tier already tested above — three of them forced
+  // a token re-authentication that could never clear a Graph rate limit. This drives the SAME
+  // "three consecutive failures" shape those tests use, but through a THROTTLED self-id
+  // resolution specifically, and proves the remedy never fires — for six consecutive cycles, not
+  // just three, ruling out "it only takes longer" as an alternate explanation.
+  it('N consecutive THROTTLED self-id-resolution failures never trip the forced re-auth path', async () => {
+    let onAuthStuckCalls = 0;
+    let readCalls = 0;
+    const readMessages = () => {
+      readCalls += 1;
+      return Promise.resolve(applyWatermark([], undefined));
+    };
+    const lines: string[] = [];
+    const p = new InboxPoller({
+      chats: { readMessages },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
+      self: () => Promise.reject(throttledSelfError()),
+      inboxPath,
+      statePath,
+      authFailureThreshold: 3,
+      onAuthStuck: () => {
+        onAuthStuckCalls += 1;
+      },
+      log: (line) => lines.push(line),
+    });
+
+    for (let i = 0; i < 6; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await p.pollOnce();
+    }
+
+    expect(onAuthStuckCalls).toBe(0);
+    expect(readCalls).toBe(0);
+    expect(lines.some((l) => /forced token re-authentication/.test(l))).toBe(false);
+  });
+
+  // A poll that fails for BOTH a throttled self-id resolution AND some other, unrelated reason on
+  // different cycles must still progress normally — the exemption above is scoped to a cycle
+  // whose ONLY failure is the self-id throttle, not to the poller's auth-stuck detector overall.
+  it('a self-id throttle streak does not suppress the auth-stuck detector for a DIFFERENT, non-throttled failure', async () => {
+    let onAuthStuckCalls = 0;
+    let selfCalls = 0;
+    const p = new InboxPoller({
+      chats: { readMessages: () => Promise.reject(Object.assign(new Error('token expired'), { status: 401 })) },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
+      self: () => {
+        selfCalls += 1;
+        // First two cycles: self-id throttled (exempt). Third onward: self resolves fine, so the
+        // failure moves to the (auth-shaped) chat read — which must still count normally.
+        return selfCalls <= 2 ? Promise.reject(throttledSelfError()) : Promise.resolve(me);
+      },
+      inboxPath,
+      statePath,
+      authFailureThreshold: 3,
+      onAuthStuck: () => {
+        onAuthStuckCalls += 1;
+      },
+    });
+
+    await p.pollOnce(); // self-id throttled — exempt
+    await p.pollOnce(); // self-id throttled — exempt
+    expect(onAuthStuckCalls).toBe(0);
+    await p.pollOnce(); // self resolves; chat read is 401 — 1st real auth-shaped failure
+    await p.pollOnce(); // 2nd
+    await p.pollOnce(); // 3rd — fires
+    expect(onAuthStuckCalls).toBe(1);
+  });
+
+  // Violating-double guard: a `self` implementation is an external-facing seam (build-inbox-
+  // poller.ts backs it with a live Graph call) and this poller must not trust a value from it
+  // that violates the "resolved means a real id" contract — a RESOLUTION (not a rejection)
+  // reporting no id at all is exactly that shape. Before this guard, `this.me ??= await
+  // this.deps.self()` would have memoized `{}` forever and isSelf's `undefined === undefined`
+  // comparisons would never have matched, so EVERY message — including a genuine other member's —
+  // would have been delivered unfiltered for the rest of the process's life.
+  it('a `self` that resolves (not throws) with no id at all is not trusted — nothing is delivered, and the next poll retries it', async () => {
+    let selfCalls = 0;
+    let readCalls = 0;
+    const readMessages = () => {
+      readCalls += 1;
+      return Promise.resolve(
+        applyWatermark([message({ id: 'alice-1', text: 'hi', fromId: 'alice-id', from: 'Alice' })], undefined),
+      );
+    };
+    const p = new InboxPoller({
+      chats: { readMessages },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: 'pilot', canPost: true }]),
+      self: () => {
+        selfCalls += 1;
+        return Promise.resolve({}); // VIOLATES the contract: a "success" with no id at all
+      },
+      inboxPath,
+      statePath,
+    });
+
+    const clean = await p.pollOnce();
+
+    expect(clean).toBe(false);
+    expect(readCalls).toBe(0); // the loop never runs without a KNOWN self id — Alice's message
+    // above is never even fetched, let alone delivered unfiltered.
+    const lines = await inboxLinesAt(inboxPath);
+    expect(lines.every((line) => !('from' in line))).toBe(true); // no delivered MESSAGE line
+    expect(String(lines[0]?.['error'])).toMatch(/self id resolution/i);
+
+    await p.pollOnce();
+    expect(selfCalls).toBe(2); // never memoized on an id-less "success" — retried every cycle
+  });
+});
+
+async function inboxLinesAt(inboxPath: string): Promise<Array<Record<string, unknown>>> {
+  const raw = await readFile(inboxPath, 'utf8').catch(() => '');
+  return raw
+    .split('\n')
+    .filter((line) => line.trim() !== '')
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
 
 describe('inbox poller — the quota yield (0.5.0: the poller starved ad-hoc readers, measured 2026-09-02)', () => {
   let dir: string;

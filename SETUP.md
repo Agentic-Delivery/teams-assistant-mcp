@@ -109,7 +109,10 @@ account's own id does not change, and the stamped username is what lets a later
 `TEAMS_MCP_USERNAME` repoint at this same directory be detected as a miss rather than a wrongly
 trusted stale id) lives there too, resolved once from `/me` and reused by every process after
 that, server or CLI alike — `TEAMS_MCP_SELF_ID` is the last-resort operator override if even that
-first resolution cannot land.
+first resolution cannot land. Since 0.6.4 the background inbox poller honours this same
+seed → cache → live-`/me` order too (previously it bypassed all three with a raw `/me` call of its
+own — see KNOWN-ISSUES.md's issue #28 entry), so a `TEAMS_MCP_SELF_ID` set for `send_chat_file`
+also keeps the poller's own self-filtering working through a throttled `/me`.
 All three files hold per-instance state, so this is another reason two long-lived instances for the
 same account want separate working directories (and separate `TEAMS_MCP_TOKEN_CACHE` paths), not
 just separate client ids.

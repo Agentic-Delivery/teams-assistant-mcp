@@ -10,9 +10,14 @@ export interface TeamsMcpConfig {
   password: string;
   tokenCachePath: string;
   /**
-   * What the service account's Teams profile is expected to be called. The server compares this
-   * against the signed-in account's displayName at startup and warns on a mismatch; it does not
-   * refuse to run, because renaming an account is IT's job, not the server's.
+   * What the service account's Teams profile is expected to be called — drives the readback
+   * match in `ReliableTeamsChats` (build-chats.ts's `selfDisplayName`), the inbox poller's
+   * no-`fromId` fallback (build-inbox-poller.ts), and tool-facing wording (server.ts). Nothing
+   * compares this specific value against the signed-in account's actual Graph displayName at
+   * server startup; the standalone `npm run probe` script (probe.ts) does that comparison, but
+   * against its own `TEAMS_MCP_DISPLAY_NAME` env var (default `DEFAULT_ASSISTANT_DISPLAY_NAME`),
+   * not this config field, and only when a human runs it by hand — it does not refuse anything,
+   * because renaming an account is IT's job, not the server's.
    */
   assistantDisplayName: string;
   allowlist: ChatAllowlist;

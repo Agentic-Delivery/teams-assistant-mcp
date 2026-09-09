@@ -240,8 +240,11 @@ also carries `truncated: true` and an explicit `…[truncated, N chars / M bytes
 2026-09-09 on one deployment: the inbox record of a 2,847-character message was exactly 2,000
 characters while the read tool returned the full text; message content withheld (customer
 material). Reproduced in tests with synthetic 5,000- and 70,000-character messages. Messages
-posted by the signed-in account itself are skipped (resolved via `/me`, so the assistant's own
-posts never echo back as inbox events), as are deleted stubs and empty system events.
+posted by the signed-in account itself are skipped — resolved through the SAME operator-seed
+(`TEAMS_MCP_SELF_ID`) → persisted-cache → live-`/me` order `resolveSelfId` uses for
+`send_chat_file` (since 0.6.4; see KNOWN-ISSUES.md's issue #28 entry for the incident this fixed),
+so the assistant's own posts never echo back as inbox events even while `/me` itself is
+throttled — as are deleted stubs and empty system events.
 
 The sidecar remembers the delivered watermark and newest message id per chat (written atomically —
 temp file then rename, so a crash mid-write cannot itself corrupt it), so a server restart never
@@ -259,7 +262,11 @@ triggers the same remedy as a last resort, because the actual live incident's ow
 `inbox poll failed: <chat>: fetch failed`, repeated, no status code, while Graph itself answered
 200 to parallel probes — matched neither shape (see KNOWN-ISSUES.md for the verbatim evidence). The
 remedy fires once per failing streak and logs what actually happened at each step (requested, then
-still failing, or recovered), not just the initial intent.
+still failing, or recovered), not just the initial intent. One exception (0.6.4, issue #28): a
+cycle whose ONLY failure is a THROTTLED self-id resolution (no operator seed, no persisted cache,
+`/me` itself rate-limited) is treated as an ordinary throttled cycle — reported, backed off by
+Graph's own Retry-After — but never counted toward this streak, since forcing a token re-mint
+cannot clear a Graph rate limit.
 
 A failing poll appends `{"error": "...", "at": "...", "consecutiveFailures": N}` to the same file.
 That line is the difference between "the chats are quiet" and "auth is dead" — a watcher must
@@ -562,7 +569,7 @@ credential, an account name, or a tenant id, and nothing ever should.
 | `TEAMS_MCP_CLIENT_ID` | no | Defaults to the first-party Teams client id; see SETUP.md for why you usually want the Office one. Also the knob for Graph throttle isolation — see "Throttle budgets are per client id" below |
 | `TEAMS_MCP_TOKEN_CACHE` | no | Defaults to `.token-cache.json` in the working directory. The members cache (see "@mentions" below) and the self-id cache (below) live next to it |
 | `TEAMS_MCP_MEMBERS_TTL_SECONDS` | no | How long a chat's cached member list is trusted before a mention resolution refreshes it (bounds a COMPLETE roster's `fetchedAt` and a PARTIAL, traffic-harvested roster's `harvestedAt` alike — see "@mentions" below). `send_chat_file`'s permission grant judges freshness against `fetchedAt` alone, ignoring intervening traffic, and never uses a PARTIAL roster at all. Defaults to 24h (86400) |
-| `TEAMS_MCP_SELF_ID` | no | Last-resort operator seed for the signed-in account's own AAD id (`resolveSelfId`), used internally so `send_chat_file` (row above) can exclude the assistant from its own read-access grant on the uploaded item. Normally unnecessary: the id is resolved once from `/me` and persisted next to the token cache with no TTL, so only the first process on a fresh install pays the live lookup. Must be GUID-shaped or it is ignored |
+| `TEAMS_MCP_SELF_ID` | no | Last-resort operator seed for the signed-in account's own AAD id (`resolveSelfId`), used so `send_chat_file` (row above) can exclude the assistant from its own read-access grant on the uploaded item, AND (since 0.6.4) so the background inbox poller can filter the assistant's own posts without a live `/me` call. Normally unnecessary: the id is resolved once from `/me` and persisted next to the token cache with no TTL, so only the first process on a fresh install pays the live lookup. Must be GUID-shaped or it is ignored. **Get it wrong (a GUID that happens to be a REAL other member's id) and it is trusted verbatim, no further check**: `send_chat_file` silently excludes that real person from the permission grant on its own uploads (they never get read access, `sendFile`'s own doc comment names this residual risk), and the inbox poller silently filters every message from that real person as if it were the assistant's own — their messages never reach the inbox. The assistant's own posts still get filtered correctly despite the wrong seed, via the separate `assistantDisplayName`-based fallback (`isSelf`) — unless that display name ALSO does not match the account's actual Teams profile name, in which case the assistant's own posts echo back as inbox events too |
 | `TEAMS_MCP_DOWNLOAD_DIR` | no | Where attachment downloads land (`get_chat_attachment`, `download_chat_attachments`, `teams-attachments`). Defaults to a temp directory |
 | `TEAMS_MCP_UPLOAD_DIR` | no | OneDrive folder where `send_chat_file` parks uploads. Defaults to `ai-test` |
 | `TEAMS_MCP_DISPLAY_NAME` | no | Overrides the expected display name for the probe |
