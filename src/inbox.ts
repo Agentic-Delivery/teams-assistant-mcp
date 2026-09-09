@@ -57,6 +57,17 @@ export interface InboxPollerDeps {
   /**
    * Resolves who the server is signed in as. The assistant's own posts must not come back as
    * inbox events, or every send would wake the orchestrator to read its own words.
+   *
+   * `build-inbox-poller.ts`'s real implementation resolves this through the SAME operator-seed
+   * (TEAMS_MCP_SELF_ID) -> persisted-cache -> live `/me` chain `GraphTeamsChats.resolveSelfId`
+   * uses for `sendFile` (`resolveSelfIdStatus`, teams-chats.ts) — before 0.6.4 this called a raw,
+   * seed/cache-blind `/me` of its own, so a tenant-wide `/me` 429 failed every poll and, after
+   * three cycles, forced a token re-authentication for a condition that was never auth-shaped
+   * (issue #28, live 2026-09-09). A throttled resolution is expected to REJECT with a 429-shaped
+   * error (`status: 429`, optionally `retryAfterSeconds`) so `pollAllowlistedChats` classifies it
+   * as a THROTTLED cycle rather than an "unrecognised shape" failure — see that method's own doc
+   * comment. Any other rejection, or a resolution reporting no `id` at all, fails the whole poll
+   * (nothing is delivered) without being memoized, so the NEXT poll retries it.
    */
   self: () => Promise<SignedInAccount>;
   inboxPath: string;
@@ -417,11 +428,13 @@ export class InboxPoller {
     let clean: boolean;
     let failureMessage: string | undefined;
     let authShapedFailure = false;
+    let selfIdThrottled = false;
     try {
       const cycle = await this.pollAllowlistedChats();
       clean = cycle.clean;
       failureMessage = cycle.failureMessage;
       authShapedFailure = cycle.authShapedFailure;
+      selfIdThrottled = cycle.selfIdThrottled ?? false;
     } catch (error) {
       this.noteRetryAfter(error);
       failureMessage = error instanceof Error ? error.message : String(error);
@@ -445,7 +458,7 @@ export class InboxPoller {
       this.lastErrorSignature = undefined;
     }
 
-    this.trackAuthHealth(clean, authShapedFailure);
+    this.trackAuthHealth(clean, authShapedFailure, selfIdThrottled);
     this.nextDelayMs = this.computeNextDelay(clean);
     await this.writeHealth({ ok: clean });
     return clean;
@@ -460,19 +473,66 @@ export class InboxPoller {
     clean: boolean;
     failureMessage?: string;
     authShapedFailure: boolean;
+    /** True only when the self-id resolution below was the SOLE, THROTTLED reason this cycle
+     *  failed — see trackAuthHealth's own doc comment for why that is exempted from the auth-stuck
+     *  streak (issue #28, live 2026-09-09: a tenant-wide `/me` 429 with no operator seed and no
+     *  persisted cache used to fail every poll as an "unrecognised shape" failure and, after three
+     *  cycles, force a token re-authentication that could never clear a Graph rate limit). */
+    selfIdThrottled?: boolean;
   }> {
     await mkdir(dirname(this.deps.inboxPath), { recursive: true });
     this.state ??= await this.loadState();
-    // Without knowing who "self" is, delivered messages could include the assistant's own
-    // posts, so a failed /me fails the whole poll rather than delivering wrongly.
-    this.me ??= await this.deps.self();
 
     const failures: string[] = [];
     const lines: string[] = [];
-
     let throttled = false;
-    let attempted = 0;
     let authShapedFailure = false;
+
+    // Without knowing who "self" is, delivered messages could include the assistant's own posts,
+    // so an unresolved self id fails the whole poll rather than delivering wrongly. `deps.self`
+    // (build-inbox-poller.ts) resolves through the SAME operator-seed -> persisted-cache -> live
+    // `/me` chain GraphTeamsChats.resolveSelfId uses for sendFile (issue #28) — a THROTTLED live
+    // call is reported below exactly like any other 429 (markThrottled/noteRetryAfter), never
+    // folded into the generic "unrecognised shape" failure the last-resort auth-stuck tier would
+    // otherwise eventually act on.
+    if (this.me === undefined) {
+      try {
+        this.me = await this.deps.self();
+      } catch (error) {
+        const message = `self id resolution: ${error instanceof Error ? error.message : String(error)}`;
+        const status = (error as { status?: number }).status;
+        if (status === 429) {
+          throttled = markThrottled(failures, message);
+          this.noteRetryAfter(error);
+        } else {
+          failures.push(message);
+        }
+        if (isAuthShaped(error)) {
+          authShapedFailure = true;
+        }
+      }
+      // Violating-double guard: a `self` implementation that RESOLVES (rather than throws) with
+      // no id at all must not be trusted any more than one that threw — it is never memoized, so
+      // the next poll retries it, and this cycle still delivers nothing (see the "with no known
+      // self id, nothing is delivered" rule below).
+      if (this.me?.id === undefined) {
+        this.me = undefined;
+      }
+    }
+
+    if (this.me === undefined) {
+      if (failures.length === 0) {
+        failures.push('self id resolution: no id reported');
+      }
+      return {
+        clean: false,
+        failureMessage: failures.join(' | '),
+        authShapedFailure,
+        selfIdThrottled: throttled,
+      };
+    }
+
+    let attempted = 0;
     for (const entry of this.deps.allowlist.entries()) {
       if (throttled) {
         break; // one 429 ends the cycle — every further request would feed the penalty window
@@ -690,14 +750,27 @@ export class InboxPoller {
    * result. Resetting the streak the instant onAuthStuck is called would therefore claim a
    * recovery the code cannot know yet; the streak (and authRemedyFired) resets ONLY when a
    * subsequent poll actually comes back clean.
+   *
+   * `selfIdThrottled` (0.6.4, issue #28, live 2026-09-09): a cycle whose ONLY failure was a
+   * THROTTLED self-id resolution (no operator seed, no persisted cache, a live `/me` 429) is
+   * exempted from this streak entirely — neither progressed nor reset. Graph rate-limiting `/me`
+   * is a known, non-auth condition; forcing a token re-mint would not clear it, so counting it
+   * toward the last-resort tier only spends a password grant for nothing while the actual
+   * unrelated throttle keeps running its own course (markThrottled/noteRetryAfter, tracked
+   * separately by pollAllowlistedChats). A poll that ALSO fails for some other reason still
+   * progresses the streak normally — this exemption applies only when the self-id throttle was
+   * the cycle's sole failure.
    */
-  private trackAuthHealth(clean: boolean, authShaped: boolean): void {
+  private trackAuthHealth(clean: boolean, authShaped: boolean, selfIdThrottled: boolean): void {
     if (clean) {
       if (this.authRemedyFired) {
         this.log('inbox poller: recovered after a forced token re-authentication');
       }
       this.authFailureStreak = 0;
       this.authRemedyFired = false;
+      return;
+    }
+    if (selfIdThrottled) {
       return;
     }
     this.authFailureStreak += 1;

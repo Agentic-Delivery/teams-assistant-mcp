@@ -6,6 +6,7 @@ import type {
   OutboundFile,
   OutboundImage,
   PinnedMessage,
+  SelfIdResolution,
   SendFileOptions,
   TeamsChatsPort,
   WarmMembersResult,
@@ -146,6 +147,11 @@ export class ReliableTeamsChats implements TeamsChatsPort {
   /** Pure passthrough — see TeamsChatsPort.warmMembers's own doc comment (0.6.0/0.6.3). */
   warmMembers(chatId: string): Promise<WarmMembersResult> {
     return this.inner.warmMembers?.(chatId) ?? Promise.resolve({ throttled: false });
+  }
+
+  /** Pure passthrough — see TeamsChatsPort.resolveSelfIdStatus's own doc comment (0.6.4). */
+  resolveSelfIdStatus(): Promise<SelfIdResolution> {
+    return this.inner.resolveSelfIdStatus?.() ?? Promise.resolve({});
   }
 
   sendMessage(chatId: string, text: string, mentions: readonly MentionTarget[] = []): Promise<ChatMessage> {

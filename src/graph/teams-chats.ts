@@ -165,11 +165,33 @@ export interface TeamsChatsPort {
    * instead of always guessing a default.
    */
   warmMembers?(chatId: string): Promise<WarmMembersResult>;
+  /**
+   * The signed-in account's own AAD id, resolved through the SAME operator-seed
+   * (`TEAMS_MCP_SELF_ID`) → persisted-cache → live `/me` order `GraphTeamsChats.resolveSelfId`
+   * already uses for `sendFile` — see `GraphTeamsChats.resolveSelfIdStatus`'s own doc comment for
+   * the full chain and the 0.6.4/issue #28 incident this exists to close. Optional: a caller with
+   * no reason to resolve self (every CLI, most of the MCP tool surface) simply never calls it; the
+   * inbox poller (`build-inbox-poller.ts`) is the one caller today, so it never has to fall back to
+   * a raw, seed/cache-blind `/me` call of its own.
+   */
+  resolveSelfIdStatus?(): Promise<SelfIdResolution>;
 }
 
 /** See TeamsChatsPort.warmMembers's own doc comment for what each field means and who reads it. */
 export interface WarmMembersResult {
   throttled: boolean;
+  retryAfterSeconds?: number;
+}
+
+/** See TeamsChatsPort.resolveSelfIdStatus's own doc comment for what each field means and who
+ *  reads it — mirrors WarmMembersResult's shape/reasoning above. */
+export interface SelfIdResolution {
+  /** The resolved id, when known: from the operator seed, the in-memory memo, the persisted
+   *  cache, or a successful live `/me`. */
+  id?: string;
+  /** True when the ONLY reason `id` is absent this call is a live `/me` 429 — never true when
+   *  the seed/memo/cache already answered, since none of those ever reach the live call. */
+  throttled?: boolean;
   retryAfterSeconds?: number;
 }
 
@@ -772,19 +794,42 @@ export class GraphTeamsChats implements TeamsChatsPort {
    * the file is deleted by hand.
    */
   private async resolveSelfId(): Promise<string | undefined> {
+    return (await this.resolveSelfIdStatus()).id;
+  }
+
+  /**
+   * Port-level twin of `resolveSelfId` above (0.6.4, issue #28) — same override → memo →
+   * persisted cache → live `/me` order, same doc comment, but surfaced PUBLICLY (see
+   * `TeamsChatsPort.resolveSelfIdStatus`) so a caller other than `sendFile` can resolve "self"
+   * without reaching for a raw `/me` call of its own. Born from a live incident: the inbox
+   * poller's own `build-inbox-poller.ts` used to call `graph.get('/me?$select=id,displayName')`
+   * directly, bypassing `TEAMS_MCP_SELF_ID` and the persisted cache entirely — under a
+   * tenant-wide `/me` 429 every poll failed and, after three cycles, forced a token
+   * re-authentication for a condition that was never auth-shaped (2026-09-09, see
+   * KNOWN-ISSUES.md). `resolveSelfId`/`resolveSelfIdLive` above are now thin wrappers around this
+   * method and its live-only twin below — one chain, walked once, never duplicated.
+   *
+   * Mirrors `WarmMembersResult`'s shape/reasoning: `id` present means resolved (override, memo,
+   * cache, or a successful live call); `throttled: true` means the ONLY reason `id` is absent is
+   * a live `/me` 429 (never true when the override/memo/cache already answered, since none of
+   * those ever reach the live call at all); neither present means every other undetermined case
+   * (a non-throttle live failure, or a live success reporting no id) — a caller decides for
+   * itself what "undetermined" should mean, same posture as `resolveSelfId`'s own doc comment.
+   */
+  async resolveSelfIdStatus(): Promise<SelfIdResolution> {
     if (this.selfIdOverride !== undefined) {
-      return this.selfIdOverride;
+      return { id: this.selfIdOverride };
     }
     if (this.selfId !== undefined) {
-      return this.selfId;
+      return { id: this.selfId };
     }
     const cached = this.selfIdCache.read();
     if (cached) {
       this.selfId = cached.id;
       this.log('self id served from the persisted cache; /me not called.');
-      return this.selfId;
+      return { id: this.selfId };
     }
-    return this.resolveSelfIdLive();
+    return this.resolveSelfIdLiveStatus();
   }
 
   /**
@@ -797,16 +842,33 @@ export class GraphTeamsChats implements TeamsChatsPort {
    * this one send.
    */
   private async resolveSelfIdLive(): Promise<string | undefined> {
+    return (await this.resolveSelfIdLiveStatus()).id;
+  }
+
+  /**
+   * Rich twin of `resolveSelfIdLive` above (0.6.4, issue #28) — same bare `GET /me?$select=id`,
+   * `readRetries: 0`, same "not memoized on failure" contract, but distinguishes a THROTTLED live
+   * call from every other outcome instead of folding both into a bare `undefined` — see
+   * `resolveSelfIdStatus`'s own doc comment for why a caller needs that distinction.
+   */
+  private async resolveSelfIdLiveStatus(): Promise<SelfIdResolution> {
     try {
       const me = await this.graph.get<{ id?: string }>('/me?$select=id', { readRetries: 0 });
       if (me.id) {
         this.selfId = me.id;
         this.selfIdCache.write({ id: me.id, resolvedAt: Date.now() });
+        return { id: this.selfId };
       }
-    } catch {
-      return undefined; // best-effort, deliberately NOT memoized — see resolveSelfId's doc comment
+      return {};
+    } catch (error) {
+      if (error instanceof GraphError && error.status === 429) {
+        return {
+          throttled: true,
+          ...(error.retryAfterSeconds !== undefined ? { retryAfterSeconds: error.retryAfterSeconds } : {}),
+        };
+      }
+      return {}; // best-effort, deliberately NOT memoized — see resolveSelfId's doc comment
     }
-    return this.selfId;
   }
 
   async readMessages(chatId: string, since?: string, limit = 50): Promise<ReadResult> {
