@@ -11,9 +11,12 @@ import type { ChatMessage } from './messages.js';
  * watcher once and stop reinventing a polling daemon per session.
  *
  * One line per message: {"chat","id","from","at","text","attachments"} — the shape the old
- * scratchpad daemon wrote, kept so existing consumers keep parsing. A failed poll appends
- * {"error","at","consecutiveFailures"} instead, because a watcher must be able to tell auth
- * death from a quiet chat.
+ * scratchpad daemon wrote, kept so existing consumers keep parsing. `text` is the FULL message
+ * body, verbatim, up to MAX_INBOX_TEXT_BYTES UTF-8 bytes (a pathological-size guard, not a
+ * preview budget); a message at or over that many bytes also carries `truncated: true` and an
+ * explicit "…[truncated, N chars / M bytes total]" suffix on `text` — never a silent cut (0.6.2;
+ * see KNOWN-ISSUES.md). A failed poll appends {"error","at","consecutiveFailures"} instead,
+ * because a watcher must be able to tell auth death from a quiet chat.
  *
  * Since 0.5.4 the poller also proves it is alive: after EVERY poll (including a yielded one — see
  * writeHealth) it rewrites a small health file beside the inbox. That carries the poller-
@@ -169,6 +172,50 @@ export const DEFAULT_MAX_BACKOFF_MS = 600_000;
  *  guards against firing on an ordinary transient blip that would have cleared on its own. */
 export const DEFAULT_AUTH_FAILURE_THRESHOLD = 3;
 export const DEFAULT_HEALTH_FILENAME = 'poller-health.json';
+
+/**
+ * Pathological-size guard only — 64 KiB, not a "keep the line short" budget. Before 0.6.2 this
+ * was a silent `text.slice(0, 2000)` present since the initial public release, with no rationale
+ * ever recorded; a live incident (2026-09-09, one deployment: the inbox record of a 2,847-char
+ * message was exactly 2,000 characters while the read tool returned the full text, content
+ * withheld — customer material) showed a downstream reader has no way to tell a cut record from a
+ * complete one. Measured in UTF-8 BYTES, not JS string length — the purpose is a disk/memory
+ * bound, and a CJK/emoji-heavy message can carry many fewer than 65,536 UTF-16 code units while
+ * still exceeding 65,536 bytes on the wire. Every message strictly UNDER this many bytes is
+ * written verbatim; a message AT or over it gets an explicit
+ * `…[truncated, N chars / M bytes total]` suffix and `truncated: true` alongside `text`, never a
+ * silent cut. See KNOWN-ISSUES.md for the incident and root cause.
+ */
+export const MAX_INBOX_TEXT_BYTES = 64 * 1024;
+
+/**
+ * Truncates `text` to at most `maxBytes` UTF-8 bytes without splitting a multi-byte code point
+ * (which would otherwise corrupt the last character into a replacement glyph). Iterates by code
+ * point (not UTF-16 code unit) so a surrogate pair is never split either.
+ */
+function truncateToUtf8Bytes(text: string, maxBytes: number): string {
+  let bytes = 0;
+  let result = '';
+  for (const codePoint of text) {
+    const codePointBytes = Buffer.byteLength(codePoint, 'utf8');
+    if (bytes + codePointBytes > maxBytes) {
+      break;
+    }
+    bytes += codePointBytes;
+    result += codePoint;
+  }
+  return result;
+}
+
+/** Builds the `text`/`truncated` fields of one inbox record — see MAX_INBOX_TEXT_BYTES. */
+function inboxTextFields(text: string): { text: string; truncated?: true } {
+  const byteLength = Buffer.byteLength(text, 'utf8');
+  if (byteLength < MAX_INBOX_TEXT_BYTES) {
+    return { text };
+  }
+  const marker = `…[truncated, ${text.length} chars / ${byteLength} bytes total]`;
+  return { text: truncateToUtf8Bytes(text, MAX_INBOX_TEXT_BYTES) + marker, truncated: true };
+}
 /**
  * Consecutive whole-poll failures at which a standing outage is re-surfaced in the inbox. The
  * forever-dedupe wrote ONE {error} line for a five-hour outage — correct against flooding,
@@ -442,7 +489,7 @@ export class InboxPoller {
               id: message.id,
               from: message.from,
               at: message.createdDateTime,
-              text: message.text.slice(0, 2000),
+              ...inboxTextFields(message.text),
               attachments: message.attachments.length,
             }),
           );

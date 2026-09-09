@@ -183,15 +183,89 @@ describe('inbox poller', () => {
     expect(await inboxLines()).toEqual([]);
   });
 
-  it('truncates very long messages to 2000 characters', async () => {
+  it('carries the full text of a long message, not a silent 2000-char cut (live hit 2026-09-09, one deployment)', async () => {
+    // Live hit 2026-09-09 on one deployment: the inbox record of a 2,847-character message was
+    // exactly 2,000 characters while the read tool returned the full text; message content
+    // withheld (customer material). Reproduced here with a synthetic 5,000-character message,
+    // well under the pathological-size guard (64 KiB) below, so the record must equal the source
+    // verbatim — no truncated field either.
     const store = chatStore({});
     await settle(store);
-    store.add(CHAT, message({ id: 'long', text: 'x'.repeat(5000) }));
+    const longText = 'x'.repeat(5000);
+    store.add(CHAT, message({ id: 'long', text: longText }));
 
     await poller(store).pollOnce();
 
     const [line] = await inboxLines();
-    expect(line?.['text']).toHaveLength(2000);
+    expect(line?.['text']).toBe(longText);
+    expect(line?.['text']).toHaveLength(5000);
+    expect(line).not.toHaveProperty('truncated');
+  });
+
+  it('marks a pathologically large message (>=64 KiB) as truncated instead of silently cutting it', async () => {
+    const store = chatStore({});
+    await settle(store);
+    const hugeText = 'y'.repeat(70_000); // past the 64 KiB (65,536-byte) pathological-size guard
+    store.add(CHAT, message({ id: 'huge', text: hugeText }));
+
+    await poller(store).pollOnce();
+
+    const [line] = await inboxLines();
+    const text = line?.['text'] as string;
+    expect(text.startsWith('y'.repeat(65_536))).toBe(true);
+    expect(text).toContain('…[truncated, 70000 chars / 70000 bytes total]');
+    expect(line?.['truncated']).toBe(true);
+  });
+
+  it('does not truncate a message exactly one byte under the 65,536-byte guard', async () => {
+    const store = chatStore({});
+    await settle(store);
+    const almostText = 'z'.repeat(65_535); // ASCII: 1 char == 1 byte
+    store.add(CHAT, message({ id: 'almost', text: almostText }));
+
+    await poller(store).pollOnce();
+
+    const [line] = await inboxLines();
+    expect(line?.['text']).toBe(almostText);
+    expect(line).not.toHaveProperty('truncated');
+  });
+
+  it('truncates a message exactly at the 65,536-byte guard (at-or-over, not strictly-over)', async () => {
+    const store = chatStore({});
+    await settle(store);
+    const exactText = 'z'.repeat(65_536); // ASCII: 1 char == 1 byte, exactly at the guard
+    store.add(CHAT, message({ id: 'exact', text: exactText }));
+
+    await poller(store).pollOnce();
+
+    const [line] = await inboxLines();
+    const text = line?.['text'] as string;
+    expect(text).toContain('…[truncated, 65536 chars / 65536 bytes total]');
+    expect(line?.['truncated']).toBe(true);
+  });
+
+  it('truncates a multi-byte message by UTF-8 BYTE length, not JS string length (CJK/emoji)', async () => {
+    // 22,000 code points of a 3-byte-in-UTF-8 CJK character (U+4F60, '你'): 22,000 UTF-16 code
+    // units (well under the old 65,536-character cap this guard replaces) but 66,000 UTF-8
+    // bytes (over the 65,536-byte guard). A char-length-only guard would have missed this
+    // entirely and written it verbatim, past the disk/memory bound the guard exists for.
+    const store = chatStore({});
+    await settle(store);
+    const cjkChar = '你';
+    const hugeCjkText = cjkChar.repeat(22_000);
+    store.add(CHAT, message({ id: 'cjk', text: hugeCjkText }));
+
+    await poller(store).pollOnce();
+
+    const [line] = await inboxLines();
+    const text = line?.['text'] as string;
+    expect(line?.['truncated']).toBe(true);
+    expect(text).toContain('…[truncated, 22000 chars / 66000 bytes total]');
+    const prefix = text.replace(/…\[truncated.*$/, '');
+    // No corrupted/split multi-byte code point: every character in the surviving prefix is the
+    // same CJK character, and the prefix itself fits the byte budget.
+    expect([...prefix].every((ch) => ch === cjkChar)).toBe(true);
+    expect(Buffer.byteLength(prefix, 'utf8')).toBeLessThanOrEqual(65_536);
   });
 
   it('surfaces a dead poll as an error line instead of silence, and does not throw', async () => {
