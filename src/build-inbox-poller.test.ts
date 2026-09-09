@@ -483,8 +483,12 @@ describe('buildInboxPoller — self id resolution reuses the seed/cache/live cha
       const u = String(url);
       if (u.includes('/me?') && u.includes('select=id')) {
         meCalls += 1;
+        // Above DEFAULT_POLL_MS (30s): if the retryAfterSeconds wire from SelfIdResolution into
+        // the thrown 429 (build-inbox-poller.ts) were dropped, the poll's next delay would fall
+        // back to the plain 30s doubling and never distinguish itself from Graph naming nothing
+        // at all — 45s is the only way this test can tell the wire is actually connected.
         return json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
-          'retry-after': '5',
+          'retry-after': '45',
         });
       }
       if (u.includes(`/chats/${encodeURIComponent(CHAT)}/messages`)) {
@@ -518,7 +522,19 @@ describe('buildInboxPoller — self id resolution reuses the seed/cache/live cha
         inboxPath: join(dir, 'inbox.jsonl'),
       });
 
-      for (let i = 0; i < 6; i += 1) {
+      const firstClean = await poller.pollOnce();
+      expect(firstClean).toBe(false);
+
+      // Graph's own named wait (45s) floors the next delay — proves the retryAfterSeconds wire
+      // from SelfIdResolution into the thrown 429 (build-inbox-poller.ts:82-84) actually reaches
+      // InboxPoller.noteRetryAfter, not just the plain-doubling 30s default every OTHER field on
+      // that thrown error would also produce.
+      const healthAfterFirst = JSON.parse(
+        await readFile(join(dir, 'poller-health.json'), 'utf8'),
+      ) as { backoffMs: number };
+      expect(healthAfterFirst.backoffMs).toBe(45_000);
+
+      for (let i = 0; i < 5; i += 1) {
         // eslint-disable-next-line no-await-in-loop
         const clean = await poller.pollOnce();
         expect(clean).toBe(false);
