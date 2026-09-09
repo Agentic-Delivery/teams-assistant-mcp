@@ -3,7 +3,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ChatAllowlist } from './allowlist.js';
-import { DEFAULT_POLL_MS, InboxPoller, PARK_FORBIDDEN_CHAT_MS } from './inbox.js';
+import {
+  DEFAULT_POLL_MS,
+  DEFAULT_WARMUP_BACKOFF_MS,
+  InboxPoller,
+  PARK_FORBIDDEN_CHAT_MS,
+  markThrottled,
+} from './inbox.js';
 import { type ChatMessage, applyWatermark } from './messages.js';
 
 const CHAT = '19:pilot@thread.v2';
@@ -1231,7 +1237,7 @@ describe('inbox poller — daemon-side roster warm-up (0.6.0)', () => {
 
   function pollerWithWarm(
     chats: Pick<ReturnType<typeof chatStore>, 'readMessages'> & {
-      warmMembers: (chatId: string) => Promise<boolean>;
+      warmMembers: (chatId: string) => Promise<{ throttled: boolean; retryAfterSeconds?: number }>;
     },
     chatIds = [CHAT],
   ) {
@@ -1251,7 +1257,7 @@ describe('inbox poller — daemon-side roster warm-up (0.6.0)', () => {
       ...store,
       warmMembers: async (chatId: string) => {
         warmed.push(chatId);
-        return false;
+        return { throttled: false };
       },
     };
     const p = pollerWithWarm(chats);
@@ -1280,14 +1286,15 @@ describe('inbox poller — daemon-side roster warm-up (0.6.0)', () => {
   });
 
   // Defensive only: GraphTeamsChats.warmMembers's own contract is "never throws" (it reports
-  // throttling via its boolean return, not an exception) — this covers a DIFFERENTLY-BEHAVED
-  // TeamsChatsPort implementation (a test double, a future decorator) that violates that contract
-  // anyway, matching this poller's own "never take the server down" doctrine either way.
+  // throttling via its returned WarmMembersResult, not an exception) — this covers a
+  // DIFFERENTLY-BEHAVED TeamsChatsPort implementation (a test double, a future decorator) that
+  // violates that contract anyway, matching this poller's own "never take the server down"
+  // doctrine either way.
   it("a warmMembers that THROWS (misbehaving port, not GraphTeamsChats's own contract) never fails the poll cycle", async () => {
     const store = chatStore({});
     const chats = {
       ...store,
-      warmMembers: async (): Promise<boolean> => {
+      warmMembers: async (): Promise<{ throttled: boolean }> => {
         throw new Error('THROTTLED: the member list refresh for daemon warm-up was throttled');
       },
     };
@@ -1316,7 +1323,7 @@ describe('inbox poller — daemon-side roster warm-up (0.6.0)', () => {
       ...store,
       warmMembers: async (chatId: string) => {
         warmCalls.push(chatId);
-        return true; // the FIRST cold chat's warm-up was itself throttled
+        return { throttled: true }; // the FIRST cold chat's warm-up was itself throttled
       },
     };
 
@@ -1325,5 +1332,153 @@ describe('inbox poller — daemon-side roster warm-up (0.6.0)', () => {
     expect(warmCalls).toEqual([CHAT]); // never reached chat B's warm-up either
     expect(readCalls).toEqual([]); // readMessages never called for EITHER chat this cycle
     expect(clean).toBe(false); // a throttled cycle is never clean (same rule as a messages 429)
+  });
+});
+
+// Issue (c), 2026-09-08 review follow-up: the throttled/failures pairing used to be held by
+// convention only — every call site that set the local `throttled` flag had to remember, on its
+// own, to also push a matching entry into `failures`, because `pollAllowlistedChats`'s own early
+// return (`if (failures.length === 0) return { clean: true, ... }`) never consults `throttled`
+// itself (see that method's own doc comment on the return statement). A THIRD call site added
+// later with only half the pair would silently misreport a throttled cycle as clean. markThrottled
+// centralises the pair so a call site cannot set one half without the other.
+describe('markThrottled — the throttled/failures pairing cannot drift apart (0.6.3, issue c)', () => {
+  it('pushes the message into failures AND reports throttled — the two halves of the pair always move together', () => {
+    const failures: string[] = [];
+
+    const result = markThrottled(failures, '19:pilot@thread.v2: THROTTLED (member roster warm-up)');
+
+    expect(result).toBe(true);
+    expect(failures).toEqual(['19:pilot@thread.v2: THROTTLED (member roster warm-up)']);
+  });
+
+  it('called twice appends both messages in order — a helper, not a one-shot setter', () => {
+    const failures: string[] = [];
+
+    markThrottled(failures, 'first');
+    markThrottled(failures, 'second');
+
+    expect(failures).toEqual(['first', 'second']);
+  });
+});
+
+// Issue (a), live 2026-09-08: the SAME chat's member-roster warm-up was THROTTLED on two
+// consecutive poll cycles 4 minutes apart (14:42Z, 14:46Z) — the old "warm once, ever" gate
+// (a Set marking a chat as attempted the moment warmMembers was FIRST called, whatever the
+// outcome) only prevented a second attempt within one process lifetime; two attempts that close
+// together meant the guard was not doing its job within a single lifetime either way this incident
+// was actually produced. A per-chat back-off window closes that gap: after a throttled warm-up,
+// the SAME chat is not re-warmed until the window elapses (Graph's own Retry-After when the 429
+// named one, else the configurable default `warmupBackoffMs` / `TEAMS_INBOX_WARMUP_BACKOFF_SECONDS`,
+// DEFAULT_WARMUP_BACKOFF_MS). A successful warm-up still marks the chat COMPLETE forever, unchanged
+// from 0.6.0 (see the "warms each allowlisted chat exactly once" test above, which still passes
+// unmodified against this change).
+describe('inbox poller — per-chat warm-up back-off window (0.6.3, live 2026-09-08 14:42Z/14:46Z)', () => {
+  let dir: string;
+  let inboxPath: string;
+  let statePath: string;
+  let clock: number;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'inbox-warmup-backoff-'));
+    inboxPath = join(dir, 'inbox.jsonl');
+    statePath = join(dir, 'inbox-state.json');
+    // 2026-09-08T14:42:00.000Z — the live incident's own first throttled timestamp.
+    clock = Date.parse('2026-09-08T14:42:00.000Z');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function pollerOverWarm(
+    warmMembers: (chatId: string) => Promise<{ throttled: boolean; retryAfterSeconds?: number }>,
+    overrides: { warmupBackoffMs?: number } = {},
+  ) {
+    const readCalls: string[] = [];
+    const readMessages = async (chatId: string, since?: string) => {
+      readCalls.push(chatId);
+      return applyWatermark([], since);
+    };
+    const poller = new InboxPoller({
+      chats: { readMessages, warmMembers },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: CHAT, canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+      nowFn: () => clock,
+      ...overrides,
+    });
+    return { poller, readCalls };
+  }
+
+  it('TRIGGERING: a cycle inside the back-off window (4 minutes after a throttled warm-up, well under the 15-minute default) does NOT call warmMembers again', async () => {
+    const warmCalls: string[] = [];
+    const warmMembers = async (chatId: string) => {
+      warmCalls.push(chatId);
+      return { throttled: true }; // Graph named no Retry-After — the incident's own log line
+    };
+    const { poller, readCalls } = pollerOverWarm(warmMembers);
+
+    const cycle1 = await poller.pollOnce(); // 14:42Z
+    expect(warmCalls).toEqual([CHAT]);
+    expect(cycle1).toBe(false); // a throttled warm-up ends the cycle, same as a throttled read
+
+    clock += 4 * 60_000; // 14:46Z — the live incident's own second attempt
+    const cycle2 = await poller.pollOnce();
+
+    expect(warmCalls).toEqual([CHAT]); // NOT re-warmed — still inside the 15-minute default window
+    expect(readCalls).toEqual([CHAT]); // the chat is not stuck: readMessages proceeds normally once warm-up is skipped
+    expect(cycle2).toBe(true); // no throttle THIS cycle since warm-up was never attempted
+  });
+
+  it('NON-TRIGGERING: the cycle after the back-off window elapses calls warmMembers again', async () => {
+    const warmCalls: string[] = [];
+    const warmMembers = async (chatId: string) => {
+      warmCalls.push(chatId);
+      return { throttled: true };
+    };
+    const { poller } = pollerOverWarm(warmMembers);
+
+    await poller.pollOnce(); // 14:42Z — opens the window
+    clock += 16 * 60_000; // 14:58Z — 16 minutes later, past the 15-minute default window
+    const cycle = await poller.pollOnce();
+
+    expect(warmCalls).toEqual([CHAT, CHAT]); // retried once the window elapsed
+    expect(cycle).toBe(false); // still throttled again in this test's fixture
+  });
+
+  it('honours Retry-After from the throttled warm-up itself over the configured default: a shorter named wait re-opens sooner', async () => {
+    const warmCalls: string[] = [];
+    const warmMembers = async (chatId: string) => {
+      warmCalls.push(chatId);
+      return { throttled: true, retryAfterSeconds: 120 }; // 2 minutes — well under the 15-minute default
+    };
+    const { poller } = pollerOverWarm(warmMembers);
+
+    await poller.pollOnce(); // 14:42Z
+    clock += 3 * 60_000; // 14:45Z — 3 minutes later: past the NAMED 2-minute wait, still inside the 15-minute default
+    await poller.pollOnce();
+
+    expect(warmCalls).toEqual([CHAT, CHAT]); // retried because Graph's own 120s window had already elapsed
+  });
+
+  it('a configured warmupBackoffMs overrides the default when Graph named no Retry-After', async () => {
+    const warmCalls: string[] = [];
+    const warmMembers = async (chatId: string) => {
+      warmCalls.push(chatId);
+      return { throttled: true };
+    };
+    const { poller } = pollerOverWarm(warmMembers, { warmupBackoffMs: 60_000 }); // 1 minute, not the 15-minute default
+
+    await poller.pollOnce(); // 14:42Z
+    clock += 90_000; // 90s later — past the configured 1-minute window
+    await poller.pollOnce();
+
+    expect(warmCalls).toEqual([CHAT, CHAT]);
+  });
+
+  it('DEFAULT_WARMUP_BACKOFF_MS is exported and is 15 minutes, matching the README/env.example default', () => {
+    expect(DEFAULT_WARMUP_BACKOFF_MS).toBe(15 * 60_000);
   });
 });

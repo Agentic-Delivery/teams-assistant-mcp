@@ -8,6 +8,7 @@ import type {
   PinnedMessage,
   SendFileOptions,
   TeamsChatsPort,
+  WarmMembersResult,
 } from './teams-chats.js';
 import { htmlToText, type ChatAttachmentRef, type ChatMessage, type ReadResult } from '../messages.js';
 
@@ -142,9 +143,9 @@ export class ReliableTeamsChats implements TeamsChatsPort {
     return this.inner.resolveMentions(chatId, names);
   }
 
-  /** Pure passthrough — see TeamsChatsPort.warmMembers's own doc comment (0.6.0). */
-  warmMembers(chatId: string): Promise<boolean> {
-    return this.inner.warmMembers?.(chatId) ?? Promise.resolve(false);
+  /** Pure passthrough — see TeamsChatsPort.warmMembers's own doc comment (0.6.0/0.6.3). */
+  warmMembers(chatId: string): Promise<WarmMembersResult> {
+    return this.inner.warmMembers?.(chatId) ?? Promise.resolve({ throttled: false });
   }
 
   sendMessage(chatId: string, text: string, mentions: readonly MentionTarget[] = []): Promise<ChatMessage> {

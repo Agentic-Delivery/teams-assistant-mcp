@@ -293,7 +293,7 @@ describe('GraphTeamsChats.warmMembers — daemon-side cache warm-up on an empty 
     const { fetchFn, calls } = countingMembersFetch(membersPage);
     const chats = subject(fetchFn as unknown as typeof fetch, cache);
 
-    await expect(chats.warmMembers(CHAT)).resolves.toBe(false);
+    await expect(chats.warmMembers(CHAT)).resolves.toEqual({ throttled: false });
 
     expect(calls).toHaveLength(1);
     expect(cache.get(CHAT)).toEqual([
@@ -308,12 +308,12 @@ describe('GraphTeamsChats.warmMembers — daemon-side cache warm-up on an empty 
     const { fetchFn, calls } = countingMembersFetch(membersPage);
     const chats = subject(fetchFn as unknown as typeof fetch, cache);
 
-    await expect(chats.warmMembers(CHAT)).resolves.toBe(false);
+    await expect(chats.warmMembers(CHAT)).resolves.toEqual({ throttled: false });
 
     expect(calls).toHaveLength(0);
   });
 
-  it('a throttled warm-up never throws, leaves the roster cold, logs one line, and reports throttled: true', async () => {
+  it('a throttled warm-up never throws, leaves the roster cold, logs one line, and reports throttled: true with Graph\'s own Retry-After', async () => {
     const cache = new MembersCache({ path });
     const { fetchFn } = countingMembersFetch(() =>
       json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
@@ -323,7 +323,9 @@ describe('GraphTeamsChats.warmMembers — daemon-side cache warm-up on an empty 
     const lines: string[] = [];
     const chats = subject(fetchFn as unknown as typeof fetch, cache, (line) => lines.push(line));
 
-    await expect(chats.warmMembers(CHAT)).resolves.toBe(true);
+    // 0.6.3: retryAfterSeconds now travels with the throttled result so a caller (inbox.ts's
+    // per-chat warm-up back-off window) can honour Graph's own named wait instead of a guess.
+    await expect(chats.warmMembers(CHAT)).resolves.toEqual({ throttled: true, retryAfterSeconds: 100 });
 
     expect(cache.get(CHAT)).toBeUndefined();
     expect(lines.some((line) => line.includes('warm-up'))).toBe(true);
@@ -354,7 +356,7 @@ describe('GraphTeamsChats.warmMembers — daemon-side cache warm-up on an empty 
     const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch, sleepFn });
     const chats = new GraphTeamsChats(graph, { membersCache: cache });
 
-    await expect(chats.warmMembers(CHAT)).resolves.toBe(true);
+    await expect(chats.warmMembers(CHAT)).resolves.toEqual({ throttled: true, retryAfterSeconds: 30 });
 
     expect(attempts).toBe(1); // exactly one live attempt — readRetries: 0, not the shared budget
     expect(sleepFn).not.toHaveBeenCalled();

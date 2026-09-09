@@ -982,7 +982,7 @@ describe('reliable sends — resolveMentions and pin/unpin/list are pure passthr
   });
 
   it('warmMembers delegates untouched (0.6.0) — a best-effort read/cache-fill, nothing to guard', async () => {
-    const warmMembers = vi.fn(async () => undefined);
+    const warmMembers = vi.fn(async () => ({ throttled: false }));
     const inner = portWith({ warmMembers });
     const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {} });
 
@@ -995,7 +995,7 @@ describe('reliable sends — resolveMentions and pin/unpin/list are pure passthr
     const inner = portWith({}); // sendFile etc. still `reject`, warmMembers simply absent
     const chats = new ReliableTeamsChats(inner, { selfDisplayName: 'Assistant', sleepFn: async () => {} });
 
-    await expect(chats.warmMembers('19:a@thread.v2')).resolves.toBe(false);
+    await expect(chats.warmMembers('19:a@thread.v2')).resolves.toEqual({ throttled: false });
   });
 
   it('pinMessage, unpinMessage and listPinnedMessages all delegate untouched', async () => {
