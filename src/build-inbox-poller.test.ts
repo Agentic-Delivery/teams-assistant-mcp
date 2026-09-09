@@ -9,6 +9,18 @@ function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 }
 
+/** A 429 with a Retry-After long enough that a retry inside this test's own process would sleep
+ *  for real if anything foolishly retried it — same convention used throughout
+ *  teams-chats.test.ts/graph-client.test.ts. Every route below is set up to prove a specific
+ *  endpoint is NEVER called at all, so answering it (rather than throwing) would only mask a
+ *  regression as a slow pass instead of a loud failure. */
+function throttled(): Response {
+  return new Response(
+    JSON.stringify({ error: { code: 'TooManyRequests', message: 'Too many requests' } }),
+    { status: 429, headers: { 'content-type': 'application/json', 'retry-after': '100' } },
+  );
+}
+
 // MAJOR 3 (2026-09-04 review): deleting `roster: membersCache` (previously an inline literal in
 // index.ts) left the full 485-test suite green — every inbox.test.ts test drives a hand-built
 // `rosterSink` double, never the real InboxPoller against a real MembersCache, and index.ts itself
@@ -28,42 +40,38 @@ describe('buildInboxPoller — the real composition, driven end to end (MAJOR 3,
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('polling one message through the REAL stack (buildChats + buildInboxPoller) harvests the sender into the REAL on-disk MembersCache as a PARTIAL entry', async () => {
+  async function configFor(dir: string) {
     const { loadConfig } = await import('./config.js');
-    const { buildChats } = await import('./build-chats.js');
-    const { buildInboxPoller } = await import('./build-inbox-poller.js');
-    const { MembersCache } = await import('./graph/members-cache.js');
-
     const configPath = join(dir, 'teams-mcp.config.json');
     await writeFile(configPath, JSON.stringify({ allowedChats: [{ id: CHAT, label: 'pilot', canPost: true }] }));
-    const config = loadConfig({
+    return loadConfig({
       TEAMS_MCP_CONFIG: configPath,
       TEAMS_MCP_TENANT_ID: 'tenant',
       TEAMS_MCP_USERNAME: 'assistant@example.com',
       TEAMS_MCP_PASSWORD: 'secret',
       TEAMS_MCP_TOKEN_CACHE: join(dir, '.token-cache.json'),
     });
+  }
+
+  it('polling one message through the REAL stack (buildChats + buildInboxPoller) harvests the sender into the REAL on-disk MembersCache as a PARTIAL entry — and NEVER calls /members (2026-09-09, poll-path throttle fix: roster warm-up no longer runs on the poll path at all)', async () => {
+    const { buildChats } = await import('./build-chats.js');
+    const { buildInboxPoller } = await import('./build-inbox-poller.js');
+    const { MembersCache } = await import('./graph/members-cache.js');
+
+    const config = await configFor(dir);
 
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (url: string) => {
       const u = String(url);
-      if (u.includes('/me?') && u.includes('select=id,displayName')) {
-        return json({ id: 'me-id', displayName: 'Assistant (AI)' });
+      if (u.includes('/me?')) {
+        return json({ id: 'me-id' });
       }
-      // 0.6.0's behaviour-4 warm-up (inbox.ts) now calls warmMembers on the FIRST poll of every
-      // allowlisted chat — modelled here as throttled (a realistic "the endpoint is unreachable
-      // this cycle" shape, matching this test's own harvest-only scenario) rather than left
-      // unhandled, so the roster genuinely stays PARTIAL for the reason the assertion below
-      // names, not because of an unrelated mock gap. See the SECOND test in this file for the
-      // warm-up-SUCCEEDS case through this same real composition.
+      // Throttled rather than left unhandled: this test's point is that this route is never
+      // reached by a poll cycle at all — an unhandled route throwing "unexpected call" would
+      // prove the same thing less clearly than a throttle response the poll would visibly choke
+      // on if it were still reached.
       if (u.includes(`/chats/${encodeURIComponent(CHAT)}/members`)) {
-        // retry-after past GraphClient's MAX_RETRY_SLEEP_MS (90s) so every retry fails fast
-        // locally rather than actually sleeping in this test (same convention used throughout
-        // teams-chats.test.ts/graph-client.test.ts).
-        return new Response(
-          JSON.stringify({ error: { code: 'TooManyRequests', message: 'Too many requests' } }),
-          { status: 429, headers: { 'content-type': 'application/json', 'retry-after': '100' } },
-        );
+        return throttled();
       }
       if (u.includes(`/chats/${encodeURIComponent(CHAT)}/messages`)) {
         return json({
@@ -81,29 +89,24 @@ describe('buildInboxPoller — the real composition, driven end to end (MAJOR 3,
       throw new Error(`unexpected call in this test: ${u}`);
     }) as typeof fetch;
     try {
-      const { chats, graph, tokenProvider, membersCache } = buildChats(config);
+      const { chats, tokenProvider, membersCache } = buildChats(config);
       vi.spyOn(tokenProvider, 'getAccessToken').mockResolvedValue('fake-token');
 
       const poller = buildInboxPoller({
         chats,
-        graph,
         tokenProvider,
         membersCache,
         allowlist: config.allowlist,
         inboxPath: join(dir, 'inbox.jsonl'),
       });
 
-      // Cycle 1: behaviour-4 warm-up (0.6.0) hits the throttled /members mock ONCE — readRetries:0
-      // means no sleep, but review round 1 MAJOR 4 also made a throttled warm-up end the CYCLE
-      // (same "one 429 ends the cycle" rule readMessages's own 429 handling follows), so this
-      // cycle never reaches readMessages/harvest at all. Cycle 2 runs back to back with no real
-      // wait, so it is still well inside this chat's per-chat warm-up back-off window (0.6.3,
-      // issue a: 15 minutes by default) opened by cycle 1's throttled attempt — the warm-up is
-      // skipped again and the cycle proceeds straight to the bootstrap poll (0.4.1: the first poll
-      // on a chat with no known watermark only settles it, delivering nothing — but harvest runs
-      // BEFORE that filter, so even this settling poll harvests Bob).
-      await poller.pollOnce();
-      await poller.pollOnce();
+      // Cycle 1 is the bootstrap/settling poll (0.4.1: delivers nothing, but harvest runs before
+      // that filter). Cycle 2 proves the SAME holds on an ordinary cycle too — neither ever
+      // touches /me or /members, which would 429 immediately above if they did.
+      const clean1 = await poller.pollOnce();
+      const clean2 = await poller.pollOnce();
+      expect(clean1).toBe(true);
+      expect(clean2).toBe(true);
 
       const freshCache = new MembersCache({ path: config.membersCachePath });
       expect(freshCache.get(CHAT)).toEqual(
@@ -111,7 +114,8 @@ describe('buildInboxPoller — the real composition, driven end to end (MAJOR 3,
       );
       // PARTIAL, not COMPLETE: this entry has only ever been touched by merge(), never a real
       // /members fetch — getComplete() must refuse it exactly as membersForInvite (sendFile's
-      // permission-grant path) needs it to (0.5.2 BLOCKER 1 fix).
+      // permission-grant path) needs it to (0.5.2 BLOCKER 1 fix). Also proves the entry did not
+      // somehow get upgraded by a poll-path warm-up, which no longer exists.
       expect(freshCache.getComplete(CHAT)).toBeUndefined();
 
       // Carried over from PR #8 (0.5.4): the health file is written by InboxPoller itself, not
@@ -129,146 +133,147 @@ describe('buildInboxPoller — the real composition, driven end to end (MAJOR 3,
     }
   });
 
-  // Behaviour 4 (0.6.0, live 2026-09-08) — the wire proof for warmMembers, same shape as MAJOR
-  // 3's `roster: membersCache` proof above: `BuildInboxPollerOptions.chats` is typed
-  // `Pick<TeamsChatsPort, 'readMessages' | 'warmMembers'>`, so a dropped `warmMembers` forward
-  // anywhere in the real chain (ReliableTeamsChats → GraphTeamsChats) would leave this the only
-  // test able to catch it — inbox.test.ts's own warm-up tests all drive hand-built doubles.
-  it('the FIRST poll of a newly-allowlisted chat warms its roster to COMPLETE through the REAL stack, when /members is reachable', async () => {
-    const { loadConfig } = await import('./config.js');
+  // 2026-09-09 (poll-path throttle fix): self id resolves through GraphTeamsChats.resolveSelfId —
+  // the operator-seed -> persisted-cache -> live /me chain sendFile already uses — instead of a
+  // raw, unconditional /me call. This drives the REAL composition with a WARM persisted self-id
+  // cache and proves /me is never called at all.
+  it('self id resolves from the REAL persisted cache through the REAL stack, with zero /me calls', async () => {
     const { buildChats } = await import('./build-chats.js');
     const { buildInboxPoller } = await import('./build-inbox-poller.js');
-    const { MembersCache } = await import('./graph/members-cache.js');
+    const { FileSelfIdCache } = await import('./graph/self-id-cache.js');
 
-    const configPath = join(dir, 'teams-mcp.config.json');
-    await writeFile(configPath, JSON.stringify({ allowedChats: [{ id: CHAT, label: 'pilot', canPost: true }] }));
-    const config = loadConfig({
-      TEAMS_MCP_CONFIG: configPath,
-      TEAMS_MCP_TENANT_ID: 'tenant',
-      TEAMS_MCP_USERNAME: 'assistant@example.com',
-      TEAMS_MCP_PASSWORD: 'secret',
-      TEAMS_MCP_TOKEN_CACHE: join(dir, '.token-cache.json'),
+    const config = await configFor(dir);
+    new FileSelfIdCache({ path: config.selfIdCachePath, expectedUsername: config.username }).write({
+      id: 'me-id',
+      resolvedAt: Date.now(),
     });
 
     const originalFetch = globalThis.fetch;
-    let membersCalls = 0;
     globalThis.fetch = (async (url: string) => {
       const u = String(url);
-      if (u.includes('/me?') && u.includes('select=id,displayName')) {
-        return json({ id: 'me-id', displayName: 'Assistant (AI)' });
+      if (u.includes('/me?')) {
+        throw new Error('unexpected /me call: the persisted self-id cache should have answered');
       }
       if (u.includes(`/chats/${encodeURIComponent(CHAT)}/members`)) {
-        membersCalls += 1;
-        return json({ value: [{ userId: 'aad-carol', displayName: 'Carol Chen' }] });
+        return throttled();
       }
       if (u.includes(`/chats/${encodeURIComponent(CHAT)}/messages`)) {
-        return json({ value: [] }); // no traffic yet — warm-up is the ONLY source of this roster
+        return json({
+          value: [
+            {
+              id: 'msg-self-1',
+              chatId: CHAT,
+              createdDateTime: '2026-09-04T10:00:00Z',
+              from: { user: { id: 'me-id', displayName: 'Assistant (AI)' } },
+              body: { contentType: 'text', content: 'my own post' },
+            },
+          ],
+        });
       }
       throw new Error(`unexpected call in this test: ${u}`);
     }) as typeof fetch;
     try {
-      const { chats, graph, tokenProvider, membersCache } = buildChats(config);
+      const { chats, tokenProvider, membersCache } = buildChats(config);
       vi.spyOn(tokenProvider, 'getAccessToken').mockResolvedValue('fake-token');
 
       const poller = buildInboxPoller({
         chats,
-        graph,
         tokenProvider,
         membersCache,
         allowlist: config.allowlist,
         inboxPath: join(dir, 'inbox.jsonl'),
       });
 
-      await poller.pollOnce();
+      await poller.pollOnce(); // settle
+      const clean = await poller.pollOnce();
+      expect(clean).toBe(true);
 
-      const freshCache = new MembersCache({ path: config.membersCachePath });
-      // COMPLETE, not just present: a real /members fetch backs this entry — sendFile's
-      // permission grant (getComplete/getStaleComplete) can use it with no further live call.
-      expect(freshCache.getComplete(CHAT)).toEqual([{ id: 'aad-carol', displayName: 'Carol Chen' }]);
-      expect(membersCalls).toBe(1);
-
-      await poller.pollOnce();
-      expect(membersCalls).toBe(1); // still once — not once per poll cycle
+      // The self-filtered message must not have been delivered — proof the persisted id actually
+      // reached isSelf, not just that resolution didn't throw.
+      const inboxRaw = await readFile(join(dir, 'inbox.jsonl'), 'utf8').catch(() => '');
+      expect(inboxRaw.trim()).toBe('');
     } finally {
       globalThis.fetch = originalFetch;
     }
   });
 
-  // MAJOR 3 (review round 1, fresh-context re-review): the TEAMS_INBOX_WARMUP_BACKOFF_SECONDS ->
-  // warmupBackoffMs wire (index.ts -> buildInboxPoller -> InboxPoller) had no test — deleting the
-  // `...(options.warmupBackoffMs !== undefined ? { warmupBackoffMs: options.warmupBackoffMs } : {})`
-  // line in build-inbox-poller.ts left the full suite green. This drives the REAL composition with
-  // an explicit warmupBackoffMs and a controlled system clock (vi.setSystemTime), proving the
-  // configured window — not just the 15-minute default — actually governs the real InboxPoller a
-  // real buildInboxPoller call produces.
-  it('warmupBackoffMs passed into buildInboxPoller actually governs the real InboxPoller: no re-warm before the configured window, one after it', async () => {
-    const { loadConfig } = await import('./config.js');
+  // The direct evidence for the incident this whole fix closes (docs/throttling-mitigation.md's
+  // dated section, 2026-09-09): /me AND /members both 429 throughout, with no seed and no
+  // persisted cache — the poll must still read and deliver every allowed chat's messages.
+  it('/me and /members throttled on EVERY call, no seed or persisted cache — messages still get delivered and the health file reports ok', async () => {
     const { buildChats } = await import('./build-chats.js');
     const { buildInboxPoller } = await import('./build-inbox-poller.js');
 
-    const configPath = join(dir, 'teams-mcp.config.json');
-    await writeFile(configPath, JSON.stringify({ allowedChats: [{ id: CHAT, label: 'pilot', canPost: true }] }));
-    const config = loadConfig({
-      TEAMS_MCP_CONFIG: configPath,
-      TEAMS_MCP_TENANT_ID: 'tenant',
-      TEAMS_MCP_USERNAME: 'assistant@example.com',
-      TEAMS_MCP_PASSWORD: 'secret',
-      TEAMS_MCP_TOKEN_CACHE: join(dir, '.token-cache.json'),
-    });
+    const config = await configFor(dir);
 
-    const originalFetch = globalThis.fetch;
+    let meCalls = 0;
     let membersCalls = 0;
+    let messagesCalls = 0;
+    const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (url: string) => {
       const u = String(url);
-      if (u.includes('/me?') && u.includes('select=id,displayName')) {
-        return json({ id: 'me-id', displayName: 'Assistant (AI)' });
+      if (u.includes('/me?')) {
+        meCalls += 1;
+        return throttled();
       }
       if (u.includes(`/chats/${encodeURIComponent(CHAT)}/members`)) {
         membersCalls += 1;
-        // No retry-after header at all: GraphError.retryAfterSeconds is undefined, so the
-        // configured warmupBackoffMs (not Graph's own wait) is what this test is actually
-        // proving — see warmupBackoffFor's floor-vs-override doc comment (MAJOR 1) for why that
-        // distinction matters.
-        return new Response(
-          JSON.stringify({ error: { code: 'TooManyRequests', message: 'Too many requests' } }),
-          { status: 429, headers: { 'content-type': 'application/json' } },
-        );
+        return throttled();
       }
       if (u.includes(`/chats/${encodeURIComponent(CHAT)}/messages`)) {
-        return json({ value: [] });
+        messagesCalls += 1;
+        // Empty on the FIRST call (the bootstrap/settling poll — 0.4.1: establishes the
+        // watermark, delivers nothing) so the second call's message is genuinely NEW against
+        // that watermark, rather than the same static message being filtered out as stale.
+        if (messagesCalls === 1) {
+          return json({ value: [] });
+        }
+        return json({
+          value: [
+            {
+              id: 'msg-1',
+              chatId: CHAT,
+              createdDateTime: '2026-09-09T10:00:00Z',
+              from: { user: { id: 'aad-dana', displayName: 'Dana Duffy' } },
+              body: { contentType: 'text', content: 'are you there?' },
+            },
+          ],
+        });
       }
       throw new Error(`unexpected call in this test: ${u}`);
     }) as typeof fetch;
-
-    vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(new Date('2026-09-08T14:42:00.000Z'));
     try {
-      const { chats, graph, tokenProvider, membersCache } = buildChats(config);
+      const { chats, tokenProvider, membersCache } = buildChats(config);
       vi.spyOn(tokenProvider, 'getAccessToken').mockResolvedValue('fake-token');
 
       const poller = buildInboxPoller({
         chats,
-        graph,
         tokenProvider,
         membersCache,
         allowlist: config.allowlist,
         inboxPath: join(dir, 'inbox.jsonl'),
-        warmupBackoffMs: 60_000, // 60s, not the 15-minute default
       });
 
-      await poller.pollOnce(); // opens the 60s window
-      expect(membersCalls).toBe(1);
+      await poller.pollOnce(); // bootstrap/settling poll — establishes the watermark, delivers nothing
+      const clean = await poller.pollOnce();
 
-      vi.setSystemTime(new Date('2026-09-08T14:42:59.000Z')); // 59s later — still inside the window
-      await poller.pollOnce();
-      expect(membersCalls).toBe(1); // NOT re-warmed yet
+      expect(clean).toBe(true);
+      const lines = (await readFile(join(dir, 'inbox.jsonl'), 'utf8')).trim().split('\n');
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(lines[0] as string)).toMatchObject({ chat: CHAT, id: 'msg-1', from: 'Dana Duffy' });
 
-      vi.setSystemTime(new Date('2026-09-08T14:43:01.000Z')); // 61s later — past the configured window
-      await poller.pollOnce();
-      expect(membersCalls).toBe(2); // re-warmed once the CONFIGURED window elapsed
+      const health = JSON.parse(
+        await readFile(join(dir, 'poller-health.json'), 'utf8'),
+      ) as Record<string, unknown>;
+      expect(health['ok']).toBe(true);
+
+      // /me is retried at most once per process (see InboxPoller's self-resolution doc comment) —
+      // NOT once per poll cycle, which would keep feeding the same throttled budget.
+      expect(meCalls).toBe(1);
+      // /members is never called at all — roster warm-up no longer runs on the poll path.
+      expect(membersCalls).toBe(0);
     } finally {
       globalThis.fetch = originalFetch;
-      vi.useRealTimers();
     }
   });
 });

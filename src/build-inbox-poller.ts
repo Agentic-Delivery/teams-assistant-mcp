@@ -1,15 +1,12 @@
 import { dirname, join } from 'node:path';
 import type { ChatAllowlist } from './allowlist.js';
-import type { GraphClient } from './graph/graph-client.js';
 import type { MembersCache } from './graph/members-cache.js';
 import { InboxPoller, type SignedInAccount } from './inbox.js';
 import type { TeamsChatsPort } from './graph/teams-chats.js';
 import type { TokenProvider } from './auth/token-provider.js';
 
 export interface BuildInboxPollerOptions {
-  chats: Pick<TeamsChatsPort, 'readMessages' | 'warmMembers'>;
-  /** Only `/me` is used here (to learn who "self" is) — the raw client, not the chats wrapper. */
-  graph: GraphClient;
+  chats: Pick<TeamsChatsPort, 'readMessages' | 'resolveSelfId'>;
   tokenProvider: TokenProvider;
   /**
    * The SAME MembersCache instance `buildChats` wires into `GraphTeamsChats` — deliberately the
@@ -24,9 +21,6 @@ export interface BuildInboxPollerOptions {
   inboxPath: string;
   inboxYieldPath?: string;
   pollMs?: number;
-  /** Per-chat warm-up back-off window override — see InboxPollerDeps.warmupBackoffMs (inbox.ts)
-   *  and TEAMS_INBOX_WARMUP_BACKOFF_SECONDS (index.ts) for where this comes from. */
-  warmupBackoffMs?: number;
   log?: (line: string) => void;
 }
 
@@ -41,7 +35,18 @@ export function buildInboxPoller(options: BuildInboxPollerOptions): InboxPoller 
   return new InboxPoller({
     chats: options.chats,
     allowlist: options.allowlist,
-    self: () => options.graph.get<SignedInAccount>('/me?$select=id,displayName'),
+    // 2026-09-09 (poll-path throttle fix): resolved through GraphTeamsChats.resolveSelfId — the
+    // SAME operator-seed (TEAMS_MCP_SELF_ID) -> persisted-cache -> live `/me` chain sendFile
+    // already uses, which never throws — instead of a raw `graph.get('/me?$select=id,displayName')`
+    // of this module's own. That raw call is what used to fail the WHOLE poll cycle on a throttled
+    // `/me`: see InboxPollerDeps.self's own doc comment (inbox.ts) for the incident. `resolveSelfId`
+    // only ever answers with an id (never a displayName) — self-message filtering by displayName
+    // (InboxPoller.isSelf's fallback branch) simply has nothing to match against when a chat member
+    // arrives with no fromId, same graceful-degradation posture as an unresolved id entirely.
+    self: async (): Promise<SignedInAccount> => {
+      const id = await options.chats.resolveSelfId?.();
+      return id !== undefined ? { id } : {};
+    },
     inboxPath: options.inboxPath,
     // The state sidecar follows the inbox file, so a TEAMS_INBOX_PATH override moves both — and
     // the yield file with them (inboxYieldPathFor derives from the same inbox path, index.ts).
@@ -54,7 +59,6 @@ export function buildInboxPoller(options: BuildInboxPollerOptions): InboxPoller 
     // re-check; see teams-chats.ts's membersForInvite for the COMPLETE-only read that enforces it.
     roster: options.membersCache,
     ...(options.pollMs !== undefined ? { pollMs: options.pollMs } : {}),
-    ...(options.warmupBackoffMs !== undefined ? { warmupBackoffMs: options.warmupBackoffMs } : {}),
     log: options.log ?? (() => {}),
     // 0.4.1 stuck-auth self-healing: a token that goes bad without the local cache's own expiry
     // catching up needs an external nudge to drop it — see InboxPoller.trackAuthHealth's doc

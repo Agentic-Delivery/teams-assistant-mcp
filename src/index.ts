@@ -10,7 +10,7 @@ async function main(): Promise<void> {
   const config = loadConfig();
 
   const uploadDir = process.env['TEAMS_MCP_UPLOAD_DIR'];
-  const { chats, graph, tokenProvider, membersCache } = buildChats(config, uploadDir ? { uploadDir } : {});
+  const { chats, tokenProvider, membersCache } = buildChats(config, uploadDir ? { uploadDir } : {});
 
   // The yield file is passed even when THIS process runs no poller: the download tools write it
   // to quiet whichever poller shares the mailbox — possibly a daemon in another process — and a
@@ -54,11 +54,6 @@ async function main(): Promise<void> {
   // also does ad-hoc reads slow the poller down; garbage or non-positive values fall back to
   // the default, same posture as every other best-effort env knob.
   const pollSeconds = Number(process.env['TEAMS_INBOX_POLL_SECONDS']);
-  // Per-chat warm-up back-off window (issue a, live-diagnosed 2026-09-08: the SAME chat's roster
-  // warm-up was throttled on two consecutive poll cycles 4 minutes apart). Defaults to
-  // DEFAULT_WARMUP_BACKOFF_MS (15 minutes, see inbox.ts) when unset or garbage — same
-  // best-effort posture as TEAMS_INBOX_POLL_SECONDS above.
-  const warmupBackoffSeconds = Number(process.env['TEAMS_INBOX_WARMUP_BACKOFF_SECONDS']);
   await startInboxSupervision({
     env: process.env,
     inboxPath,
@@ -69,15 +64,11 @@ async function main(): Promise<void> {
     // review).
     pollerOptions: {
       chats,
-      graph,
       tokenProvider,
       membersCache,
       allowlist: config.allowlist,
       inboxYieldPath,
       ...(Number.isFinite(pollSeconds) && pollSeconds > 0 ? { pollMs: pollSeconds * 1000 } : {}),
-      ...(Number.isFinite(warmupBackoffSeconds) && warmupBackoffSeconds > 0
-        ? { warmupBackoffMs: warmupBackoffSeconds * 1000 }
-        : {}),
     },
   });
 }

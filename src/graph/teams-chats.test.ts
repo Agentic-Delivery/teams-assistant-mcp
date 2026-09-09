@@ -363,6 +363,42 @@ describe('GraphTeamsChats.warmMembers — daemon-side cache warm-up on an empty 
   });
 });
 
+// 2026-09-09 (poll-path throttle fix): resolveSelfId went from a private helper (used only by
+// sendFile, exercised only indirectly through it below) to a public TeamsChatsPort method the
+// inbox poller now calls directly (build-inbox-poller.ts). A direct test pins the one contract
+// the new caller actually relies on: a throttled/failed live /me degrades to `undefined`, it never
+// throws — sendFile's own tests already cover the seed/memo/cache short-circuits this shares.
+describe('GraphTeamsChats.resolveSelfId — public port method (2026-09-09, poll-path throttle fix)', () => {
+  it('a throttled live /me (no seed, no persisted cache) resolves to undefined rather than throwing', async () => {
+    const fetchFn = vi.fn(async (url: string) => {
+      if (String(url).includes('/me?')) {
+        return json({ error: { code: 'TooManyRequests', message: 'Too many requests' } }, 429, {
+          'retry-after': '100',
+        });
+      }
+      throw new Error(`unexpected call: ${String(url)}`);
+    });
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch });
+    const chats = new GraphTeamsChats(graph, { membersCache: new MembersCache({ path: '/dev/null' }) });
+
+    await expect(chats.resolveSelfId()).resolves.toBeUndefined();
+  });
+
+  it('TEAMS_MCP_SELF_ID (selfIdOverride) answers with zero /me calls, same as the private path sendFile uses', async () => {
+    const fetchFn = vi.fn(async (url: string) => {
+      throw new Error(`unexpected call: ${String(url)}`);
+    });
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn: fetchFn as unknown as typeof fetch });
+    const chats = new GraphTeamsChats(graph, {
+      membersCache: new MembersCache({ path: '/dev/null' }),
+      selfIdOverride: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+    });
+
+    await expect(chats.resolveSelfId()).resolves.toBe('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+});
+
 describe('buildChats — the composition actually wires the members cache (0.4.1 review round 1)', () => {
   // MAJOR 1: an optional membersCache let the wiring in build-chats.ts be silently dropped with
   // no test noticing (mutation-verified: deleting the wiring left the full suite green). This

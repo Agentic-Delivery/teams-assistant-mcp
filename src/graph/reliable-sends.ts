@@ -148,6 +148,14 @@ export class ReliableTeamsChats implements TeamsChatsPort {
     return this.inner.warmMembers?.(chatId) ?? Promise.resolve({ throttled: false });
   }
 
+  /** Pure passthrough — see TeamsChatsPort.resolveSelfId's own doc comment (2026-09-09). Without
+   *  this, `chats.resolveSelfId` on the REAL stack (buildChats wraps GraphTeamsChats in THIS
+   *  class) silently reads as `undefined` — the optional-method shape that let `warmMembers` above
+   *  need the exact same passthrough first. */
+  resolveSelfId(): Promise<string | undefined> {
+    return this.inner.resolveSelfId?.() ?? Promise.resolve(undefined);
+  }
+
   sendMessage(chatId: string, text: string, mentions: readonly MentionTarget[] = []): Promise<ChatMessage> {
     // A mention rewrites its occurrence in the text into an <at> tag whose readback shows the
     // RESOLVED displayName ("Berggren, Mikael"), not the caller's search string ("Mika") — so the

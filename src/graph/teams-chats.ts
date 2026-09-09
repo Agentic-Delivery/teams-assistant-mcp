@@ -165,6 +165,18 @@ export interface TeamsChatsPort {
    * instead of always guessing a default.
    */
   warmMembers?(chatId: string): Promise<WarmMembersResult>;
+  /**
+   * The signed-in account's own AAD id, through the SAME override -> memo -> persisted-cache ->
+   * live `/me` order GraphTeamsChats.resolveSelfId already used privately for sendFile — exposed
+   * on the port (2026-09-09, poll-path throttle fix) so a caller other than sendFile can resolve
+   * "self" WITHOUT a raw, seed/cache-blind `/me` call of its own. Never throws: a live `/me` 429
+   * (or any other failure, once the override/memo/cache all miss) resolves to `undefined`, exactly
+   * as `resolveSelfId`'s own doc comment already documents — a caller decides for itself what
+   * "undetermined" means. This is what lets the inbox poller (`build-inbox-poller.ts`) stop
+   * depending on a throttled `/me` to make progress: see InboxPollerDeps.self's own doc comment
+   * for the incident this closes. Optional, same posture as `warmMembers` above.
+   */
+  resolveSelfId?(): Promise<string | undefined>;
 }
 
 /** See TeamsChatsPort.warmMembers's own doc comment for what each field means and who reads it. */
@@ -771,7 +783,10 @@ export class GraphTeamsChats implements TeamsChatsPort {
    * same-account operator typo. Nothing here invalidates that case; the cache is trusted until
    * the file is deleted by hand.
    */
-  private async resolveSelfId(): Promise<string | undefined> {
+  /** Public since 2026-09-09 (poll-path throttle fix) — see TeamsChatsPort.resolveSelfId's own
+   *  doc comment for why: the inbox poller resolves "self" through this SAME chain instead of a
+   *  raw `/me` call. Behaviour is otherwise unchanged from when this was private. */
+  async resolveSelfId(): Promise<string | undefined> {
     if (this.selfIdOverride !== undefined) {
       return this.selfIdOverride;
     }
