@@ -164,6 +164,26 @@ same cycle also attempt (and also get throttled by) the same closed gate. This i
 shortens the gap the bounded retry above cannot fully close: a chat created and used within the
 SAME poll interval the roster warms in.
 
+**Per-chat warm-up back-off window (0.6.3).** In 0.6.0 a chat's warm-up was attempted AT MOST ONCE
+per process lifetime, whatever the outcome: the moment `warmMembers` was first called for a chat,
+that chat was marked done and never offered again, throttled or not — so a THROTTLED warm-up was
+never retried by that same process, ever. Two throttled warm-ups for the same chat 4 minutes apart
+were observed live on 2026-09-08 (14:42Z, 14:46Z); re-review traced this to a daemon RESTART
+between the two, not to one process retrying — the old checkout was moved aside (directory mtime
+14:42:08 local / 14:42:08Z) and the daemon relaunched from a fresh clone before 14:46Z, so the pair
+was the OLD process's last cycle and the NEW process's first, each independently paying the "one
+attempt per lifetime" cost. **0.6.3 changes what happens after a throttle, not what happens across
+a restart**: a THROTTLED warm-up now backs that one chat off for a window before the SAME process
+tries it again — Graph's own `Retry-After` when the 429 named one, floored at (not replaced by) the
+configurable default `TEAMS_INBOX_WARMUP_BACKOFF_SECONDS` (15 minutes/900s — see "Configuration"
+below), so a short named wait can never re-open the chat sooner than the configured window. A chat
+whose warm-up succeeds (or whose cache was already warm, or a non-throttle failure) is still marked
+done forever, unchanged from 0.6.0. **The window lives in process memory only and is NOT persisted
+across a restart** — a fresh process re-attempts every chat's warm-up once, same as 0.6.0, which is
+exactly the shape that produced the original 14:42Z/14:46Z pair; 0.6.3 does not change that shape,
+it only stops a SINGLE long-running process from re-hammering the same throttled chat every cycle.
+Every other allowlisted chat is unaffected; the window is per chat, not process-wide.
+
 ## Retry-After
 
 Any Graph 429 in the send/reply/edit path never auto-retries — that has always been the rule for
@@ -548,6 +568,7 @@ credential, an account name, or a tenant id, and nothing ever should.
 | `TEAMS_MCP_DISPLAY_NAME` | no | Overrides the expected display name for the probe |
 | `TEAMS_INBOX_PATH` | no | Where the background inbox JSONL lands. Defaults to `~/.teams-assistant/inbox.jsonl`. **Set this to a distinct path for every additional server instance on the same host** — the poller's single-instance lock (`poller.lock`) and health file (`poller-health.json`) are keyed to this path, not to `TEAMS_MCP_CONFIG`, so two instances that both leave it unset silently share one lock and only one of them polls (see "Supervising the daemon") |
 | `TEAMS_INBOX_POLL_SECONDS` | no | Inbox poll interval, default 30. Raising it frees per-mailbox Graph read budget for ad-hoc reads — see "Downloading attachments" |
+| `TEAMS_INBOX_WARMUP_BACKOFF_SECONDS` | no | How long a chat's daemon-side member-roster warm-up backs off after being throttled before the poller tries it again for that chat. Defaults to 900 (15 minutes); Graph's own `Retry-After` on the throttled attempt raises this when longer (a floor, not a replacement). Process-local — does not survive a restart — see "The background inbox" above |
 | `TEAMS_INBOX_DISABLED` | no | Set to `1` to not run the background inbox poller at all |
 
 ### Throttle budgets are per client id

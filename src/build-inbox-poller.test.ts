@@ -96,10 +96,12 @@ describe('buildInboxPoller — the real composition, driven end to end (MAJOR 3,
       // Cycle 1: behaviour-4 warm-up (0.6.0) hits the throttled /members mock ONCE — readRetries:0
       // means no sleep, but review round 1 MAJOR 4 also made a throttled warm-up end the CYCLE
       // (same "one 429 ends the cycle" rule readMessages's own 429 handling follows), so this
-      // cycle never reaches readMessages/harvest at all. warmedChats already records CHAT as
-      // attempted, so cycle 2 skips warm-up and proceeds straight to the bootstrap poll (0.4.1:
-      // the first poll on a chat with no known watermark only settles it, delivering nothing —
-      // but harvest runs BEFORE that filter, so even this settling poll harvests Bob).
+      // cycle never reaches readMessages/harvest at all. Cycle 2 runs back to back with no real
+      // wait, so it is still well inside this chat's per-chat warm-up back-off window (0.6.3,
+      // issue a: 15 minutes by default) opened by cycle 1's throttled attempt — the warm-up is
+      // skipped again and the cycle proceeds straight to the bootstrap poll (0.4.1: the first poll
+      // on a chat with no known watermark only settles it, delivering nothing — but harvest runs
+      // BEFORE that filter, so even this settling poll harvests Bob).
       await poller.pollOnce();
       await poller.pollOnce();
 
@@ -189,6 +191,84 @@ describe('buildInboxPoller — the real composition, driven end to end (MAJOR 3,
       expect(membersCalls).toBe(1); // still once — not once per poll cycle
     } finally {
       globalThis.fetch = originalFetch;
+    }
+  });
+
+  // MAJOR 3 (review round 1, fresh-context re-review): the TEAMS_INBOX_WARMUP_BACKOFF_SECONDS ->
+  // warmupBackoffMs wire (index.ts -> buildInboxPoller -> InboxPoller) had no test — deleting the
+  // `...(options.warmupBackoffMs !== undefined ? { warmupBackoffMs: options.warmupBackoffMs } : {})`
+  // line in build-inbox-poller.ts left the full suite green. This drives the REAL composition with
+  // an explicit warmupBackoffMs and a controlled system clock (vi.setSystemTime), proving the
+  // configured window — not just the 15-minute default — actually governs the real InboxPoller a
+  // real buildInboxPoller call produces.
+  it('warmupBackoffMs passed into buildInboxPoller actually governs the real InboxPoller: no re-warm before the configured window, one after it', async () => {
+    const { loadConfig } = await import('./config.js');
+    const { buildChats } = await import('./build-chats.js');
+    const { buildInboxPoller } = await import('./build-inbox-poller.js');
+
+    const configPath = join(dir, 'teams-mcp.config.json');
+    await writeFile(configPath, JSON.stringify({ allowedChats: [{ id: CHAT, label: 'pilot', canPost: true }] }));
+    const config = loadConfig({
+      TEAMS_MCP_CONFIG: configPath,
+      TEAMS_MCP_TENANT_ID: 'tenant',
+      TEAMS_MCP_USERNAME: 'assistant@example.com',
+      TEAMS_MCP_PASSWORD: 'secret',
+      TEAMS_MCP_TOKEN_CACHE: join(dir, '.token-cache.json'),
+    });
+
+    const originalFetch = globalThis.fetch;
+    let membersCalls = 0;
+    globalThis.fetch = (async (url: string) => {
+      const u = String(url);
+      if (u.includes('/me?') && u.includes('select=id,displayName')) {
+        return json({ id: 'me-id', displayName: 'Assistant (AI)' });
+      }
+      if (u.includes(`/chats/${encodeURIComponent(CHAT)}/members`)) {
+        membersCalls += 1;
+        // No retry-after header at all: GraphError.retryAfterSeconds is undefined, so the
+        // configured warmupBackoffMs (not Graph's own wait) is what this test is actually
+        // proving — see warmupBackoffFor's floor-vs-override doc comment (MAJOR 1) for why that
+        // distinction matters.
+        return new Response(
+          JSON.stringify({ error: { code: 'TooManyRequests', message: 'Too many requests' } }),
+          { status: 429, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (u.includes(`/chats/${encodeURIComponent(CHAT)}/messages`)) {
+        return json({ value: [] });
+      }
+      throw new Error(`unexpected call in this test: ${u}`);
+    }) as typeof fetch;
+
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-09-08T14:42:00.000Z'));
+    try {
+      const { chats, graph, tokenProvider, membersCache } = buildChats(config);
+      vi.spyOn(tokenProvider, 'getAccessToken').mockResolvedValue('fake-token');
+
+      const poller = buildInboxPoller({
+        chats,
+        graph,
+        tokenProvider,
+        membersCache,
+        allowlist: config.allowlist,
+        inboxPath: join(dir, 'inbox.jsonl'),
+        warmupBackoffMs: 60_000, // 60s, not the 15-minute default
+      });
+
+      await poller.pollOnce(); // opens the 60s window
+      expect(membersCalls).toBe(1);
+
+      vi.setSystemTime(new Date('2026-09-08T14:42:59.000Z')); // 59s later — still inside the window
+      await poller.pollOnce();
+      expect(membersCalls).toBe(1); // NOT re-warmed yet
+
+      vi.setSystemTime(new Date('2026-09-08T14:43:01.000Z')); // 61s later — past the configured window
+      await poller.pollOnce();
+      expect(membersCalls).toBe(2); // re-warmed once the CONFIGURED window elapsed
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
     }
   });
 });

@@ -1,7 +1,7 @@
 import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { ChatAllowlist } from './allowlist.js';
-import type { TeamsChatsPort } from './graph/teams-chats.js';
+import type { TeamsChatsPort, WarmMembersResult } from './graph/teams-chats.js';
 import { readYield } from './inbox-yield.js';
 import type { ChatMessage } from './messages.js';
 
@@ -84,6 +84,17 @@ export interface InboxPollerDeps {
    *  to Date.now. */
   nowFn?: () => number;
   maxBackoffMs?: number;
+  /**
+   * How long a chat sits out further warm-up attempts after one comes back throttled — issue (a),
+   * live-diagnosed 2026-09-08: the SAME chat's roster warm-up was throttled on two consecutive
+   * poll cycles just 4 minutes apart, so the pre-0.6.3 "warm once, ever" gate (a chat marked
+   * attempted the moment warmMembers was first CALLED, whatever the outcome) was not actually
+   * closing the gap this incident showed. This is the DEFAULT window only — a throttled attempt
+   * that carries Graph's own Retry-After (WarmMembersResult.retryAfterSeconds) honours that
+   * instead, same posture as noteRetryAfter's read-loop floor. TEAMS_INBOX_WARMUP_BACKOFF_SECONDS
+   * is the env knob (see index.ts); defaults to DEFAULT_WARMUP_BACKOFF_MS (15 minutes).
+   */
+  warmupBackoffMs?: number;
   log?: (line: string) => void;
   /**
    * Called once a poll cycle ends with an auth-shaped failure (401, or a message naming
@@ -115,6 +126,19 @@ export interface InboxPollerDeps {
  * gates whether the forced re-mint fires at all; trackAuthHealth's last-resort tier covers the
  * shapeless case this function cannot name.
  */
+/**
+ * Pairs the two halves of "this cycle is throttled" so a call site cannot set one without the
+ * other (issue c, 2026-09-08 review: the pairing used to be convention only — a throttled cycle
+ * with no matching `failures` entry would slip past `pollAllowlistedChats`'s own
+ * `failures.length === 0` early return and be misreported as clean; see that method's own comment
+ * on the return statement). Both call sites today (the warm-up 429 and the readMessages 429) go
+ * through this; a third can never forget the push half. Exported for its own direct test.
+ */
+export function markThrottled(failures: string[], message: string): true {
+  failures.push(message);
+  return true;
+}
+
 function isAuthShaped(error: unknown): boolean {
   if (!(error instanceof Error)) {
     return false;
@@ -172,6 +196,11 @@ export const DEFAULT_MAX_BACKOFF_MS = 600_000;
  *  guards against firing on an ordinary transient blip that would have cleared on its own. */
 export const DEFAULT_AUTH_FAILURE_THRESHOLD = 3;
 export const DEFAULT_HEALTH_FILENAME = 'poller-health.json';
+/** Default per-chat warm-up back-off window (issue a, live 2026-09-08) — 15 minutes, comfortably
+ *  past the 4-minute gap the live incident's two throttled attempts actually showed. Overridden
+ *  by `warmupBackoffMs` / `TEAMS_INBOX_WARMUP_BACKOFF_SECONDS`; a throttled attempt that names its
+ *  own Retry-After uses that instead — see InboxPollerDeps.warmupBackoffMs's own doc comment. */
+export const DEFAULT_WARMUP_BACKOFF_MS = 15 * 60_000;
 
 /**
  * Pathological-size guard only — 64 KiB, not a "keep the line short" budget. Before 0.6.2 this
@@ -266,11 +295,23 @@ export class InboxPoller {
   private authRemedyFired = false;
   /** The `until` of the yield last logged, so one yield episode logs once, not once per cycle. */
   private yieldLoggedUntil: number | undefined;
-  /** Chat ids already offered to `chats.warmMembers` THIS process lifetime — behaviour 4 (0.6.0,
-   *  live 2026-09-08): warm each allowlisted chat's roster cache ONCE, not once per poll cycle.
-   *  GraphTeamsChats.warmMembers is itself a no-op once the cache has any entry, so this Set is
-   *  only what keeps a PERSISTENTLY failing warm-up from retrying the live call every cycle. */
-  private readonly warmedChats = new Set<string>();
+  /** Chat ids whose warm-up has been ATTEMPTED WITHOUT BEING THROTTLED — behaviour 4 (0.6.0, live
+   *  2026-09-08): once a chat lands here there is nothing left to warm, ever, for this process's
+   *  lifetime. This is NOT the same claim as "succeeded": GraphTeamsChats.warmMembers's own
+   *  contract (unchanged from 0.6.0) reports `{ throttled: false }` alike for a real success
+   *  (fetched, or the cache was already warm) and for a non-throttle failure (network error,
+   *  licence problem, a misbehaving port throwing, caught defensively by the `.catch` below) —
+   *  none of those say trying again right now would help, which is why both land here the same
+   *  way. A THROTTLED attempt does NOT land here — it goes into warmBackoffUntil below instead, so
+   *  a later cycle can retry once the window elapses rather than being permanently skipped (0.6.3,
+   *  issue a). */
+  private readonly warmComplete = new Set<string>();
+  /** Chat id -> the clock time (this.now()) before which this chat's warm-up is skipped, set
+   *  after a throttled attempt (issue a, live 2026-09-08: the SAME chat's warm-up was throttled on
+   *  two consecutive poll cycles 4 minutes apart). See warmupBackoffFor for how the window is
+   *  computed and InboxPollerDeps.warmupBackoffMs's doc comment for the knobs. */
+  private readonly warmBackoffUntil = new Map<string, number>();
+  private readonly warmupBackoffMs: number;
   private readonly writeFileFn: typeof writeFile;
   private readonly renameFn: typeof rename;
 
@@ -287,6 +328,25 @@ export class InboxPoller {
     this.authFailureThreshold = deps.authFailureThreshold ?? DEFAULT_AUTH_FAILURE_THRESHOLD;
     this.writeFileFn = deps.writeFileFn ?? writeFile;
     this.renameFn = deps.renameFn ?? rename;
+    this.warmupBackoffMs = deps.warmupBackoffMs ?? DEFAULT_WARMUP_BACKOFF_MS;
+  }
+
+  /**
+   * How long THIS throttled warm-up attempt backs its chat off for. MAJOR 1 (review round 1,
+   * fresh-context re-review of this branch): Graph's own Retry-After FLOORS the configured/default
+   * window, it does not REPLACE it — a short named wait (e.g. GraphClient's LocallyThrottled gate
+   * forwards `retryAfterSeconds = ceil(remaining/1000)`, which can be a handful of seconds) used
+   * to re-open the chat on the very next poll cycle, reproduced live as 5 warm-up attempts in 5
+   * consecutive 30s cycles. `noteRetryAfter` (below) takes the same `max` posture for the whole
+   * poll's own next delay — this mirrors it. Still capped at RETRY_AFTER_FLOOR_CAP_MS so a
+   * pathological header value can't wedge a chat cold for a day.
+   */
+  private warmupBackoffFor(retryAfterSeconds: number | undefined): number {
+    const named =
+      typeof retryAfterSeconds === 'number' && Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+        ? retryAfterSeconds * 1000
+        : 0;
+    return Math.min(Math.max(named, this.warmupBackoffMs), RETRY_AFTER_FLOOR_CAP_MS);
   }
 
   /**
@@ -422,29 +482,61 @@ export class InboxPoller {
         continue; // a chat this account can't read (403) is re-tried on a slow cadence, not every cycle
       }
       attempted += 1;
-      // Behaviour 4 (0.6.0, live 2026-09-08): warm this chat's roster cache once — best-effort,
-      // GraphTeamsChats.warmMembers itself never throws, but a `.catch` here is cheap insurance
-      // against a differently-behaved TeamsChatsPort implementation (a test double, a future
-      // decorator) doing so instead, matching this poller's own "never take the server down"
-      // contract (class doc comment above). `readRetries: 0` inside warmMembers means this never
-      // sleeps through a Retry-After itself (review round 1 MAJOR 4) — its `true` return (this
-      // single, non-retried attempt WAS throttled) still ends the cycle here, same "one 429 ends
-      // the cycle" rule readMessages's own 429 handling follows below: skip THIS chat's read and
-      // stop before any LATER chat's warm-up or read, rather than each cold chat in the same
-      // cycle issuing its own live 429 against a gate the first one already closed.
-      if (this.deps.chats.warmMembers && !this.warmedChats.has(entry.id)) {
-        this.warmedChats.add(entry.id);
-        const warmThrottled = await this.deps.chats.warmMembers(entry.id).catch(() => false);
-        if (warmThrottled) {
-          throttled = true;
-          // A `failures` entry is what makes this cycle NOT "clean" below (the failures.length
-          // === 0 early return does not itself consult `throttled` — this keeps that invariant
-          // intact rather than special-casing it there) and is what a watcher reading the inbox's
-          // {error, at, consecutiveFailures} line sees; readMessages's own 429 handling (below)
-          // does the same pairing.
-          failures.push(`${entry.label}: THROTTLED (member roster warm-up)`);
-          continue; // the `if (throttled) break;` at the top of the next iteration ends the cycle
+      // Behaviour 4 (0.6.0, live 2026-09-08), per-chat back-off since 0.6.3 (issue a): warm this
+      // chat's roster cache — best-effort, GraphTeamsChats.warmMembers itself never throws, but a
+      // `.catch` here is cheap insurance against a differently-behaved TeamsChatsPort
+      // implementation (a test double, a future decorator) doing so instead, matching this
+      // poller's own "never take the server down" contract (class doc comment above).
+      // `readRetries: 0` inside warmMembers means this never sleeps through a Retry-After itself
+      // (review round 1 MAJOR 4) — a `throttled: true` result (this single, non-retried attempt
+      // WAS throttled) still ends the cycle here, same "one 429 ends the cycle" rule
+      // readMessages's own 429 handling follows below: skip THIS chat's read and stop before any
+      // LATER chat's warm-up or read, rather than each cold chat in the same cycle issuing its own
+      // live 429 against a gate the first one already closed. A chat already attempted WITHOUT
+      // being throttled (warmed successfully, cache already warm, or a non-throttle failure — see
+      // warmComplete's own doc comment) is skipped forever, unchanged from 0.6.0; a chat still
+      // inside its back-off window from an EARLIER throttled attempt is skipped for
+      // THIS cycle only, falling straight through to the ordinary readMessages call below — live-
+      // diagnosed 2026-09-08: the SAME chat's warm-up was throttled on two consecutive poll cycles
+      // just 4 minutes apart, which the old "attempted once, ever" gate (marking a chat as done the
+      // moment warmMembers was first CALLED, whatever the outcome) did not actually prevent within
+      // one process lifetime.
+      if (this.deps.chats.warmMembers && !this.warmComplete.has(entry.id)) {
+        const backoffUntil = this.warmBackoffUntil.get(entry.id) ?? 0;
+        if (backoffUntil <= this.now()) {
+          const warmResult = await this.deps.chats
+            .warmMembers(entry.id)
+            .catch((): WarmMembersResult => ({ throttled: false }));
+          if (warmResult.throttled) {
+            throttled = markThrottled(failures, `${entry.label}: THROTTLED (member roster warm-up)`);
+            this.warmBackoffUntil.set(
+              entry.id,
+              this.now() + this.warmupBackoffFor(warmResult.retryAfterSeconds),
+            );
+            // MINOR (review round 1): a warm-up 429 is still a 429 against the SAME shared
+            // /members gate readMessages's own 429 handling floors the whole poll's next delay
+            // for (see noteRetryAfter's doc comment) — Graph's named wait should govern the next
+            // POLL just as much as it governs this one chat's own back-off window above.
+            this.noteRetryAfter(warmResult);
+            continue; // the `if (throttled) break;` at the top of the next iteration ends the cycle
+          }
+          // Memory hygiene only: warmComplete below is checked FIRST on every later iteration for
+          // this chat, so a stale warmBackoffUntil entry left behind here is never read again —
+          // this delete has no effect on behaviour, it just stops the map growing unboundedly for
+          // a chat that eventually succeeds after several throttled attempts.
+          this.warmBackoffUntil.delete(entry.id);
+          // "COMPLETE" here means "attempted without being throttled", not "succeeded" — the
+          // underlying GraphTeamsChats.warmMembers contract (and, defensively, the `.catch` above
+          // for a differently-behaved port) already reports `{ throttled: false }` for a REAL
+          // success (fetched, or cache already warm) and for a non-throttle failure alike (network
+          // error, licence problem, a misbehaving port throwing) — unchanged from 0.6.0. Telling
+          // those two apart would be a real behaviour change (a network-error chat would need its
+          // own retry story, not "never try again"), which is out of scope here.
+          this.warmComplete.add(entry.id);
         }
+        // else: still inside this chat's back-off window from an earlier throttled attempt — skip
+        // the warm-up silently this cycle and fall through to the ordinary readMessages path
+        // below; the window elapsing is what makes a LATER cycle attempt it again.
       }
       const known = this.state[entry.id];
       // 0.4.1 (live-diagnosed: a restart was observed replaying ~40 old messages): no entry on
@@ -506,15 +598,20 @@ export class InboxPoller {
         };
       } catch (error) {
         // One unreachable chat must not blank out the poll for the others.
-        failures.push(
-          `${entry.label}: ` + (error instanceof Error ? error.message : String(error)),
-        );
+        const message = `${entry.label}: ` + (error instanceof Error ? error.message : String(error));
         const status = (error as { status?: number }).status;
         if (status === 429) {
-          throttled = true; // 2026-08-25: polling on through a throttle kept an account throttled for hours
+          // 2026-08-25: polling on through a throttle kept an account throttled for hours.
+          // markThrottled (issue c, 2026-09-08 review) keeps the failures entry and the throttled
+          // flag paired — see that function's own doc comment for why this used to be convention
+          // only.
+          throttled = markThrottled(failures, message);
           this.noteRetryAfter(error);
-        } else if (status === 403) {
-          this.parked.set(entry.id, this.now() + PARK_FORBIDDEN_CHAT_MS);
+        } else {
+          failures.push(message);
+          if (status === 403) {
+            this.parked.set(entry.id, this.now() + PARK_FORBIDDEN_CHAT_MS);
+          }
         }
         if (isAuthShaped(error)) {
           authShapedFailure = true;

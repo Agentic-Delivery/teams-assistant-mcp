@@ -155,11 +155,22 @@ export interface TeamsChatsPort {
   /**
    * Daemon-side roster warm-up (0.6.0, live 2026-09-08) — see GraphTeamsChats.warmMembers's own
    * doc comment. Optional: a caller with no reason to warm anything (every CLI, most of the MCP
-   * tool surface) simply never calls it; the inbox poller (inbox.ts) is the one real caller, which
-   * uses the returned `true` (this single, non-retried attempt was itself throttled) to stop
-   * asking for more this poll cycle.
+   * tool surface) simply never calls it; the inbox poller (inbox.ts) is the one real caller.
+   * `throttled: true` means this single, non-retried attempt was itself throttled — the poller
+   * uses that to stop asking for more this poll cycle (same "one 429 ends the cycle" rule as a
+   * throttled message read). `retryAfterSeconds` (0.6.3) carries Graph's own named wait when the
+   * 429 supplied one, so a caller that backs a chat off after a throttled warm-up (inbox.ts's
+   * per-chat warm-up back-off window, live-diagnosed 2026-09-08: the SAME chat's warm-up was
+   * throttled on two consecutive poll cycles 4 minutes apart) can honour Graph's own number
+   * instead of always guessing a default.
    */
-  warmMembers?(chatId: string): Promise<boolean>;
+  warmMembers?(chatId: string): Promise<WarmMembersResult>;
+}
+
+/** See TeamsChatsPort.warmMembers's own doc comment for what each field means and who reads it. */
+export interface WarmMembersResult {
+  throttled: boolean;
+  retryAfterSeconds?: number;
 }
 
 export type { ChatMember, MentionTarget };
@@ -661,28 +672,39 @@ export class GraphTeamsChats implements TeamsChatsPort {
    * SECOND cold chat's warm-up issue ANOTHER live 429 in the SAME cycle instead of being refused
    * locally. One attempt, honest result, no wait, ever.
    *
-   * Returns `true` when that single attempt was itself throttled (a live 429, OR the local
-   * `LocallyThrottled` gate a PRIOR call already closed) — the caller (the poller) uses this to
-   * stop asking for more THIS cycle, same "one 429 ends the cycle" rule readMessages's own 429
-   * handling already follows. Returns `false` for every other outcome: already cached, fetched
-   * successfully, or failed for a reason OTHER than throttling (network error, licence problem,
-   * …) — none of those say anything about whether asking again right now would make things worse.
+   * Returns `{ throttled: true, retryAfterSeconds? }` when that single attempt was itself
+   * throttled (a live 429, OR the local `LocallyThrottled` gate a PRIOR call already closed) —
+   * the caller (the poller) uses `throttled` to stop asking for more THIS cycle, same "one 429
+   * ends the cycle" rule readMessages's own 429 handling already follows, and `retryAfterSeconds`
+   * (0.6.3, carried through from `GraphError.retryAfterSeconds` when Graph named a wait) to back
+   * this chat's NEXT warm-up attempt off for that long instead of retrying it on the very next
+   * cycle — live-diagnosed 2026-09-08: the same chat's warm-up was throttled on two consecutive
+   * poll cycles 4 minutes apart. Returns `{ throttled: false }` for every other outcome: already
+   * cached, fetched successfully, or failed for a reason OTHER than throttling (network error,
+   * licence problem, …) — none of those say anything about whether asking again right now would
+   * make things worse.
    */
-  async warmMembers(chatId: string): Promise<boolean> {
+  async warmMembers(chatId: string): Promise<WarmMembersResult> {
     if (this.membersCache.get(chatId)) {
-      return false;
+      return { throttled: false };
     }
     try {
       const fresh = await this.refreshMembers(chatId, 'for daemon warm-up', '', 0);
       this.cacheIfNonEmpty(chatId, fresh);
-      return false;
+      return { throttled: false };
     } catch (error) {
       this.log(
         `warmMembers: /members warm-up for ${chatId} failed ` +
           `(${error instanceof Error ? error.message : String(error)}); leaving the roster cold ` +
           'for the next real caller to retry.',
       );
-      return error instanceof GraphError && error.status === 429;
+      if (error instanceof GraphError && error.status === 429) {
+        return {
+          throttled: true,
+          ...(error.retryAfterSeconds !== undefined ? { retryAfterSeconds: error.retryAfterSeconds } : {}),
+        };
+      }
+      return { throttled: false };
     }
   }
 

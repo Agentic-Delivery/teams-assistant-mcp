@@ -3,7 +3,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ChatAllowlist } from './allowlist.js';
-import { DEFAULT_POLL_MS, InboxPoller, PARK_FORBIDDEN_CHAT_MS } from './inbox.js';
+import {
+  DEFAULT_POLL_MS,
+  DEFAULT_WARMUP_BACKOFF_MS,
+  InboxPoller,
+  PARK_FORBIDDEN_CHAT_MS,
+  markThrottled,
+} from './inbox.js';
 import { type ChatMessage, applyWatermark } from './messages.js';
 
 const CHAT = '19:pilot@thread.v2';
@@ -1231,7 +1237,7 @@ describe('inbox poller — daemon-side roster warm-up (0.6.0)', () => {
 
   function pollerWithWarm(
     chats: Pick<ReturnType<typeof chatStore>, 'readMessages'> & {
-      warmMembers: (chatId: string) => Promise<boolean>;
+      warmMembers: (chatId: string) => Promise<{ throttled: boolean; retryAfterSeconds?: number }>;
     },
     chatIds = [CHAT],
   ) {
@@ -1251,7 +1257,7 @@ describe('inbox poller — daemon-side roster warm-up (0.6.0)', () => {
       ...store,
       warmMembers: async (chatId: string) => {
         warmed.push(chatId);
-        return false;
+        return { throttled: false };
       },
     };
     const p = pollerWithWarm(chats);
@@ -1280,14 +1286,15 @@ describe('inbox poller — daemon-side roster warm-up (0.6.0)', () => {
   });
 
   // Defensive only: GraphTeamsChats.warmMembers's own contract is "never throws" (it reports
-  // throttling via its boolean return, not an exception) — this covers a DIFFERENTLY-BEHAVED
-  // TeamsChatsPort implementation (a test double, a future decorator) that violates that contract
-  // anyway, matching this poller's own "never take the server down" doctrine either way.
+  // throttling via its returned WarmMembersResult, not an exception) — this covers a
+  // DIFFERENTLY-BEHAVED TeamsChatsPort implementation (a test double, a future decorator) that
+  // violates that contract anyway, matching this poller's own "never take the server down"
+  // doctrine either way.
   it("a warmMembers that THROWS (misbehaving port, not GraphTeamsChats's own contract) never fails the poll cycle", async () => {
     const store = chatStore({});
     const chats = {
       ...store,
-      warmMembers: async (): Promise<boolean> => {
+      warmMembers: async (): Promise<{ throttled: boolean }> => {
         throw new Error('THROTTLED: the member list refresh for daemon warm-up was throttled');
       },
     };
@@ -1316,7 +1323,7 @@ describe('inbox poller — daemon-side roster warm-up (0.6.0)', () => {
       ...store,
       warmMembers: async (chatId: string) => {
         warmCalls.push(chatId);
-        return true; // the FIRST cold chat's warm-up was itself throttled
+        return { throttled: true }; // the FIRST cold chat's warm-up was itself throttled
       },
     };
 
@@ -1325,5 +1332,252 @@ describe('inbox poller — daemon-side roster warm-up (0.6.0)', () => {
     expect(warmCalls).toEqual([CHAT]); // never reached chat B's warm-up either
     expect(readCalls).toEqual([]); // readMessages never called for EITHER chat this cycle
     expect(clean).toBe(false); // a throttled cycle is never clean (same rule as a messages 429)
+  });
+});
+
+// Issue (c), 2026-09-08 review follow-up: the throttled/failures pairing used to be held by
+// convention only — every call site that set the local `throttled` flag had to remember, on its
+// own, to also push a matching entry into `failures`, because `pollAllowlistedChats`'s own early
+// return (`if (failures.length === 0) return { clean: true, ... }`) never consults `throttled`
+// itself (see that method's own doc comment on the return statement). A THIRD call site added
+// later with only half the pair would silently misreport a throttled cycle as clean. markThrottled
+// centralises the pair so a call site cannot set one half without the other.
+describe('markThrottled — the throttled/failures pairing cannot drift apart (0.6.3, issue c)', () => {
+  it('pushes the message into failures AND reports throttled — the two halves of the pair always move together', () => {
+    const failures: string[] = [];
+
+    const result = markThrottled(failures, '19:pilot@thread.v2: THROTTLED (member roster warm-up)');
+
+    expect(result).toBe(true);
+    expect(failures).toEqual(['19:pilot@thread.v2: THROTTLED (member roster warm-up)']);
+  });
+
+  it('called twice appends both messages in order — a helper, not a one-shot setter', () => {
+    const failures: string[] = [];
+
+    markThrottled(failures, 'first');
+    markThrottled(failures, 'second');
+
+    expect(failures).toEqual(['first', 'second']);
+  });
+});
+
+// Issue (a), live 2026-09-08: the SAME chat's member-roster warm-up was THROTTLED on two
+// consecutive poll cycles 4 minutes apart (14:42Z, 14:46Z) — the old "warm once, ever" gate
+// (a Set marking a chat as attempted the moment warmMembers was FIRST called, whatever the
+// outcome) only prevented a second attempt within one process lifetime; two attempts that close
+// together meant the guard was not doing its job within a single lifetime either way this incident
+// was actually produced. A per-chat back-off window closes that gap: after a throttled warm-up,
+// the SAME chat is not re-warmed until the window elapses (Graph's own Retry-After when the 429
+// named one, else the configurable default `warmupBackoffMs` / `TEAMS_INBOX_WARMUP_BACKOFF_SECONDS`,
+// DEFAULT_WARMUP_BACKOFF_MS). A successful warm-up still marks the chat COMPLETE forever, unchanged
+// from 0.6.0 (see the "warms each allowlisted chat exactly once" test above, which still passes
+// unmodified against this change).
+describe('inbox poller — per-chat warm-up back-off window (0.6.3, live 2026-09-08 14:42Z/14:46Z)', () => {
+  let dir: string;
+  let inboxPath: string;
+  let statePath: string;
+  let clock: number;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'inbox-warmup-backoff-'));
+    inboxPath = join(dir, 'inbox.jsonl');
+    statePath = join(dir, 'inbox-state.json');
+    // 2026-09-08T14:42:00.000Z — the live incident's own first throttled timestamp.
+    clock = Date.parse('2026-09-08T14:42:00.000Z');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function pollerOverWarm(
+    warmMembers: (chatId: string) => Promise<{ throttled: boolean; retryAfterSeconds?: number }>,
+    overrides: { warmupBackoffMs?: number } = {},
+  ) {
+    const readCalls: string[] = [];
+    const readMessages = async (chatId: string, since?: string) => {
+      readCalls.push(chatId);
+      return applyWatermark([], since);
+    };
+    const poller = new InboxPoller({
+      chats: { readMessages, warmMembers },
+      allowlist: new ChatAllowlist([{ id: CHAT, label: CHAT, canPost: true }]),
+      self: () => Promise.resolve(me),
+      inboxPath,
+      statePath,
+      nowFn: () => clock,
+      ...overrides,
+    });
+    return { poller, readCalls };
+  }
+
+  it('TRIGGERING: a cycle inside the back-off window (4 minutes after a throttled warm-up, well under the 15-minute default) does NOT call warmMembers again', async () => {
+    const warmCalls: string[] = [];
+    const warmMembers = async (chatId: string) => {
+      warmCalls.push(chatId);
+      return { throttled: true }; // Graph named no Retry-After — the incident's own log line
+    };
+    const { poller, readCalls } = pollerOverWarm(warmMembers);
+
+    const cycle1 = await poller.pollOnce(); // 14:42Z
+    expect(warmCalls).toEqual([CHAT]);
+    expect(cycle1).toBe(false); // a throttled warm-up ends the cycle, same as a throttled read
+
+    clock += 4 * 60_000; // 14:46Z — the live incident's own second attempt
+    const cycle2 = await poller.pollOnce();
+
+    expect(warmCalls).toEqual([CHAT]); // NOT re-warmed — still inside the 15-minute default window
+    expect(readCalls).toEqual([CHAT]); // the chat is not stuck: readMessages proceeds normally once warm-up is skipped
+    expect(cycle2).toBe(true); // no throttle THIS cycle since warm-up was never attempted
+  });
+
+  it('NON-TRIGGERING: the cycle after the back-off window elapses calls warmMembers again', async () => {
+    const warmCalls: string[] = [];
+    const warmMembers = async (chatId: string) => {
+      warmCalls.push(chatId);
+      return { throttled: true };
+    };
+    const { poller } = pollerOverWarm(warmMembers);
+
+    await poller.pollOnce(); // 14:42Z — opens the window
+    clock += 16 * 60_000; // 14:58Z — 16 minutes later, past the 15-minute default window
+    const cycle = await poller.pollOnce();
+
+    expect(warmCalls).toEqual([CHAT, CHAT]); // retried once the window elapsed
+    expect(cycle).toBe(false); // still throttled again in this test's fixture
+  });
+
+  // MAJOR 1 (review round 1, fresh-context re-review): Retry-After FLOORS the configured/default
+  // window rather than replacing it — a short named wait (GraphClient's LocallyThrottled gate can
+  // forward `retryAfterSeconds` as low as a handful of seconds, `ceil(remaining/1000)`) must not
+  // re-open the chat before the default window would have anyway. Reproduced live as 5 warm-up
+  // attempts in 5 consecutive 30s cycles before this fix.
+  it('TRIGGERING: a Retry-After SHORTER than the default (5s) never re-opens the chat sooner than the default window', async () => {
+    const warmCalls: string[] = [];
+    const warmMembers = async (chatId: string) => {
+      warmCalls.push(chatId);
+      return { throttled: true, retryAfterSeconds: 5 }; // far under the 15-minute default
+    };
+    const { poller } = pollerOverWarm(warmMembers);
+
+    await poller.pollOnce(); // 14:42Z
+    clock += 30_000; // one ordinary 30s poll cycle later — well past the named 5s, still far inside the default
+    await poller.pollOnce();
+
+    expect(warmCalls).toEqual([CHAT]); // NOT retried — the default window floors the short Retry-After
+  });
+
+  it('NON-TRIGGERING: a Retry-After LONGER than the default raises the window past the default instead of being ignored', async () => {
+    const warmCalls: string[] = [];
+    const warmMembers = async (chatId: string) => {
+      warmCalls.push(chatId);
+      return { throttled: true, retryAfterSeconds: 20 * 60 }; // 20 minutes — longer than the 15-minute default
+    };
+    const { poller } = pollerOverWarm(warmMembers);
+
+    await poller.pollOnce(); // 14:42Z
+    clock += 16 * 60_000; // 14:58Z — past the 15-minute DEFAULT, still short of the named 20 minutes
+    await poller.pollOnce();
+    expect(warmCalls).toEqual([CHAT]); // not yet — the longer named wait wins (a floor, not a default cap)
+
+    clock += 5 * 60_000; // 15:03Z — now past the named 20 minutes too
+    await poller.pollOnce();
+    expect(warmCalls).toEqual([CHAT, CHAT]); // retried once the LONGER of the two windows elapsed
+  });
+
+  it('a configured warmupBackoffMs overrides the default when Graph named no Retry-After', async () => {
+    const warmCalls: string[] = [];
+    const warmMembers = async (chatId: string) => {
+      warmCalls.push(chatId);
+      return { throttled: true };
+    };
+    const { poller } = pollerOverWarm(warmMembers, { warmupBackoffMs: 60_000 }); // 1 minute, not the 15-minute default
+
+    await poller.pollOnce(); // 14:42Z
+    clock += 90_000; // 90s later — past the configured 1-minute window
+    await poller.pollOnce();
+
+    expect(warmCalls).toEqual([CHAT, CHAT]);
+  });
+
+  it('DEFAULT_WARMUP_BACKOFF_MS is exported and is 15 minutes, matching the README/env.example default', () => {
+    expect(DEFAULT_WARMUP_BACKOFF_MS).toBe(15 * 60_000);
+  });
+
+  // MINOR (review round 1): retryAfterSeconds is data from an UNTRUSTED-ish source (a header
+  // Graph itself sends, but shaped by a numeric parse — see graph-client.ts's retryAfterSecondsOf)
+  // and warmupBackoffFor's own guard (typeof === 'number' && Number.isFinite && > 0) was previously
+  // untested at the boundary values that actually exercise it. Each of these three is mutation-
+  // silent without its own test: dropping the guard entirely would only show up on exactly these
+  // inputs, not on the "happy path" values (120, undefined) the tests above already use.
+  it('retryAfterSeconds 0 falls back to the configured default window, not "no back-off at all"', async () => {
+    const warmCalls: string[] = [];
+    const warmMembers = async (chatId: string) => {
+      warmCalls.push(chatId);
+      return { throttled: true, retryAfterSeconds: 0 };
+    };
+    const { poller } = pollerOverWarm(warmMembers);
+
+    await poller.pollOnce(); // 14:42Z
+    clock += 30_000; // one ordinary poll cycle later — nowhere near the 15-minute default
+    await poller.pollOnce();
+
+    expect(warmCalls).toEqual([CHAT]); // NOT retried — 0 must not collapse the window to nothing
+  });
+
+  it('retryAfterSeconds NaN falls back to the default window instead of wedging the chat cold forever', async () => {
+    // Without the Number.isFinite guard, `this.now() + NaN` computes to NaN; every later
+    // `backoffUntil <= this.now()` comparison against NaN is false, so the chat would NEVER be
+    // re-warmed again for the rest of the process's lifetime — silently worse than the 0.6.0
+    // "warm once, ever" behaviour this branch replaces.
+    const warmCalls: string[] = [];
+    const warmMembers = async (chatId: string) => {
+      warmCalls.push(chatId);
+      return { throttled: true, retryAfterSeconds: Number.NaN };
+    };
+    const { poller } = pollerOverWarm(warmMembers);
+
+    await poller.pollOnce(); // 14:42Z
+    clock += 20 * 60_000; // 20 minutes later — past the 15-minute default
+    await poller.pollOnce();
+
+    expect(warmCalls).toEqual([CHAT, CHAT]); // retried — NaN falls back to the default, not "never"
+  });
+
+  it('a pathological retryAfterSeconds (1e9) is capped at the 1-hour sanity ceiling, not used literally', async () => {
+    const warmCalls: string[] = [];
+    const warmMembers = async (chatId: string) => {
+      warmCalls.push(chatId);
+      return { throttled: true, retryAfterSeconds: 1e9 }; // ~31 years, uncapped
+    };
+    const { poller } = pollerOverWarm(warmMembers);
+
+    await poller.pollOnce(); // 14:42Z
+    clock += 59 * 60_000; // 59 minutes later — still inside the 1-hour cap
+    await poller.pollOnce();
+    expect(warmCalls).toEqual([CHAT]); // not yet
+
+    clock += 2 * 60_000; // 61 minutes total — past the 1-hour cap
+    await poller.pollOnce();
+    expect(warmCalls).toEqual([CHAT, CHAT]); // capped at 1 hour, not left cold indefinitely
+  });
+
+  // MINOR (review round 1): a warm-up 429 shares the SAME `/members` gate a message-read 429
+  // closes — readMessages's own 429 handling already floors the whole poll's NEXT delay via
+  // noteRetryAfter (see "Retry-After as the backoff floor" describe block above); a warm-up 429
+  // used not to, so the poller could come back for the NEXT cycle sooner than Graph itself asked.
+  it("a throttled warm-up's Retry-After also floors the whole poll cycle's own next delay, same as a throttled message read", async () => {
+    const warmMembers = async () => ({ throttled: true, retryAfterSeconds: 120 });
+    const { poller } = pollerOverWarm(warmMembers);
+
+    await poller.pollOnce();
+
+    const health = JSON.parse(await readFile(join(dir, 'poller-health.json'), 'utf8')) as {
+      backoffMs: number;
+    };
+    // Blind doubling alone would report DEFAULT_POLL_MS (30s); Graph asked for 120s via the
+    // warm-up's own throttled result.
+    expect(health.backoffMs).toBe(120_000);
   });
 });

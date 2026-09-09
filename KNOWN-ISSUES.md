@@ -1,3 +1,76 @@
+## Three follow-ups from live observation 2026-09-08 after 0.6.0/0.6.1 (fixed 0.6.3)
+
+**(a) The daemon's member-roster warm-up for a chat was THROTTLED on two consecutive poll cycles
+4 minutes apart (14:42Z, 14:46Z).**
+
+*What 0.6.0 actually did:* a chat's warm-up was attempted AT MOST ONCE per process lifetime,
+whatever the outcome — `warmedChats.add(entry.id)` ran BEFORE the call, so the moment `warmMembers`
+was first CALLED for a chat, that chat was marked done and never offered again, throttled or not.
+One process could not attempt the same chat twice, by construction.
+
+*What actually happened (corrected from this entry's first draft, which wrongly blamed "the same
+process attempting twice"):* the two throttled attempts came from TWO DIFFERENT processes, not one
+process retrying. The old checkout was moved aside to `teams-assistant-mcp.pre-rewrite-1646` at
+16:42:08 local time (14:42:08Z, matching the FIRST throttled attempt's own timestamp almost to the
+second), and the daemon was restarted from a fresh clone before 14:46Z. The pair was therefore the
+OLD process's last poll cycle and the NEW process's first — each independently paying 0.6.0's "one
+attempt per lifetime" cost, exactly as 0.6.0 was built to do. (Cited from directory mtime and the
+restart timing; the daemon's own log from that window has since rotated and could not be quoted
+verbatim here.)
+
+*What 0.6.3 changes:* a THROTTLED warm-up is no longer permanently skipped for the rest of that
+SAME process's lifetime — `GraphTeamsChats.warmMembers` now returns `{ throttled, retryAfterSeconds
+}` instead of a bare boolean, and the poller (`inbox.ts`) backs a throttled chat off for a window
+before trying it again in a LATER poll cycle of the SAME process — Graph's own `Retry-After` when
+the 429 named one FLOORS (does not replace) the configurable default
+`TEAMS_INBOX_WARMUP_BACKOFF_SECONDS` / `warmupBackoffMs` (`DEFAULT_WARMUP_BACKOFF_MS`, 15 minutes) —
+a short named wait can no longer re-open the chat sooner than the configured window (MAJOR 1,
+review round 1: the first cut of this fix let Retry-After REPLACE the window, reproduced live as 5
+warm-up attempts in 5 consecutive 30s cycles; fixed to floor instead, matching `noteRetryAfter`'s
+own `max` posture). An attempt that succeeds, finds the cache already warm, or fails for a
+non-throttle reason still marks the chat done forever, unchanged from 0.6.0.
+
+**This window is process-local (an in-memory `Map`), not persisted anywhere — it does NOT survive
+a restart.** A fresh process re-attempts every chat's warm-up once on its first poll, exactly as
+0.6.0 did, which is the same shape that produced the original 14:42Z/14:46Z pair. 0.6.3 does not
+change that shape and does not claim to: it only stops a SINGLE long-running process from
+re-hammering the same throttled chat every cycle for the rest of its life. Persisting the window
+across a restart is not part of this fix.
+
+Tests: `src/inbox.test.ts`'s "inbox poller — per-chat warm-up back-off window (0.6.3, live
+2026-09-08 14:42Z/14:46Z)" describe block (a cycle inside the window does not re-call
+`warmMembers`; the cycle after the window does; a Retry-After shorter than the default never
+re-opens the chat sooner than the default; a Retry-After longer than the default raises the window
+past it; a configured `warmupBackoffMs` overrides the default; boundary guards for
+`retryAfterSeconds` of `0`, `NaN` and a pathological `1e9`, the last two mutation-killed by
+dropping `Number.isFinite`/the `RETRY_AFTER_FLOOR_CAP_MS` ceiling respectively) and
+`src/build-inbox-poller.test.ts` (the `warmupBackoffMs` wire from `buildInboxPoller` into the real
+`InboxPoller`, driven with a fake system clock).
+
+**(b) `sendHtmlMessage`'s whole outer request-body shape was unpinned.** Every existing test
+(GH-14b/e) only checked a PIECE of the Graph POST body — that the resolved `<at>` tag landed
+inside `body.content`, that `mentions` had the right length — never the outer envelope itself
+(`contentType`, exactly which fields exist, and that `mentions` sits as a SIBLING of `body`, not
+nested inside it). A regression moving `mentions` under `body`, renaming `contentType`, or adding
+an unrelated field would have passed every test that existed before this fix. **Fixed:** two new
+tests in `src/graph/teams-chats.test.ts` ("GraphTeamsChats.sendHtmlMessage — the whole outer
+request body is pinned") assert the COMPLETE body with `toEqual`, with and without mentions;
+verified to actually catch a regression by temporarily nesting `mentions` inside `body` in
+`sendHtmlMessage` — both the new test and the pre-existing GH-14b failed, reverted after
+confirming.
+
+**(c) `inbox.ts` held the throttled/failures invariant by convention only.** Every call site that
+set the local `throttled` flag had to separately remember to also push a matching entry into
+`failures`, because `pollAllowlistedChats`'s own early return
+(`if (failures.length === 0) return { clean: true, ... }`) never consults `throttled` itself — a
+throttled cycle with no matching `failures` entry would slip past that check and be misreported as
+clean. **Fixed:** a new exported `markThrottled(failures, message)` helper in `inbox.ts` pushes the
+message and returns `true` in one call, used at both existing call sites (the warm-up 429 and the
+`readMessages` 429). Tested directly (`markThrottled — the throttled/failures pairing cannot drift
+apart`) and indirectly: mutating `markThrottled` to drop the push made 8 existing/new tests fail
+for the stated reason (including "the first 429 ends the cycle…" and "a warmMembers reporting
+throttled:true stops the cycle…"), reverted after confirming.
+
 ## Inbox records silently cut a message's text at 2,000 characters (live hit 2026-09-09, fixed 0.6.2)
 
 **Live hit 2026-09-09 on one deployment:** the inbox record of a 2,847-character message was
