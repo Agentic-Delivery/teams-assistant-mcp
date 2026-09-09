@@ -2207,3 +2207,65 @@ describe('GraphTeamsChats.sendHtmlMessage / editHtmlMessage — the orphaned-men
     expect(fetchFn).toHaveBeenCalledTimes(2);
   });
 });
+
+// Issue (b), 2026-09-08 review follow-up: sendHtmlMessage's own request-body shape (the exact
+// Graph POST envelope — contentType, body.content, and where the `mentions` array sits) was
+// unpinned end to end. GH-14b/GH-14e above only check a PIECE of the body (that `<at>` landed
+// inside body.content, that `mentions` has the right length) — a regression that nested
+// `mentions` inside `body` instead of alongside it, renamed `contentType`, or leaked an unrelated
+// field (an `attachments` key this method never sends, say) would pass every test above. These
+// pin the WHOLE outer envelope with `toEqual`, once with no mentions and once with one, so any
+// change to the outer shape is caught, not just a change to `body.content`'s own text.
+describe('GraphTeamsChats.sendHtmlMessage — the whole outer request body is pinned (2026-09-08 review follow-up b)', () => {
+  function subject(fetchFn: typeof fetch) {
+    const graph = new GraphClient({ tokenProvider: stubToken, fetchFn });
+    return new GraphTeamsChats(graph, { membersCache: new MembersCache({ path: '/dev/null/unused' }) });
+  }
+
+  it('posts exactly {body:{contentType:"html",content}} — no mentions key at all when no mentions are given', async () => {
+    let capturedBody: unknown;
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      expect(String(url)).toContain(`/chats/${encodeURIComponent(CHAT)}/messages`);
+      expect(init?.method).toBe('POST');
+      capturedBody = JSON.parse(String(init?.body));
+      return json({
+        id: 'sent-html-1',
+        chatId: CHAT,
+        createdDateTime: '2026-09-08T10:00:00Z',
+        body: { contentType: 'html', content: '<p>Hi</p>' },
+      });
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch);
+
+    await chats.sendHtmlMessage(CHAT, '<p>Hi</p>');
+
+    expect(capturedBody).toEqual({ body: { contentType: 'html', content: '<p>Hi</p>' } });
+  });
+
+  it('posts exactly {body:{contentType:"html",content},mentions:[...]} — mentions is a SIBLING of body, not nested inside it', async () => {
+    let capturedBody: unknown;
+    const maja = { name: 'Nordqvist, Maja', id: 'aad-maja', displayName: 'Nordqvist, Maja' };
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      capturedBody = JSON.parse(String(init?.body));
+      return json({
+        id: 'sent-html-2',
+        chatId: CHAT,
+        createdDateTime: '2026-09-08T10:00:00Z',
+        body: { contentType: 'html', content: '<p>Please review <at id="0">Nordqvist, Maja</at></p>' },
+      });
+    });
+    const chats = subject(fetchFn as unknown as typeof fetch);
+
+    await chats.sendHtmlMessage(CHAT, '<p>Please review @{Nordqvist, Maja}</p>', [maja]);
+
+    expect(capturedBody).toEqual({
+      body: {
+        contentType: 'html',
+        content: '<p>Please review <at id="0">Nordqvist, Maja</at></p>',
+      },
+      mentions: [
+        { id: 0, mentionText: 'Nordqvist, Maja', mentioned: { user: { id: 'aad-maja', displayName: 'Nordqvist, Maja' } } },
+      ],
+    });
+  });
+});

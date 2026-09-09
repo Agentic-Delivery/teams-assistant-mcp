@@ -24,6 +24,9 @@ export interface BuildInboxPollerOptions {
   inboxPath: string;
   inboxYieldPath?: string;
   pollMs?: number;
+  /** Per-chat warm-up back-off window override — see InboxPollerDeps.warmupBackoffMs (inbox.ts)
+   *  and TEAMS_INBOX_WARMUP_BACKOFF_SECONDS (index.ts) for where this comes from. */
+  warmupBackoffMs?: number;
   log?: (line: string) => void;
 }
 
@@ -51,6 +54,7 @@ export function buildInboxPoller(options: BuildInboxPollerOptions): InboxPoller 
     // re-check; see teams-chats.ts's membersForInvite for the COMPLETE-only read that enforces it.
     roster: options.membersCache,
     ...(options.pollMs !== undefined ? { pollMs: options.pollMs } : {}),
+    ...(options.warmupBackoffMs !== undefined ? { warmupBackoffMs: options.warmupBackoffMs } : {}),
     log: options.log ?? (() => {}),
     // 0.4.1 stuck-auth self-healing: a token that goes bad without the local cache's own expiry
     // catching up needs an external nudge to drop it — see InboxPoller.trackAuthHealth's doc
