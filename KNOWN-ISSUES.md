@@ -1,3 +1,28 @@
+## The poll path depended on two throttled endpoints it never needed (fixed 2026-09-09)
+
+Live 2026-09-09, two shapes of the same problem, both in the SRP daemon's own log the same day:
+
+```
+warmMembers: /members warm-up for <chat> failed (THROTTLED ...)
+inbox poll failed: <chat>: THROTTLED (member roster warm-up)
+```
+
+```
+Graph 429 on /me: x-ms-throttle-scope=(none) retry-after=100s
+inbox poll failed: Too many requests
+```
+
+Neither `/me` nor `/chats/{id}/members` is needed to read `/chats/{id}/messages`, but a throttled
+call to either used to fail or stall the whole poll cycle before a single chat's messages were
+read — a throttled warm-up ended the cycle for every chat after (and including) the one that hit
+it, and a throttled `/me` failed the cycle before the per-chat loop even started. Message reads
+are now fully decoupled from both: the roster warm-up the 0.6.0/0.6.3 entries below describe is
+gone from the poll path entirely (mention resolution and `send_chat_file`'s grant still refresh
+`/members` on demand, unchanged), and self id resolves through the same operator-seed →
+persisted-cache → live `/me` chain `sendFile` already used, at most once per process, degrading
+self-message filtering rather than the poll on failure. See `docs/throttling-mitigation.md`'s
+dated section and `src/inbox.ts`'s class doc comment for the fuller account.
+
 ## Three follow-ups from live observation 2026-09-08 after 0.6.0/0.6.1 (fixed 0.6.3)
 
 **(a) The daemon's member-roster warm-up for a chat was THROTTLED on two consecutive poll cycles

@@ -147,42 +147,16 @@ or an upgrade — a harvested roster on disk from an earlier build simply never 
 the very next `send_chat_file` into that chat pays one real (now retried) `/members` call and
 moves on.**
 
-**Since 0.6.0 the background inbox poller also warms a cold roster proactively.** The FIRST poll
-of any newly-allowlisted chat, if its roster cache has no entry at all (complete or partial), now
-tries ONE real `/members` fetch (`GraphTeamsChats.warmMembers`, best-effort — a throttled warm-up
-just leaves the roster cold for the next real caller to retry, never fails the poll on its own) so
-a chat's very first `send_chat_file` does not have to pay that call live. Deliberately NOT the
-same retry budget mention resolution and `send_chat_file`'s grant use above: warm-up makes a
-single attempt (`readRetries: 0`, no Retry-After sleep at all) because it runs inside the poller's
-own awaited per-chat loop — a real, honoured Retry-After there would have stalled the WHOLE poll
-cycle, not just this one chat, and let the SAME shared `/members` throttle window reopen partway
-through another cold chat's own attempt in the same cycle (retrying-then-sleeping is exactly the
-amplification `docs/throttling-mitigation.md`'s 2026-08-25 incident warns about). A warm-up that
-IS itself throttled still ends the cycle — the same "one 429 ends the cycle" rule the poller
-already applies to a throttled message read — rather than letting every other cold chat in the
-same cycle also attempt (and also get throttled by) the same closed gate. This is what actually
-shortens the gap the bounded retry above cannot fully close: a chat created and used within the
-SAME poll interval the roster warms in.
-
-**Per-chat warm-up back-off window (0.6.3).** In 0.6.0 a chat's warm-up was attempted AT MOST ONCE
-per process lifetime, whatever the outcome: the moment `warmMembers` was first called for a chat,
-that chat was marked done and never offered again, throttled or not — so a THROTTLED warm-up was
-never retried by that same process, ever. Two throttled warm-ups for the same chat 4 minutes apart
-were observed live on 2026-09-08 (14:42Z, 14:46Z); re-review traced this to a daemon RESTART
-between the two, not to one process retrying — the old checkout was moved aside (directory mtime
-14:42:08 local / 14:42:08Z) and the daemon relaunched from a fresh clone before 14:46Z, so the pair
-was the OLD process's last cycle and the NEW process's first, each independently paying the "one
-attempt per lifetime" cost. **0.6.3 changes what happens after a throttle, not what happens across
-a restart**: a THROTTLED warm-up now backs that one chat off for a window before the SAME process
-tries it again — Graph's own `Retry-After` when the 429 named one, floored at (not replaced by) the
-configurable default `TEAMS_INBOX_WARMUP_BACKOFF_SECONDS` (15 minutes/900s — see "Configuration"
-below), so a short named wait can never re-open the chat sooner than the configured window. A chat
-whose warm-up succeeds (or whose cache was already warm, or a non-throttle failure) is still marked
-done forever, unchanged from 0.6.0. **The window lives in process memory only and is NOT persisted
-across a restart** — a fresh process re-attempts every chat's warm-up once, same as 0.6.0, which is
-exactly the shape that produced the original 14:42Z/14:46Z pair; 0.6.3 does not change that shape,
-it only stops a SINGLE long-running process from re-hammering the same throttled chat every cycle.
-Every other allowlisted chat is unaffected; the window is per chat, not process-wide.
+**Between 0.6.0 and 0.6.3 the background inbox poller also warmed a cold roster proactively** —
+one `/members` fetch per newly-allowlisted chat, on its first poll. **That is gone as of 2026-09-09**
+(see `docs/throttling-mitigation.md`'s dated section): a throttled warm-up used to end the whole
+poll cycle — the same "one 429 ends the cycle" rule a throttled message read follows — which meant
+a single cold chat could stall every chat after it, including its own message read. The poll path
+no longer calls `GraphTeamsChats.warmMembers` at all; a chat's roster still fills for free from
+message traffic (the harvest described above), and `send_chat_file`'s permission grant still forces
+a real `/members` fetch on demand when no COMPLETE roster is cached — nothing about that guarantee
+changed. `TEAMS_INBOX_WARMUP_BACKOFF_SECONDS` and the per-chat back-off window it configured are
+gone with the mechanism they governed.
 
 ## Retry-After
 
@@ -568,7 +542,6 @@ credential, an account name, or a tenant id, and nothing ever should.
 | `TEAMS_MCP_DISPLAY_NAME` | no | Overrides the expected display name for the probe |
 | `TEAMS_INBOX_PATH` | no | Where the background inbox JSONL lands. Defaults to `~/.teams-assistant/inbox.jsonl`. **Set this to a distinct path for every additional server instance on the same host** — the poller's single-instance lock (`poller.lock`) and health file (`poller-health.json`) are keyed to this path, not to `TEAMS_MCP_CONFIG`, so two instances that both leave it unset silently share one lock and only one of them polls (see "Supervising the daemon") |
 | `TEAMS_INBOX_POLL_SECONDS` | no | Inbox poll interval, default 30. Raising it frees per-mailbox Graph read budget for ad-hoc reads — see "Downloading attachments" |
-| `TEAMS_INBOX_WARMUP_BACKOFF_SECONDS` | no | How long a chat's daemon-side member-roster warm-up backs off after being throttled before the poller tries it again for that chat. Defaults to 900 (15 minutes); Graph's own `Retry-After` on the throttled attempt raises this when longer (a floor, not a replacement). Process-local — does not survive a restart — see "The background inbox" above |
 | `TEAMS_INBOX_DISABLED` | no | Set to `1` to not run the background inbox poller at all |
 
 ### Throttle budgets are per client id

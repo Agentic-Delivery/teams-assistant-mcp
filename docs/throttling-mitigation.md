@@ -403,3 +403,30 @@ attribution).
 6. **Is an Azure spend in the Agentic Delivery subscription approved** for an Event Hubs namespace
    plus a small always-on receiver? Modest, but it is a standing cost against the cost-conscious
    infrastructure rule.
+
+## 6. 2026-09-09 addendum: the poll path itself never needed the crowded bucket
+
+Everything above is about reducing how hard we lean on `/chats/{id}/members` and `/me`. It never
+asked a more basic question: does reading `/chats/{id}/messages` need either of them at all? It
+doesn't, and until today the poller acted as though it did.
+
+Two couplings, both visible in the same day's daemon log. A throttled roster warm-up (`warmMembers:
+/members warm-up for <chat> failed (THROTTLED ...)`) ended the whole poll cycle — the "one 429 ends
+the cycle" rule a throttled message read follows applied equally to a throttled warm-up, so a
+single cold chat could stall every chat after it in allowlist order, including its own read. A
+throttled `/me` (`Graph 429 on /me`) failed the cycle before the per-chat loop even started,
+because self-id resolution ran unguarded ahead of it. Neither endpoint has anything to do with
+whether `/chats/{id}/messages` itself is reachable, so a throttle on either was stalling reads it
+had no real bearing on.
+
+The fix: the poll path no longer calls either endpoint. Roster warm-up is deleted from `inbox.ts`
+entirely — a chat's roster still fills for free from message-sender traffic (mitigation 2 above),
+and mention resolution / `send_chat_file`'s permission grant still refresh `/members` live on
+demand, exactly as section 4 already describes; nothing about the COMPLETE-roster guarantee behind
+a file grant changed. Self id resolves through the same operator-seed → persisted-cache → live
+`/me` chain `sendFile` already used (mitigation from 0.5.1), reused now by the poller too, at most
+once per process — a failure degrades self-message filtering for the rest of that process's
+lifetime rather than the poll cycle. A daemon can now read every allowed chat's messages through a
+`/me` and `/members` outage of any length; only self-filtering and warm rosters wait for the
+throttle to clear. See `src/inbox.ts`'s class doc comment and `KNOWN-ISSUES.md`'s matching entry
+for the exact log lines this closes.
