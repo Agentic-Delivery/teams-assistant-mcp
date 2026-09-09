@@ -1,3 +1,44 @@
+## Three follow-ups from live observation 2026-09-08 after 0.6.0/0.6.1 (fixed 0.6.3)
+
+**(a) The daemon's member-roster warm-up for a chat was THROTTLED on two consecutive poll cycles
+4 minutes apart (14:42Z, 14:46Z).** The 0.6.0 "warm once, ever" gate (a chat marked as attempted
+the moment `warmMembers` was first CALLED, whatever the outcome) only ever prevented a SECOND
+attempt within one process's lifetime — it did nothing to stop two attempts that close together,
+which is exactly what this incident showed. **Fixed:** `GraphTeamsChats.warmMembers` now returns
+`{ throttled, retryAfterSeconds }` instead of a bare boolean, and the poller (`inbox.ts`) backs a
+throttled chat off for a window before trying it again — Graph's own `Retry-After` when the 429
+named one, else the configurable default `TEAMS_INBOX_WARMUP_BACKOFF_SECONDS` /
+`warmupBackoffMs` (`DEFAULT_WARMUP_BACKOFF_MS`, 15 minutes). A successful warm-up (or a cache
+already warm) still marks the chat COMPLETE forever, unchanged from 0.6.0. Tests: `src/inbox.test.ts`'s
+"inbox poller — per-chat warm-up back-off window (0.6.3, live 2026-09-08 14:42Z/14:46Z)" describe
+block (a cycle inside the window does not re-call `warmMembers`; the cycle after the window does;
+Graph's own Retry-After overrides the default when shorter; a configured `warmupBackoffMs`
+overrides the default).
+
+**(b) `sendHtmlMessage`'s whole outer request-body shape was unpinned.** Every existing test
+(GH-14b/e) only checked a PIECE of the Graph POST body — that the resolved `<at>` tag landed
+inside `body.content`, that `mentions` had the right length — never the outer envelope itself
+(`contentType`, exactly which fields exist, and that `mentions` sits as a SIBLING of `body`, not
+nested inside it). A regression moving `mentions` under `body`, renaming `contentType`, or adding
+an unrelated field would have passed every test that existed before this fix. **Fixed:** two new
+tests in `src/graph/teams-chats.test.ts` ("GraphTeamsChats.sendHtmlMessage — the whole outer
+request body is pinned") assert the COMPLETE body with `toEqual`, with and without mentions;
+verified to actually catch a regression by temporarily nesting `mentions` inside `body` in
+`sendHtmlMessage` — both the new test and the pre-existing GH-14b failed, reverted after
+confirming.
+
+**(c) `inbox.ts` held the throttled/failures invariant by convention only.** Every call site that
+set the local `throttled` flag had to separately remember to also push a matching entry into
+`failures`, because `pollAllowlistedChats`'s own early return
+(`if (failures.length === 0) return { clean: true, ... }`) never consults `throttled` itself — a
+throttled cycle with no matching `failures` entry would slip past that check and be misreported as
+clean. **Fixed:** a new exported `markThrottled(failures, message)` helper in `inbox.ts` pushes the
+message and returns `true` in one call, used at both existing call sites (the warm-up 429 and the
+`readMessages` 429). Tested directly (`markThrottled — the throttled/failures pairing cannot drift
+apart`) and indirectly: mutating `markThrottled` to drop the push made 8 existing/new tests fail
+for the stated reason (including "the first 429 ends the cycle…" and "a warmMembers reporting
+throttled:true stops the cycle…"), reverted after confirming.
+
 ## Inbox records silently cut a message's text at 2,000 characters (live hit 2026-09-09, fixed 0.6.2)
 
 **Live hit 2026-09-09 on one deployment:** the inbox record of a 2,847-character message was
