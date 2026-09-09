@@ -1,3 +1,60 @@
+## Inbox records silently cut a message's text at 2,000 characters (live hit 2026-09-09, fixed 0.6.2)
+
+**Live hit 2026-09-09 on one deployment:** the inbox record of a 2,847-character message was
+exactly 2,000 characters while the read tool returned the full text; message content withheld
+(customer material). `inbox.jsonl`'s `text` was cut at exactly 2,000 characters with no marker, no
+field saying it had happened; a downstream reader treated the record as the whole message and lost
+the tail. `teams-read` (which reads Graph directly, not the inbox file) returned the full text, so
+the two surfaces disagreed on what the message said. Reproduced in tests with synthetic 5,000- and
+70,000-character messages (below).
+
+**Root cause:** `src/inbox.ts`'s poll loop wrote `text: message.text.slice(0, 2000)` into every
+inbox record. This was not a regression — it was present, unchanged, in the very first commit of
+this repo (`Initial public release`, 2026-08-21, `c1849b8a5`), with no comment or doc explaining
+why 2,000 was chosen, and no marker distinguishing a cut record from a complete one. README.md and
+`inbox.test.ts` both documented/pinned the cap as intentional, which is presumably why it survived
+five subsequent minor versions unquestioned: the pin ("truncates very long messages to 2000
+characters") tested that the cut happened, not that it was safe to lose the tail silently.
+
+No evidence was found tying the cap to the inbox file being tail-read by a `Monitor`/`tail -F`
+consumer (README's "The recommended consumption pattern" section) — the file is JSONL, one
+complete record per line, not a running status line a consumer expects to stay short; nothing else
+in this codebase derives a short preview from `text` for that purpose (the one existing preview
+field, `messagePreview` in `teams-chats.ts`'s reply quote-card builder, is unrelated — it previews
+the message being REPLIED TO, not an inbox record). No separate `preview` field was added; there
+was no discovered behaviour it would have replaced.
+
+**Fixed (0.6.2):** `inbox.ts`'s `text` now carries the full source message verbatim. A pathological
+size guard remains — `MAX_INBOX_TEXT_BYTES`, 65,536 UTF-8 bytes, not 2,000 characters — and only
+messages AT OR OVER that many bytes are cut, always with an explicit
+`…[truncated, N chars / M bytes total]` suffix on `text` plus a `truncated: true` field on the
+record, never a silent cut. Tests:
+`carries the full text of a long message, not a silent 2000-char cut (live hit 2026-09-09, one deployment)`
+(5,000 synthetic chars, well under the guard, asserts the record equals the source verbatim and
+carries no `truncated` field) and
+`marks a pathologically large message (>=64 KiB) as truncated instead of silently cutting it`
+(70,000 synthetic chars, asserts the marker and `truncated: true`) in `src/inbox.test.ts`.
+
+**Fresh-context review (2026-09-09) of the above found two more gaps, both fixed in the same
+commit:**
+
+- **Boundary mismatch (MINOR 1):** the guard's own doc comment said "at or over" the cap but the
+  code only truncated on strictly-greater (`<=` kept the whole message), so a message of exactly
+  the limit was written verbatim with no `truncated` flag — silently reintroducing the exact class
+  of bug this fix exists to close, just moved to one boundary value. Now `>=` triggers truncation,
+  proven by two new tests at the limit and at limit-minus-one:
+  `does not truncate a message exactly one byte under the 65,536-byte guard` and
+  `truncates a message exactly at the 65,536-byte guard (at-or-over, not strictly-over)`.
+- **Bytes vs. characters (MINOR 2):** "64 KiB" was measured in JS string length (UTF-16 code
+  units), not bytes — the actual disk/memory bound the guard exists for. A CJK- or emoji-heavy
+  message can carry far fewer than 65,536 UTF-16 code units while still exceeding 65,536 UTF-8
+  bytes, so the old guard would have written such a message verbatim past the intended bound. Now
+  measured via `Buffer.byteLength(text, 'utf8')`, and truncation walks code points (not UTF-16
+  code units) so a surrogate pair is never split into a corrupted character. Proven by
+  `truncates a multi-byte message by UTF-8 BYTE length, not JS string length (CJK/emoji)` (22,000
+  repeats of a 3-byte CJK character — 22,000 UTF-16 units, well under the old char-based cap, but
+  66,000 UTF-8 bytes, over the byte-based one).
+
 ## PR #24 review round 1 (fresh context, 2026-09-08): the daemon's own warm-up could stall a whole poll cycle on a real Retry-After, and three gaps in the 0.6.0 send-file/mentions work were untested
 
 Fresh-context review of the branch that became 0.6.0 (entry below) found five items before that

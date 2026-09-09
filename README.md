@@ -211,10 +211,17 @@ session-independent file:
 ~/.teams-assistant/inbox-state.json   watermark sidecar, lives next to the inbox
 ```
 
-One line per message: `{"chat","id","from","at","text","attachments"}` — `text` capped at 2000
-characters, `attachments` a count. Messages posted by the signed-in account itself are skipped
-(resolved via `/me`, so the assistant's own posts never echo back as inbox events), as are
-deleted stubs and empty system events.
+One line per message: `{"chat","id","from","at","text","attachments"}` — `text` is the FULL
+message body verbatim, `attachments` a count. `text` is only ever cut on a pathological-size
+message (65,536 UTF-8 bytes or larger — measured in bytes, not JS string length, so a CJK/emoji-
+heavy message can hit the guard well under 65,536 characters), and never silently: that record
+also carries `truncated: true` and an explicit `…[truncated, N chars / M bytes total]` suffix on
+`text` — see KNOWN-ISSUES.md for the 0.6.2 fix and the incident that prompted it. Live hit
+2026-09-09 on one deployment: the inbox record of a 2,847-character message was exactly 2,000
+characters while the read tool returned the full text; message content withheld (customer
+material). Reproduced in tests with synthetic 5,000- and 70,000-character messages. Messages
+posted by the signed-in account itself are skipped (resolved via `/me`, so the assistant's own
+posts never echo back as inbox events), as are deleted stubs and empty system events.
 
 The sidecar remembers the delivered watermark and newest message id per chat (written atomically —
 temp file then rename, so a crash mid-write cannot itself corrupt it), so a server restart never
