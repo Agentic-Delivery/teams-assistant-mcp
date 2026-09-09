@@ -146,8 +146,11 @@ export interface InboxPollerDeps {
  * other (issue c, 2026-09-08 review: the pairing used to be convention only — a throttled cycle
  * with no matching `failures` entry would slip past `pollAllowlistedChats`'s own
  * `failures.length === 0` early return and be misreported as clean; see that method's own comment
- * on the return statement). Both call sites today (the warm-up 429 and the readMessages 429) go
- * through this; a third can never forget the push half. Exported for its own direct test.
+ * on the return statement). Originally shared by two call sites (a warm-up 429 and a readMessages
+ * 429); the warm-up call site is gone with the poll-path roster warm-up itself (2026-09-09), so
+ * only the readMessages 429 goes through this today — kept as a named helper anyway, since a
+ * future second call site can never forget the push half by construction. Exported for its own
+ * direct test.
  */
 export function markThrottled(failures: string[], message: string): true {
   failures.push(message);
@@ -463,8 +466,22 @@ export class InboxPoller {
     if (this.me === undefined && !this.selfResolutionAttempted) {
       this.selfResolutionAttempted = true;
       const resolved = await this.deps.self().catch(() => undefined);
+      // "Resolved" means an id, nothing else (fix round 1, Opus review MAJOR 1, live-reproduced
+      // against the real composition): `build-inbox-poller.ts`'s `self` always returns a
+      // `displayName` when `assistantDisplayName` is configured — which it always is, since
+      // `config.ts` defaults it and `index.ts` always passes it through — regardless of whether
+      // the id itself resolved. The OLD condition here (`resolved.id !== undefined ||
+      // resolved.displayName !== undefined`) therefore logged "self id resolved" and skipped the
+      // degraded line on EVERY real-wiring run, even a persistently-throttled `/me` with no seed
+      // and no cache: `resolved.displayName` was always truthy, so the id-missing branch was
+      // unreachable in production. `this.me` still gets set whenever EITHER field is present — a
+      // display-name-only fallback still lets isSelf filter the assistant's own posts by name —
+      // but which LOG line fires is gated on the id alone, since "resolved" is a claim about the
+      // id specifically.
       if (resolved && (resolved.id !== undefined || resolved.displayName !== undefined)) {
         this.me = resolved;
+      }
+      if (resolved?.id !== undefined) {
         this.log('inbox poller: self id resolved; self-message filtering is active.');
       } else {
         this.log(

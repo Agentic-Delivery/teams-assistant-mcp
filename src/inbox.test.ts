@@ -1448,6 +1448,35 @@ describe('inbox poller — self-id resolution never blocks a message read (2026-
     expect(clean).toBe(true);
     expect((await inboxLines()).map((line) => line['id'])).toEqual(['a']);
   });
+
+  // Fix round 1, Opus review MAJOR 1: build-inbox-poller.ts's `self` always returns a
+  // `displayName` when `assistantDisplayName` is configured (which it always is in production —
+  // config.ts defaults it, index.ts always passes it), REGARDLESS of whether the id itself
+  // resolved. Before this fix, the OLD condition (`resolved.id !== undefined ||
+  // resolved.displayName !== undefined`) logged "self id resolved" on THIS exact shape — id
+  // undefined, displayName present — which is precisely what a persistently-throttled `/me` with
+  // no seed/cache produces through the real composition (see build-inbox-poller.test.ts's own
+  // composition test for the end-to-end reproduction). "Resolved" now means an id, nothing else:
+  // the degraded line fires, not the success one, even though `this.me` still gets set (a
+  // display-name-only fallback is still worth having for isSelf's no-fromId branch).
+  it('a self() that resolves with a displayName but no id logs the DEGRADED line, never "resolved" — "resolved" means an id, nothing else', async () => {
+    const store = chatStore({});
+    const lines: string[] = [];
+    const poller = new InboxPoller({
+      chats: store,
+      allowlist: new ChatAllowlist([{ id: CHAT, label: CHAT, canPost: true }]),
+      self: () => Promise.resolve({ displayName: 'Assistant (AI)' }),
+      inboxPath,
+      statePath,
+      log: (line) => lines.push(line),
+    });
+
+    await poller.pollOnce();
+    await poller.pollOnce();
+
+    expect(lines.some((line) => line.includes('self id resolved'))).toBe(false);
+    expect(lines.filter((line) => line.includes('self id could not be resolved'))).toHaveLength(1);
+  });
 });
 
 // Issue (c), 2026-09-08 review follow-up: the throttled/failures pairing used to be held by

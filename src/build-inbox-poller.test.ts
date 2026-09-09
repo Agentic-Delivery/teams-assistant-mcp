@@ -63,6 +63,7 @@ describe('buildInboxPoller — the real composition, driven end to end (MAJOR 3,
 
     const config = await configFor(dir);
 
+    let membersCalls = 0;
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (url: string) => {
       const u = String(url);
@@ -72,8 +73,11 @@ describe('buildInboxPoller — the real composition, driven end to end (MAJOR 3,
       // Throttled rather than left unhandled: this test's point is that this route is never
       // reached by a poll cycle at all — an unhandled route throwing "unexpected call" would
       // prove the same thing less clearly than a throttle response the poll would visibly choke
-      // on if it were still reached.
+      // on if it were still reached. The `membersCalls` counter below is the actual proof (fix
+      // round 1, Opus review MINOR 4: this test's old body asserted nothing about /members at
+      // all — re-adding a call to it anywhere in the poll path left this test green).
       if (u.includes(`/chats/${encodeURIComponent(CHAT)}/members`)) {
+        membersCalls += 1;
         return throttled();
       }
       if (u.includes(`/chats/${encodeURIComponent(CHAT)}/messages`)) {
@@ -105,11 +109,12 @@ describe('buildInboxPoller — the real composition, driven end to end (MAJOR 3,
 
       // Cycle 1 is the bootstrap/settling poll (0.4.1: delivers nothing, but harvest runs before
       // that filter). Cycle 2 proves the SAME holds on an ordinary cycle too — neither ever
-      // touches /me or /members, which would 429 immediately above if they did.
+      // touches /members, which would 429 immediately above if they did.
       const clean1 = await poller.pollOnce();
       const clean2 = await poller.pollOnce();
       expect(clean1).toBe(true);
       expect(clean2).toBe(true);
+      expect(membersCalls).toBe(0); // the actual "never calls /members" proof this test is named for
 
       const freshCache = new MembersCache({ path: config.membersCachePath });
       expect(freshCache.get(CHAT)).toEqual(
@@ -270,11 +275,75 @@ describe('buildInboxPoller — the real composition, driven end to end (MAJOR 3,
       ) as Record<string, unknown>;
       expect(health['ok']).toBe(true);
 
-      // /me is retried at most once per process (see InboxPoller's self-resolution doc comment) —
-      // NOT once per poll cycle, which would keep feeding the same throttled budget.
+      // meCalls staying at 1 across two cycles does NOT by itself prove InboxPoller's own
+      // selfResolutionAttempted guard (fix round 1, Opus review MINOR 4: GraphClient's own
+      // LocallyThrottled gate — a real 429 closes the /me family's gate for a real wall-clock
+      // window — would suppress the second live call regardless of whether that guard exists).
+      // What it DOES prove here is that a live /me is attempted at all and degrades cleanly; the
+      // guard's own once-per-process contract is mutation-killed by inbox.test.ts's unit-level
+      // tests instead (a hand-built `self` double with no GraphClient underneath to hide behind —
+      // "self() that ALWAYS throws … never fails the poll" and "self() that stays THROTTLED
+      // across six cycles", both asserting the double's own call count).
       expect(meCalls).toBe(1);
       // /members is never called at all — roster warm-up no longer runs on the poll path.
       expect(membersCalls).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  // Fix round 1, Opus review MAJOR 1, reproduced by the reviewer against the real composition:
+  // config.ts defaults `assistantDisplayName` (DEFAULT_ASSISTANT_DISPLAY_NAME) and index.ts ALWAYS
+  // passes it to buildInboxPoller, regardless of whether self-id resolution ever succeeds — so
+  // `deps.self()`'s returned account always carries a `displayName`, even when `/me` is
+  // permanently throttled with no seed and no persisted cache. The buggy condition in inbox.ts
+  // used to treat "displayName present" as "resolved" and log the SUCCESS line even with no id at
+  // all. This test wires buildInboxPoller EXACTLY as index.ts does — `assistantDisplayName:
+  // config.assistantDisplayName`, unconditionally — and proves the log output: the degraded line
+  // fires, the "resolved" line never does, even though messages still get delivered (the fix this
+  // whole branch is about is unaffected — only the log wording was wrong).
+  it('assistantDisplayName wired exactly as index.ts wires it: a persistently-throttled /me with no seed/cache logs the DEGRADED line, never "resolved"', async () => {
+    const { buildChats } = await import('./build-chats.js');
+    const { buildInboxPoller } = await import('./build-inbox-poller.js');
+
+    const config = await configFor(dir);
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string) => {
+      const u = String(url);
+      if (u.includes('/me?')) {
+        return throttled();
+      }
+      if (u.includes(`/chats/${encodeURIComponent(CHAT)}/members`)) {
+        return throttled();
+      }
+      if (u.includes(`/chats/${encodeURIComponent(CHAT)}/messages`)) {
+        return json({ value: [] });
+      }
+      throw new Error(`unexpected call in this test: ${u}`);
+    }) as typeof fetch;
+    try {
+      const { chats, tokenProvider, membersCache } = buildChats(config);
+      vi.spyOn(tokenProvider, 'getAccessToken').mockResolvedValue('fake-token');
+
+      const lines: string[] = [];
+      const poller = buildInboxPoller({
+        chats,
+        tokenProvider,
+        membersCache,
+        allowlist: config.allowlist,
+        inboxPath: join(dir, 'inbox.jsonl'),
+        // Exactly what index.ts passes — never conditional, always config.assistantDisplayName,
+        // which config.ts defaults (DEFAULT_ASSISTANT_DISPLAY_NAME) when unset.
+        assistantDisplayName: config.assistantDisplayName,
+        log: (line) => lines.push(line),
+      });
+
+      await poller.pollOnce();
+      await poller.pollOnce();
+
+      expect(lines.some((line) => line.includes('self id resolved'))).toBe(false);
+      expect(lines.filter((line) => line.includes('self id could not be resolved'))).toHaveLength(1);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -548,7 +617,11 @@ describe('buildInboxPoller — self id resolution reuses the seed/cache/live cha
       }
 
       expect(messagesCalls).toBe(6); // every cycle reads messages regardless of self-id status
-      expect(meCalls).toBe(1); // resolved at most once per process, not retried every cycle
+      // Same caveat as the top describe block's own "/me and /members throttled" test (fix round
+      // 1, Opus review MINOR 4): GraphClient's own LocallyThrottled gate, not
+      // selfResolutionAttempted, is what actually keeps this at 1 across six cycles here — see
+      // inbox.test.ts's hand-built-double tests for the guard's own mutation-killing proof.
+      expect(meCalls).toBe(1);
       expect(invalidateSpy).not.toHaveBeenCalled(); // the forced re-auth path never trips
 
       const delivered = (await readFile(join(dir, 'inbox.jsonl'), 'utf8'))

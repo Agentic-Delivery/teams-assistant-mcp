@@ -153,19 +153,6 @@ export interface TeamsChatsPort {
   unpinMessage(chatId: string, messageId: string): Promise<void>;
   listPinnedMessages(chatId: string): Promise<PinnedMessage[]>;
   /**
-   * Daemon-side roster warm-up (0.6.0, live 2026-09-08) — see GraphTeamsChats.warmMembers's own
-   * doc comment. Optional: a caller with no reason to warm anything (every CLI, most of the MCP
-   * tool surface) simply never calls it; the inbox poller (inbox.ts) is the one real caller.
-   * `throttled: true` means this single, non-retried attempt was itself throttled — the poller
-   * uses that to stop asking for more this poll cycle (same "one 429 ends the cycle" rule as a
-   * throttled message read). `retryAfterSeconds` (0.6.3) carries Graph's own named wait when the
-   * 429 supplied one, so a caller that backs a chat off after a throttled warm-up (inbox.ts's
-   * per-chat warm-up back-off window, live-diagnosed 2026-09-08: the SAME chat's warm-up was
-   * throttled on two consecutive poll cycles 4 minutes apart) can honour Graph's own number
-   * instead of always guessing a default.
-   */
-  warmMembers?(chatId: string): Promise<WarmMembersResult>;
-  /**
    * The signed-in account's own AAD id, through the SAME override -> memo -> persisted-cache ->
    * live `/me` order GraphTeamsChats.resolveSelfId already used privately for sendFile — exposed
    * on the port (2026-09-09, poll-path throttle fix) so a caller other than sendFile can resolve
@@ -174,7 +161,8 @@ export interface TeamsChatsPort {
    * as `resolveSelfId`'s own doc comment already documents — a caller decides for itself what
    * "undetermined" means. This is what lets the inbox poller (`build-inbox-poller.ts`) stop
    * depending on a throttled `/me` to make progress: see InboxPollerDeps.self's own doc comment
-   * for the incident this closes. Optional, same posture as `warmMembers` above.
+   * for the incident this closes. Optional: a caller with no reason to resolve self (every CLI,
+   * most of the MCP tool surface) simply never calls it; the inbox poller is the one real caller.
    */
   resolveSelfId?(): Promise<string | undefined>;
   /**
@@ -190,14 +178,9 @@ export interface TeamsChatsPort {
   resolveSelfIdStatus?(): Promise<SelfIdResolution>;
 }
 
-/** See TeamsChatsPort.warmMembers's own doc comment for what each field means and who reads it. */
-export interface WarmMembersResult {
-  throttled: boolean;
-  retryAfterSeconds?: number;
-}
-
 /** See TeamsChatsPort.resolveSelfIdStatus's own doc comment for what each field means and who
- *  reads it — mirrors WarmMembersResult's shape/reasoning above. */
+ *  reads it — mirrors WarmMembersResult's old shape/reasoning (removed with warmMembers, fix
+ *  round 1: dead production code with no caller once the poll-path roster warm-up was deleted). */
 export interface SelfIdResolution {
   /** The resolved id, when known: from the operator seed, the in-memory memo, the persisted
    *  cache, or a successful live `/me`. */
@@ -687,63 +670,6 @@ export class GraphTeamsChats implements TeamsChatsPort {
   }
 
   /**
-   * Daemon-side warm-up (behaviour 4, live 2026-09-08 — see KNOWN-ISSUES.md): when an allowlisted
-   * chat's roster cache is COLD (no entry at all, complete or partial — `get()`), fetches it ONCE
-   * so a later sendFile/mention resolution does not pay the live call. A chat with ANY cached
-   * roster is left alone — this exists to avoid a cold miss, not to upgrade a PARTIAL roster to
-   * COMPLETE (membersForInvite's own live refresh already does that when sendFile actually needs
-   * one). Best-effort and NEVER throws: a throttled/failed warm-up leaves the roster exactly as
-   * cold as it would be without this method, logged once for diagnosis — the inbox poller this is
-   * called from must never be taken down by it (same posture as every other poller failure path,
-   * see InboxPoller's own class doc comment).
-   *
-   * `readRetries: 0` (review round 1 MAJOR 4, fresh-context re-review of PR #24, live 2026-09-08):
-   * deliberately does NOT use LIVE_MEMBERS_REFRESH_RETRIES like membersForInvite/resolveMentions
-   * — this is called from INSIDE the poller's per-chat loop and AWAITED there, so a real,
-   * honourable (under the 90s sleep cap) Retry-After used to sleep the WHOLE poll cycle for real,
-   * per cold chat, per retry — the exact "retries amplify a throttle" shape
-   * docs/throttling-mitigation.md's 2026-08-25 incident already warns about, since sleeping
-   * through a retry advances the clock PAST the shared `/members` gate's own window, letting a
-   * SECOND cold chat's warm-up issue ANOTHER live 429 in the SAME cycle instead of being refused
-   * locally. One attempt, honest result, no wait, ever.
-   *
-   * Returns `{ throttled: true, retryAfterSeconds? }` when that single attempt was itself
-   * throttled (a live 429, OR the local `LocallyThrottled` gate a PRIOR call already closed) —
-   * the caller (the poller) uses `throttled` to stop asking for more THIS cycle, same "one 429
-   * ends the cycle" rule readMessages's own 429 handling already follows, and `retryAfterSeconds`
-   * (0.6.3, carried through from `GraphError.retryAfterSeconds` when Graph named a wait) to back
-   * this chat's NEXT warm-up attempt off for that long instead of retrying it on the very next
-   * cycle — live-diagnosed 2026-09-08: the same chat's warm-up was throttled on two consecutive
-   * poll cycles 4 minutes apart. Returns `{ throttled: false }` for every other outcome: already
-   * cached, fetched successfully, or failed for a reason OTHER than throttling (network error,
-   * licence problem, …) — none of those say anything about whether asking again right now would
-   * make things worse.
-   */
-  async warmMembers(chatId: string): Promise<WarmMembersResult> {
-    if (this.membersCache.get(chatId)) {
-      return { throttled: false };
-    }
-    try {
-      const fresh = await this.refreshMembers(chatId, 'for daemon warm-up', '', 0);
-      this.cacheIfNonEmpty(chatId, fresh);
-      return { throttled: false };
-    } catch (error) {
-      this.log(
-        `warmMembers: /members warm-up for ${chatId} failed ` +
-          `(${error instanceof Error ? error.message : String(error)}); leaving the roster cold ` +
-          'for the next real caller to retry.',
-      );
-      if (error instanceof GraphError && error.status === 429) {
-        return {
-          throttled: true,
-          ...(error.retryAfterSeconds !== undefined ? { retryAfterSeconds: error.retryAfterSeconds } : {}),
-        };
-      }
-      return { throttled: false };
-    }
-  }
-
-  /**
    * The assistant's own AAD id — used only so sendFile can exclude the assistant from its own
    * permission grant (it already owns the uploaded item as the uploader; granting itself `read`
    * on top would be harmless but noisy, not wrong). Returning `undefined` here does NOT itself
@@ -827,7 +753,7 @@ export class GraphTeamsChats implements TeamsChatsPort {
    * KNOWN-ISSUES.md). `resolveSelfId`/`resolveSelfIdLive` above are now thin wrappers around this
    * method and its live-only twin below — one chain, walked once, never duplicated.
    *
-   * Mirrors `WarmMembersResult`'s shape/reasoning: `id` present means resolved (override, memo,
+   * `id` present means resolved (override, memo,
    * cache, or a successful live call); `throttled: true` means the ONLY reason `id` is absent is
    * a live `/me` 429 (never true when the override/memo/cache already answered, since none of
    * those ever reach the live call at all); neither present means every other undetermined case
