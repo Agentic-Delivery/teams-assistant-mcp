@@ -335,7 +335,7 @@ describe('GraphTeamsChats.resolveSelfIdStatus — port-level self-id resolution 
       selfIdOverride: 'aad-override-self',
     });
 
-    await expect(chats.resolveSelfIdStatus()).resolves.toEqual({ id: 'aad-override-self' });
+    await expect(chats.resolveSelfIdStatus()).resolves.toEqual({ id: 'aad-override-self', source: 'override' });
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
@@ -351,7 +351,7 @@ describe('GraphTeamsChats.resolveSelfIdStatus — port-level self-id resolution 
       selfIdCache,
     });
 
-    await expect(chats.resolveSelfIdStatus()).resolves.toEqual({ id: 'aad-cached-self' });
+    await expect(chats.resolveSelfIdStatus()).resolves.toEqual({ id: 'aad-cached-self', source: 'cache' });
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
@@ -369,7 +369,7 @@ describe('GraphTeamsChats.resolveSelfIdStatus — port-level self-id resolution 
       selfIdCache,
     });
 
-    await expect(chats.resolveSelfIdStatus()).resolves.toEqual({ id: 'aad-live-self' });
+    await expect(chats.resolveSelfIdStatus()).resolves.toEqual({ id: 'aad-live-self', source: 'live' });
     expect(selfIdCache.read()).toEqual({ id: 'aad-live-self', resolvedAt: expect.any(Number) });
   });
 
@@ -415,7 +415,7 @@ describe('GraphTeamsChats.resolveSelfIdStatus — port-level self-id resolution 
     await expect(chats.resolveSelfIdStatus()).resolves.toEqual({});
     // Not memoized: the NEXT call retries rather than being stuck (same contract resolveSelfId's
     // own doc comment already promises for sendFile).
-    await expect(chats.resolveSelfIdStatus()).resolves.toEqual({ id: 'aad-recovered-self' });
+    await expect(chats.resolveSelfIdStatus()).resolves.toEqual({ id: 'aad-recovered-self', source: 'live' });
   });
 });
 
