@@ -393,25 +393,47 @@ async function resolveMentions(
  */
 export class PlainTextRefusedError extends Error {}
 
-// A markdown/pipe-table row: at least two pipes on one line, e.g. "| a | b |" or "a | b | c" —
-// deliberately narrow (one stray "|" in ordinary prose does not trip it) per the teams-styling
-// skill's own "never plain-text pipe walls" guidance.
-const TABLE_LIKE_LINE = /^.*\|.*\|.*$/m;
+// A REAL markdown/pipe-table row: the line both STARTS and ENDS with a pipe (ignoring leading/
+// trailing whitespace), e.g. "| a | b |" or "|---|---|" — narrower than "any line with two
+// pipes" (fix round, 2026-09-22, BLOCKING MAJOR review round 1: a shell pipeline like
+// "cat x | grep y | head" has two pipes on one line but is not a table row — it starts with
+// "cat" and ends with "head", neither a pipe).
+const TABLE_LIKE_LINE = /^[ \t]*\|.*\|[ \t]*$/m;
 // A run of two or more newlines — Teams renders a blank-line-separated body as multiple
 // paragraphs, itself a styling decision the skill says needs <div>&nbsp;</div> air, not a
 // plain-text double linebreak.
 const BLANK_LINE = /\n[ \t]*\r?\n/;
+// A sentence terminator only counts when it actually ENDS something — followed by whitespace or
+// the end of the string. Fix round, 2026-09-22 (BLOCKING MAJOR, review round 1): counting every
+// literal . ! ? character refused ordinary one-sentence status posts containing a version number
+// ("v0.7.2"), a filename ("findings.md"), a URL, a decimal ("30.9 percent"), or a path — none of
+// those periods are followed by whitespace (the next character is a digit/letter), so this
+// lookahead excludes them for free without a maintained list of extensions/abbreviations. A
+// decimal, a semver segment, or a file extension's dot is by construction never followed by
+// whitespace; only a REAL sentence end is.
+const SENTENCE_TERMINATOR = /[.!?](?=\s|$)/g;
+// Recall gap (fix round, 2026-09-22, review item 1): a body can be structured with NO
+// terminators and NO blank line at all — a bulleted list (one short line per item, nothing to
+// end a "sentence") or a very long single paragraph. Thresholds picked well clear of the
+// reviewer's six one-liner repro bodies (max 59 characters, 1 line each) and well under a
+// realistic long paragraph (a 200-word paragraph runs ~1500 characters) — see the corpus test
+// for both boundaries exercised together.
+const MANY_LINES_THRESHOLD = 4;
+const LONG_BODY_THRESHOLD = 400;
 
 /**
  * Classifies a plain-text body against the teams-styling skill's own threshold ("more than two
- * sentences ⇒ not plain text"): three or more sentence terminators (. ! ?), OR any blank line,
- * OR a pipe-table/markdown-looking line. Returns the reason phrase to quote in the refusal, or
- * undefined when the body is short/plain enough to send as-is. C1 (audit fix, 2026-09-21) —
- * measured 31% styling compliance, traced to plain text being the tool's silent default for
- * bodies exactly this shape.
+ * sentences ⇒ not plain text"): three or more REAL sentence terminators (. ! ?, each followed by
+ * whitespace or end-of-string), OR any blank line, OR a real pipe-table-looking line, OR the body
+ * is long/many-lined enough that it is obviously not a short conversational reply even with none
+ * of the above. Returns the reason phrase to quote in the refusal, or undefined when the body is
+ * short/plain enough to send as-is. C1 (audit fix, 2026-09-21; classifier corrected in the
+ * 2026-09-22 fix round after review round 1 found the naive terminator count over-triggered on
+ * ordinary operational text) — measured 31% styling compliance, traced to plain text being the
+ * tool's silent default for bodies exactly this shape.
  */
 export function structuredTextReason(text: string): string | undefined {
-  const terminators = text.match(/[.!?]/g)?.length ?? 0;
+  const terminators = text.match(SENTENCE_TERMINATOR)?.length ?? 0;
   if (terminators >= 3) {
     return `it reads as ${terminators} sentences — more than two is not plain text, per the teams-styling skill`;
   }
@@ -420,6 +442,13 @@ export function structuredTextReason(text: string): string | undefined {
   }
   if (TABLE_LIKE_LINE.test(text)) {
     return 'it has a pipe-table-looking line';
+  }
+  const nonEmptyLines = text.split('\n').filter((line) => line.trim() !== '').length;
+  if (nonEmptyLines >= MANY_LINES_THRESHOLD) {
+    return `it has ${nonEmptyLines} lines — that reads as a list, not a short reply`;
+  }
+  if (text.length > LONG_BODY_THRESHOLD) {
+    return `it is ${text.length} characters long — too long for a short reply`;
   }
   return undefined;
 }
@@ -470,6 +499,12 @@ export async function doPost(
   mentions: readonly string[] = [],
   options: { plainTextOverride?: boolean } = {},
 ): Promise<{ action: 'post'; id: string; chat: string }> {
+  // Allowlist gate FIRST (fix round, 2026-09-22, review item 2): the README's exit-code contract
+  // documents 3 (allowlist) as a distinct, prior failure class from 2 (usage, including this
+  // guard) — a chat that fails the allowlist gate must exit 3 regardless of what its body looks
+  // like, not be shadowed by a plain-text refusal that never even reached a chat Graph will
+  // refuse anyway.
+  const entry = allowlist.assertPostable(chatId);
   assertPlainTextAllowed(
     'teams-post',
     `teams-post ${chatId} --html`,
@@ -478,7 +513,6 @@ export async function doPost(
     html,
     options.plainTextOverride ?? false,
   );
-  const entry = allowlist.assertPostable(chatId);
   const resolved = await resolveMentions(chats, chatId, mentions);
   const sent = html
     ? await chats.sendHtmlMessage(chatId, text, resolved)
@@ -496,6 +530,8 @@ export async function doEdit(
   mentions: readonly string[] = [],
   options: { plainTextOverride?: boolean } = {},
 ): Promise<{ action: 'edit'; id: string; chat: string }> {
+  // Allowlist gate FIRST — same ordering rationale as doPost above.
+  const entry = allowlist.assertPostable(chatId);
   assertPlainTextAllowed(
     'teams-edit',
     `teams-edit ${chatId} ${messageId} --html`,
@@ -504,7 +540,6 @@ export async function doEdit(
     html,
     options.plainTextOverride ?? false,
   );
-  const entry = allowlist.assertPostable(chatId);
   const resolved = await resolveMentions(chats, chatId, mentions);
   if (html) {
     await chats.editHtmlMessage(chatId, messageId, newText, resolved);
@@ -528,6 +563,8 @@ export async function doReply(
   mentions: readonly string[] = [],
   options: { plainTextOverride?: boolean } = {},
 ): Promise<{ action: 'reply'; id: string; inReplyTo: string; chat: string }> {
+  // Allowlist gate FIRST — same ordering rationale as doPost above.
+  const entry = allowlist.assertPostable(chatId);
   assertPlainTextAllowed(
     'teams-reply',
     `teams-reply ${chatId} ${replyToMessageId} --html`,
@@ -536,7 +573,6 @@ export async function doReply(
     html,
     options.plainTextOverride ?? false,
   );
-  const entry = allowlist.assertPostable(chatId);
   const resolved = await resolveMentions(chats, chatId, mentions);
   const sent = html
     ? await chats.replyToHtmlMessage(chatId, replyToMessageId, text, resolved)

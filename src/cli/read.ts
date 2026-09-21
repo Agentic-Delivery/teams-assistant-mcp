@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Usage: teams-read <chatId> [--limit N] [--since ISO]
-// Success: one JSON line {ok, messages: [...]} on stdout — ids, timestamps, sender, text, and
-// (when a message carries any) attachment metadata. Metadata only: teams-attachments downloads.
+// Success: one JSON line {ok, messages: [...]} on stdout — ids, timestamps, sender, text,
+// format ("html" or "text", from Graph's own contentType — C3, 2026-09-21), and (when a message
+// carries any) attachment metadata. Metadata only: teams-attachments downloads.
 import { buildContext, doRead, run, succeed, usage } from './common.js';
 
 await run(async () => {

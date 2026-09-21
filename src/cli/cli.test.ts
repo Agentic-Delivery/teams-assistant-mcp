@@ -76,6 +76,11 @@ function fixtureEnv(): Record<string, string> {
       assistantDisplayName: 'Assistant',
       allowedChats: [
         { id: '19:readonly@thread.v2', label: 'read-only chat', canPost: false },
+        // Postable (2026-09-22 fix round, review item 2): the C1 guard now runs AFTER
+        // allowlist.assertPostable, per the README's exit-code contract (3 before 2) — a
+        // subprocess test proving the GUARD fires (exit 2) needs a chat that clears the
+        // allowlist gate first, or it would only ever prove the allowlist gate fires (exit 3).
+        { id: '19:postable@thread.v2', label: 'postable chat', canPost: true },
       ],
     }),
   );
@@ -349,18 +354,22 @@ describe('C1 — plain-text guard (subprocess: exit codes and the refusal messag
   const twoSentences = 'First sentence. Second sentence.';
   const blankLineBody = 'First line.\n\nSecond line.';
   const tableLikeBody = '| a | b |\n| 1 | 2 |';
+  // Postable (see fixtureEnv) — the fix-round reorder (review item 2) means the guard only
+  // fires after assertPostable passes, so every test that means to PROVE THE GUARD fires needs
+  // a chat that clears the allowlist gate first.
+  const postable = '19:postable@thread.v2';
 
   it('C1a: a plain 3-sentence body with no --html/--text is refused, exit 2', async () => {
-    const result = await runCli('post.ts', ['19:readonly@thread.v2'], fixtureEnv(), threeSentences);
+    const result = await runCli('post.ts', [postable], fixtureEnv(), threeSentences);
 
     expect(result.code).toBe(2);
     expect(result.stdout).toBe('');
     expect(result.stderr).toMatch(/teams-styling/);
     // (b) the correct invocation shape — chat id first, then --html — not the trap order.
-    expect(result.stderr).toMatch(/teams-post 19:readonly@thread\.v2 --html/);
-    expect(result.stderr).not.toMatch(/--html 19:readonly@thread\.v2/);
+    expect(result.stderr).toMatch(/teams-post 19:postable@thread\.v2 --html/);
+    expect(result.stderr).not.toMatch(/--html 19:postable@thread\.v2/);
     // (c) the deliberate override is named.
-    expect(result.stderr).toMatch(/teams-post 19:readonly@thread\.v2 --text/);
+    expect(result.stderr).toMatch(/teams-post 19:postable@thread\.v2 --text/);
   });
 
   it('C1b: a plain 2-sentence body (the non-triggering side) is NOT refused — reaches the same allowlist gate as before', async () => {
@@ -407,15 +416,15 @@ describe('C1 — plain-text guard (subprocess: exit codes and the refusal messag
   });
 
   it('C1f: a body with a blank line is refused even with fewer than 3 sentence terminators', async () => {
-    const result = await runCli('post.ts', ['19:readonly@thread.v2'], fixtureEnv(), blankLineBody);
+    const result = await runCli('post.ts', [postable], fixtureEnv(), blankLineBody);
 
     expect(result.code).toBe(2);
     expect(result.stdout).toBe('');
     expect(result.stderr).toMatch(/blank line/);
   });
 
-  it('C1g: a body with a pipe-table-looking line is refused', async () => {
-    const result = await runCli('post.ts', ['19:readonly@thread.v2'], fixtureEnv(), tableLikeBody);
+  it('C1g: a body with a REAL pipe-table-looking line is refused', async () => {
+    const result = await runCli('post.ts', [postable], fixtureEnv(), tableLikeBody);
 
     expect(result.code).toBe(2);
     expect(result.stdout).toBe('');
@@ -423,61 +432,101 @@ describe('C1 — plain-text guard (subprocess: exit codes and the refusal messag
   });
 
   it('C1h: teams-reply applies the same guard, naming teams-reply\'s own invocation shape', async () => {
-    const result = await runCli(
-      'reply.ts',
-      ['19:readonly@thread.v2', 'msg-1'],
-      fixtureEnv(),
-      threeSentences,
-    );
+    const result = await runCli('reply.ts', [postable, 'msg-1'], fixtureEnv(), threeSentences);
 
     expect(result.code).toBe(2);
     expect(result.stdout).toBe('');
     expect(result.stderr).toMatch(/teams-styling/);
-    expect(result.stderr).toMatch(/teams-reply 19:readonly@thread\.v2 msg-1 --html/);
-    expect(result.stderr).toMatch(/teams-reply 19:readonly@thread\.v2 msg-1 --text/);
+    expect(result.stderr).toMatch(/teams-reply 19:postable@thread\.v2 msg-1 --html/);
+    expect(result.stderr).toMatch(/teams-reply 19:postable@thread\.v2 msg-1 --text/);
   });
 
   it('C1i: teams-edit applies the same guard, naming teams-edit\'s own invocation shape', async () => {
-    const result = await runCli(
-      'edit.ts',
-      ['19:readonly@thread.v2', 'msg-1'],
-      fixtureEnv(),
-      threeSentences,
-    );
+    const result = await runCli('edit.ts', [postable, 'msg-1'], fixtureEnv(), threeSentences);
 
     expect(result.code).toBe(2);
     expect(result.stdout).toBe('');
     expect(result.stderr).toMatch(/teams-styling/);
-    expect(result.stderr).toMatch(/teams-edit 19:readonly@thread\.v2 msg-1 --html/);
-    expect(result.stderr).toMatch(/teams-edit 19:readonly@thread\.v2 msg-1 --text/);
+    expect(result.stderr).toMatch(/teams-edit 19:postable@thread\.v2 msg-1 --html/);
+    expect(result.stderr).toMatch(/teams-edit 19:postable@thread\.v2 msg-1 --text/);
+  });
+
+  // C1j (fix round, 2026-09-22, BLOCKING MAJOR from review round 1): the naive "count every
+  // . ! ? character" classifier refused ordinary one-sentence operational status posts that
+  // happen to contain a version number, a filename, a URL, a decimal, or a path — reviewer-
+  // reproduced against the built CLI, all six wrongly exit 2 before the fix. Every one of these
+  // MUST pass as plain (exit 3, reaching the allowlist gate, not the refusal) after the fix.
+  const reviewerCorpus = [
+    'Shipped teams-assistant-mcp v0.7.2 to the server.',
+    'See findings.md and notes.md in the workspace.',
+    'The build is at https://dev.azure.com/if/CTP/_build?id=42.',
+    'Compliance moved from 30.9 percent to 48.0 percent.',
+    'Config lives at /home/johan/.claude/settings.json and .env.',
+    'Run: cat x | grep y | head',
+  ];
+  it.each(reviewerCorpus)('C1j: reviewer body %j is NOT refused — reaches the allowlist gate', async (body) => {
+    const result = await runCli('post.ts', ['19:readonly@thread.v2'], fixtureEnv(), body);
+
+    expect(result.code).toBe(3);
+    expect(result.stdout).toBe('');
+  });
+
+  // C1k (fix round, review item 2): the guard now runs AFTER allowlist.assertPostable, per the
+  // README's documented exit-code contract (3 before 2) — a chat that fails the allowlist gate
+  // must exit 3 even when its body would ALSO have tripped the plain-text guard; the guard never
+  // gets the chance to run.
+  it('C1k: a non-postable chat with a structured body exits 3 (allowlist), not 2 (the guard never runs)', async () => {
+    const result = await runCli('post.ts', ['19:readonly@thread.v2'], fixtureEnv(), threeSentences);
+
+    expect(result.code).toBe(3);
+    expect(result.stdout).toBe('');
   });
 });
 
-describe('structuredTextReason — the plain-text guard\'s classifier (C1)', () => {
-  it('0, 1 or 2 sentence terminators: not structured', () => {
-    expect(structuredTextReason('no terminator here')).toBeUndefined();
-    expect(structuredTextReason('One sentence.')).toBeUndefined();
-    expect(structuredTextReason('One sentence. Two sentences.')).toBeUndefined();
+describe('structuredTextReason — the plain-text guard\'s classifier (C1, fix round 2026-09-22)', () => {
+  // Table-driven corpus (review item 3, root cause of the MAJOR): a plain assertion per case
+  // would not have caught the naive-terminator-count bug, because none of the ORIGINAL tests
+  // exercised a realistic body containing a version number/URL/path/decimal/filename — every
+  // case here is a REAL message shape, not a synthetic "One. Two. Three." Each row states the
+  // reason a human would give for the expected verdict, so a future classifier tweak that
+  // breaks one of these fails with that reason visible in the test name.
+  const notStructured: Array<[string, string]> = [
+    ['no terminator here', 'no terminator, no blank line, no table line'],
+    ['One sentence.', 'a single real sentence'],
+    ['One sentence. Two sentences.', 'exactly two real sentences — the skill\'s own threshold'],
+    ['Shipped teams-assistant-mcp v0.7.2 to the server.', 'a version number\'s dots are not sentence ends'],
+    ['See findings.md and notes.md in the workspace.', 'filenames\' dots are not sentence ends'],
+    ['The build is at https://dev.azure.com/if/CTP/_build?id=42.', 'a URL\'s dots are not sentence ends'],
+    ['Compliance moved from 30.9 percent to 48.0 percent.', 'decimal points are not sentence ends'],
+    ['Config lives at /home/johan/.claude/settings.json and .env.', 'a path\'s dots are not sentence ends'],
+    ['Run: cat x | grep y | head', 'a shell pipeline is not a table row (no leading/trailing pipe)'],
+    ['a | b', 'a single mid-line pipe is not a table row'],
+    ['See e.g. the notes.', 'a lone abbreviation does not by itself reach the 3-terminator threshold'],
+    ['It costs $3.50 per unit.', 'a currency decimal is not a sentence end'],
+    ['Node v20.11.0 shipped.', 'a semver\'s dots are not sentence ends'],
+  ];
+  it.each(notStructured)('NOT structured: %j (%s)', (text) => {
+    expect(structuredTextReason(text)).toBeUndefined();
   });
 
-  it('3 or more sentence terminators: structured', () => {
-    expect(structuredTextReason('One. Two. Three.')).toBeDefined();
-  });
-
-  it('a mix of . ! ? still counts toward the 3-terminator threshold', () => {
-    expect(structuredTextReason('Really? Yes! Confirmed.')).toBeDefined();
-  });
-
-  it('a blank line: structured, even with zero sentence terminators', () => {
-    expect(structuredTextReason('first line\n\nsecond line')).toBeDefined();
-  });
-
-  it('a pipe-table-looking line: structured, even with zero sentence terminators', () => {
-    expect(structuredTextReason('| a | b |')).toBeDefined();
-  });
-
-  it('a single pipe (not a table row) does not trigger the table check on its own', () => {
-    expect(structuredTextReason('a | b')).toBeUndefined();
+  const structured: Array<[string, string]> = [
+    ['One. Two. Three.', 'three real sentence terminators, each followed by whitespace'],
+    ['Really? Yes! Confirmed.', 'a mix of . ! ? still counts toward the 3-terminator threshold'],
+    ['Done! Ready for review? Yes.', 'three genuinely separate real sentences'],
+    ['first line\n\nsecond line', 'a blank line, even with zero sentence terminators'],
+    ['| a | b |', 'a real single-row table line (starts AND ends with a pipe)'],
+    ['| a | b |\n| 1 | 2 |', 'a real two-row markdown table'],
+    [
+      Array.from({ length: 10 }, (_, i) => `- item ${i}`).join('\n'),
+      'a 10-line bulleted list with no terminators and no blank lines at all (recall gap, review item 1)',
+    ],
+    [
+      Array.from({ length: 200 }, (_, i) => `word${i}`).join(' ') + '.',
+      'a 200-word single paragraph with only one terminator (recall gap, review item 1)',
+    ],
+  ];
+  it.each(structured)('structured: %j (%s)', (text) => {
+    expect(structuredTextReason(text)).toBeDefined();
   });
 });
 
