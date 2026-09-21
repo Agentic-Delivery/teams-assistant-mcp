@@ -1,6 +1,6 @@
 ---
 name: teams-styling
-description: "Styling doctrine for agent-posted Teams messages: when to style and when not to, the empirically verified HTML vocabulary Teams renders, known quirks, and the live status-board pattern for agent-progress transparency. Load before posting anything beyond a short conversational reply to a Teams chat — reports, findings tables, status updates, alerts."
+description: "Styling doctrine for agent-posted Teams messages: when to style and when not to, the empirically verified HTML vocabulary Teams renders, known quirks, and the live status-board pattern for agent-progress transparency. Read it BEFORE composing the message body — do not skip because the message 'looks short'; more than two sentences is not short. Triggers on: posting, replying to, or editing ANY Teams chat message; 'post.mjs', 'reply.mjs', 'edit.mjs', 'teams-post', 'teams-reply', 'teams-edit'; the flags '--html' and '--text'; 'send_chat_message', 'reply_chat_message', 'edit_chat_message'; any message longer than two sentences; 'Teams message', 'chat message', 'status board', 'findings table', 'status update', 'report to the channel', 'alert'."
 ---
 
 # Teams message styling
@@ -152,12 +152,35 @@ working with an Azure DevOps file view; the target must tolerate iframe renderin
 ## Wiring it into a project
 
 A skill teaches *how*; it does not make an agent reach for it. The consuming project's
-conduct/profile must carry the mandate — one line is enough:
+conduct/profile must carry the mandate:
 
 > All formatted channel output (tables, reports, status boards, alerts) follows the
 > `teams-styling` skill; agents load it before composing any such message.
 
-Without that line, expect agents to fall back to plain-text walls.
+**That line alone was measured insufficient.** Earlier versions of this section claimed one line
+is enough; an audit of 21 sessions in the guidewire factory (2026-09-21) falsified it. Of 188
+sends that this skill's own table says must NOT be plain text, 58 went out styled — 31 %
+compliance — with the mandate line in force the whole period, reinforced by an auto-loaded
+project memory rule and two prior verbal corrections from the owner. Over-styling was 0 of 12:
+the failure is pure omission, not disagreement. Split by whether this skill had loaded earlier
+in the session, compliance was 13 % before a load and 63 % after (n=373) — the rule works while
+it is in context and is absent otherwise. The mandate line is necessary and nowhere near
+sufficient; deterministic enforcement is required alongside it, at two points:
+
+- **A send-path guard in the tool** — `teams-assistant-mcp` refuses a multi-sentence body sent
+  without `--html`/`format: 'html'` unless the caller passes an explicit `--text` override, from
+  the version that ships the guard onward. This is the one enforcement that reaches every
+  consumer automatically and holds regardless of model, session or harness.
+- **A `PreToolUse` deny hook on `Bash` in the consuming project** — match
+  `(post|reply|edit)\.mjs`, deny when `--html` is absent and the body is over the threshold, and
+  name this skill in the denial text together with the correct argument order (the chat id is
+  positional-first, so `post.mjs --html <chat>` parses `--html` as the chat id). This is the only
+  fix that carries the rule into context at the failing instant. A hook template will ship with
+  this plugin in a later version; until then, write it against the consuming project's own hook
+  conventions.
+
+With the mandate line but neither enforcement point, expect agents to fall back to plain-text
+walls roughly two times in three.
 
 **Where that line lives — and nothing of this package beside it.** No package artifact goes
 into a customer's repository: this skill is read from the plugin cache, and everything a
