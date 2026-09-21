@@ -99,6 +99,31 @@ describe('graph message mapping', () => {
     });
   });
 
+  // C3 (audit fix, 2026-09-21): doRead's output had no way to tell a caller whether a message it
+  // reads back actually went out styled — this is the derivation the read path now surfaces.
+  it('C3c: derives format "html" from a Graph contentType of "html"', () => {
+    const message = toChatMessage(
+      { id: '8', createdDateTime: '2026-09-21T08:00:00Z', body: { contentType: 'html', content: '<p>styled</p>' } },
+      '19:pilot@thread.v2',
+    );
+
+    expect(message.format).toBe('html');
+  });
+
+  // C3d: the non-triggering side — anything other than "html" (including the plain "text"
+  // Graph actually sends, and a message with no body at all) maps to "text", same as the
+  // existing text-flattening ternary a few lines above this in toChatMessage.
+  it('C3d: derives format "text" from a Graph contentType of "text" (and from no contentType at all)', () => {
+    const textMessage = toChatMessage(
+      { id: '9', createdDateTime: '2026-09-21T08:00:00Z', body: { contentType: 'text', content: 'plain' } },
+      '19:pilot@thread.v2',
+    );
+    const noBodyMessage = toChatMessage({ id: '10', createdDateTime: '2026-09-21T08:00:00Z' }, '19:pilot@thread.v2');
+
+    expect(textMessage.format).toBe('text');
+    expect(noBodyMessage.format).toBe('text');
+  });
+
   it('labels a system event instead of leaving the sender blank', () => {
     const message = toChatMessage(
       {

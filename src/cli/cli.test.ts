@@ -1439,8 +1439,8 @@ describe('teams-read — attachment metadata in the output (0.5.0: a file used t
 
   it('doRead includes id/name/contentType when a message carries attachments, and omits the field when not', async () => {
     const messages: ChatMessage[] = [
-      { id: 'm1', chatId: '19:r@thread.v2', createdDateTime: '2026-09-02T08:00:00Z', from: 'Maja', text: 'plain', isDeleted: false, attachments: [] },
-      { id: 'm2', chatId: '19:r@thread.v2', createdDateTime: '2026-09-02T08:01:00Z', from: 'Maja', text: 'file attached', isDeleted: false,
+      { id: 'm1', chatId: '19:r@thread.v2', createdDateTime: '2026-09-02T08:00:00Z', from: 'Maja', text: 'plain', isDeleted: false, attachments: [], format: 'text' },
+      { id: 'm2', chatId: '19:r@thread.v2', createdDateTime: '2026-09-02T08:01:00Z', from: 'Maja', text: 'file attached', isDeleted: false, format: 'html',
         attachments: [{ id: 'att-1', name: 'plan.xlsx', contentType: 'reference', contentUrl: 'https://x/p' }] },
     ];
     const readMessages = vi.fn(async () => ({ messages }) as ReadResult);
@@ -1459,6 +1459,60 @@ describe('teams-read — attachment metadata in the output (0.5.0: a file used t
     expect(result.messages[1]?.attachments).toEqual([
       { id: 'att-1', name: 'plan.xlsx', contentType: 'reference' },
     ]);
+  });
+
+  // C3 (audit fix, 2026-09-21): messages.ts:184 used to flatten HTML and discard contentType,
+  // so a caller reading back its own sends could never tell whether the plain-text guard (C1)
+  // was actually being honoured — this is the field the harvest ritual now measures compliance
+  // from. Additive only: `text` keeps carrying the exact same flattened string as before either
+  // way (asserted below), `format` is the new field.
+  it('C3a: an html-contentType message reads back format: "html", text still flattened the same way', async () => {
+    const messages: ChatMessage[] = [
+      {
+        id: 'm3',
+        chatId: '19:r@thread.v2',
+        createdDateTime: '2026-09-21T08:00:00Z',
+        from: 'Assistant',
+        text: 'Styled update\nSecond line',
+        isDeleted: false,
+        attachments: [],
+        format: 'html',
+      },
+    ];
+    const readMessages = vi.fn(async () => ({ messages }) as ReadResult);
+    const chats = new ReliableTeamsChats({ readMessages } as unknown as TeamsChatsPort, {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    const result = await doRead({ chats, allowlist }, '19:r@thread.v2', { limit: 5 });
+
+    expect(result.messages[0]).toMatchObject({ format: 'html', text: 'Styled update\nSecond line' });
+  });
+
+  // C3b: the non-triggering side — a plain-contentType message reads back format: "text".
+  it('C3b: a text-contentType message reads back format: "text"', async () => {
+    const messages: ChatMessage[] = [
+      {
+        id: 'm4',
+        chatId: '19:r@thread.v2',
+        createdDateTime: '2026-09-21T08:00:00Z',
+        from: 'Assistant',
+        text: 'plain update',
+        isDeleted: false,
+        attachments: [],
+        format: 'text',
+      },
+    ];
+    const readMessages = vi.fn(async () => ({ messages }) as ReadResult);
+    const chats = new ReliableTeamsChats({ readMessages } as unknown as TeamsChatsPort, {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    const result = await doRead({ chats, allowlist }, '19:r@thread.v2', { limit: 5 });
+
+    expect(result.messages[0]).toMatchObject({ format: 'text', text: 'plain update' });
   });
 });
 

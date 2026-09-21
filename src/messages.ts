@@ -21,6 +21,15 @@ export interface ChatMessage {
   text: string;
   isDeleted: boolean;
   attachments: ChatAttachmentRef[];
+  /**
+   * Derived from Graph's `body.contentType` — 'html' exactly when Graph said 'html', 'text'
+   * otherwise (same "not literally html ⇒ text" rule `text` above already uses). Optional only
+   * so hand-built ChatMessage fixtures elsewhere (reliable-sends.test.ts, inbox.test.ts) that
+   * predate this field and never touch the read path don't need updating; every ChatMessage
+   * toChatMessage() actually produces sets it. Audit fix C3, 2026-09-21: without this, doRead's
+   * output had no way to tell a caller whether a message it reads back actually went out styled.
+   */
+  format?: 'html' | 'text';
 }
 
 export interface ReadResult {
@@ -182,6 +191,7 @@ export function toChatMessage(raw: unknown, fallbackChatId: string): ChatMessage
     from: sender?.displayName ?? (message.messageType === 'systemEventMessage' ? 'system' : 'unknown'),
     ...(sender?.id ? { fromId: sender.id } : {}),
     text: body.contentType === 'html' ? htmlToText(content) : content.trim(),
+    format: body.contentType === 'html' ? 'html' : 'text',
     isDeleted: Boolean(message.deletedDateTime),
     attachments: [
       ...(message.attachments ?? []).flatMap((attachment) =>

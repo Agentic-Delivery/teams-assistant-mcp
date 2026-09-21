@@ -249,6 +249,7 @@ export async function doRead(
     from: string;
     deleted: boolean;
     text: string;
+    format: 'html' | 'text';
     attachments?: Array<{ id: string; name?: string; contentType?: string }>;
   }>;
 }> {
@@ -263,6 +264,13 @@ export async function doRead(
       from: m.from,
       deleted: m.isDeleted,
       text: m.text,
+      // C3 (audit fix, 2026-09-21): additive only — `text` above is still the exact same
+      // flattened string as before; `format` is the new field, derived by toChatMessage
+      // (messages.ts) from Graph's body.contentType. `m.format` is only optional on ChatMessage
+      // for hand-built fixtures elsewhere that never reach this path; anything actually read
+      // from Graph always has it set, but the ternary mirrors toChatMessage's own "not literally
+      // html ⇒ text" rule rather than assuming that.
+      format: m.format === 'html' ? 'html' : 'text',
       ...(m.attachments.length > 0
         ? {
             attachments: m.attachments.map((a) => ({
