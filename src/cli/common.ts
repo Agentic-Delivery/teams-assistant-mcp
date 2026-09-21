@@ -403,15 +403,31 @@ const TABLE_LIKE_LINE = /^[ \t]*\|.*\|[ \t]*$/m;
 // paragraphs, itself a styling decision the skill says needs <div>&nbsp;</div> air, not a
 // plain-text double linebreak.
 const BLANK_LINE = /\n[ \t]*\r?\n/;
-// A sentence terminator only counts when it actually ENDS something — followed by whitespace or
+// A . ! ? only counts as a candidate sentence terminator when it is followed by whitespace or
 // the end of the string. Fix round, 2026-09-22 (BLOCKING MAJOR, review round 1): counting every
 // literal . ! ? character refused ordinary one-sentence status posts containing a version number
-// ("v0.7.2"), a filename ("findings.md"), a URL, a decimal ("30.9 percent"), or a path — none of
-// those periods are followed by whitespace (the next character is a digit/letter), so this
-// lookahead excludes them for free without a maintained list of extensions/abbreviations. A
-// decimal, a semver segment, or a file extension's dot is by construction never followed by
-// whitespace; only a REAL sentence end is.
+// ("v0.7.2"), a filename ("findings.md"), a URL, a decimal ("30.9 percent"), or a path — a
+// decimal/semver/extension dot is by construction never followed by whitespace (the next
+// character is a digit or letter), so this lookahead excludes those for free, with no maintained
+// list. It does NOT exclude a genuine sentence-ending abbreviation ("e.g. ", "kl. ") — those ARE
+// followed by whitespace, so they still match here; ABBREVIATION_TERMINATOR_CI/CS below (fix
+// round, 2026-09-22, review round 2, MINOR 2) subtract the short fixed list of those out of the
+// count separately, rather than trying to make this one regex do both jobs.
 const SENTENCE_TERMINATOR = /[.!?](?=\s|$)/g;
+// A short, deliberately non-exhaustive list of abbreviations whose final dot reads as a sentence
+// terminator by the rule above (it IS followed by whitespace) but isn't one. Case-insensitive for
+// "e.g."/"i.e."/Swedish "kl." (klockan, a time-of-day marker, e.g. "kl. 14.30"); "No." (as in
+// "item No. 42") is deliberately case-SENSITIVE (capital N only) so the common word "no." ending
+// an ordinary sentence ("I said no. Then I left.") is not silently exempted. This is a known,
+// bounded gap, not a general abbreviation detector — MINOR 2, review round 2.
+const ABBREVIATION_TERMINATOR_CI = /\b(?:e\.g|i\.e|kl)\.(?=\s|$)/gi;
+const ABBREVIATION_TERMINATOR_CS = /\bNo\.(?=\s|$)/g;
+
+function countAbbreviationTerminators(text: string): number {
+  const ci = text.match(ABBREVIATION_TERMINATOR_CI)?.length ?? 0;
+  const cs = text.match(ABBREVIATION_TERMINATOR_CS)?.length ?? 0;
+  return ci + cs;
+}
 // Recall gap (fix round, 2026-09-22, review item 1): a body can be structured with NO
 // terminators and NO blank line at all — a bulleted list (one short line per item, nothing to
 // end a "sentence") or a very long single paragraph. Thresholds picked well clear of the
@@ -423,17 +439,20 @@ const LONG_BODY_THRESHOLD = 400;
 
 /**
  * Classifies a plain-text body against the teams-styling skill's own threshold ("more than two
- * sentences ⇒ not plain text"): three or more REAL sentence terminators (. ! ?, each followed by
- * whitespace or end-of-string), OR any blank line, OR a real pipe-table-looking line, OR the body
- * is long/many-lined enough that it is obviously not a short conversational reply even with none
- * of the above. Returns the reason phrase to quote in the refusal, or undefined when the body is
- * short/plain enough to send as-is. C1 (audit fix, 2026-09-21; classifier corrected in the
- * 2026-09-22 fix round after review round 1 found the naive terminator count over-triggered on
- * ordinary operational text) — measured 31% styling compliance, traced to plain text being the
- * tool's silent default for bodies exactly this shape.
+ * sentences ⇒ not plain text"): three or more sentence terminators (. ! ?, each followed by
+ * whitespace or end-of-string, MINUS the short fixed list of abbreviation-final dots that shape
+ * also matches — see ABBREVIATION_TERMINATOR_CI/CS above), OR any blank line, OR a real
+ * pipe-table-looking line, OR the body is long/many-lined enough that it is obviously not a short
+ * conversational reply even with none of the above. Returns the reason phrase to quote in the
+ * refusal, or undefined when the body is short/plain enough to send as-is. C1 (audit fix,
+ * 2026-09-21; classifier corrected in the 2026-09-22 fix rounds after review found the naive
+ * terminator count over-triggered on ordinary operational text, and on ordinary abbreviations) —
+ * measured 31% styling compliance, traced to plain text being the tool's silent default for
+ * bodies exactly this shape.
  */
 export function structuredTextReason(text: string): string | undefined {
-  const terminators = text.match(SENTENCE_TERMINATOR)?.length ?? 0;
+  const rawTerminators = text.match(SENTENCE_TERMINATOR)?.length ?? 0;
+  const terminators = Math.max(0, rawTerminators - countAbbreviationTerminators(text));
   if (terminators >= 3) {
     return `it reads as ${terminators} sentences — more than two is not plain text, per the teams-styling skill`;
   }

@@ -459,14 +459,21 @@ flags were parsed, so a flag placed before it was silently misread as the chat i
 resolved chat id that still looks like a flag (starts with `--`) is refused rather than
 misparsed.
 
-**Plain-text guard (0.7.2).** `teams-post`/`teams-reply`/`teams-edit`, given a plain (no `--html`)
-body that reads as three or more sentences, has a blank line, or has a pipe-table-looking line,
-refuse to send it (exit 2) rather than post it unstyled — the audit-measured failure mode this
-closes: 31% of messages that should have been styled were, and the failure was purely
-one-directional (plain text going out unstyled), never the reverse. The refusal names the
-`teams-styling` skill, the correct invocation (chat id first, then `--html`), and the deliberate
-override, `--text`, which sends the body as plain text regardless of its shape. `--html` and
-`--text` together is an error. The guard is CLI-only — the MCP `send_chat_message`/
+**Plain-text guard (0.7.2, classifier corrected in two fix rounds, 2026-09-22).** `teams-post`/
+`teams-reply`/`teams-edit`, given a plain (no `--html`) body, refuse to send it (exit 2) rather
+than post it unstyled when it reads as three or more real sentences (a `.`/`!`/`?` only counts
+when followed by whitespace or the end of the body — a version number, filename, URL, decimal or
+path never trips this on its own; a short fixed list of abbreviations, `e.g.`/`i.e.`/Swedish
+`kl.`/`No.`, is exempted too), has a blank line, has a REAL pipe-table-looking line (a line that
+both starts and ends with a pipe — a shell pipeline like `cat x | grep y | head` does not count),
+or is long/many-lined enough on its own (4+ non-empty lines, or over 400 characters) that it is
+obviously not a short conversational reply. This closes the audit-measured failure mode: 31% of
+messages that should have been styled were, and the failure was purely one-directional (plain
+text going out unstyled), never the reverse. The refusal names the `teams-styling` skill, the
+correct invocation (chat id first, then `--html`), and the deliberate override, `--text`, which
+sends the body as plain text regardless of its shape. `--html` and `--text` together is an error.
+The guard runs AFTER the allowlist gate (a chat that fails allowlist still exits 3, never
+shadowed by the guard's exit 2). The guard is CLI-only — the MCP `send_chat_message`/
 `reply_chat_message`/`edit_chat_message` tools are unaffected; an agent driving the server
 directly is expected to have read the skill already (see its trigger list).
 

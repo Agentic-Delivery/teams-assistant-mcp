@@ -355,11 +355,14 @@ vars, same allowlist, same send-reliability code paths as the server tools. `--h
 parameter. Flags parse anywhere in argv (0.7.2) — the chat id is whichever positional survives
 flag parsing, not a fixed argv slot, so `--html`/`--text` can come before or after it; a chat id
 that still looks like a flag is refused. `--text` (0.7.2) is the deliberate override for the
-plain-text guard: given a plain body (`--html` not set) that reads as three-or-more sentences,
-has a blank line, or has a pipe-table-looking line, `teams-post`/`teams-reply`/`teams-edit`
-refuse to send it (exit 2, naming the `teams-styling` skill and the correct invocation) unless
-`--text` is given — see README's "The standalone CLIs" for the full contract. `--html` and
-`--text` together is an error. `teams-read`'s output also carries each message's `format`
+plain-text guard: given a plain body (`--html` not set) that reads as three-or-more real
+sentences (a terminator followed by whitespace/end, excluding a short fixed abbreviation list —
+`e.g.`/`i.e.`/`kl.`/`No.`), has a blank line, has a REAL pipe-table-looking line (starts AND ends
+with a pipe — not any line with pipes, so a shell pipeline doesn't count), or is 4+ non-empty
+lines or over 400 characters on its own, `teams-post`/`teams-reply`/`teams-edit` refuse to send
+it (exit 2, naming the `teams-styling` skill and the correct invocation) unless `--text` is
+given — see README's "The standalone CLIs" for the full contract. `--html` and `--text` together
+is an error; the guard runs after the allowlist gate. `teams-read`'s output also carries each message's `format`
 (`"html"`/`"text"`, from Graph's `contentType`) alongside the existing flattened `text` field.
 `teams-send-file` sends one or more local files (`--caption`, optional, shown on the first file
 only), streaming one JSON line to stdout as EACH file lands rather than buffering until the whole

@@ -351,7 +351,6 @@ describe('C2 — flags parse anywhere in argv; a flag-like resolved chat id is r
 // skill was ever read: the CLI send path itself.
 describe('C1 — plain-text guard (subprocess: exit codes and the refusal message)', () => {
   const threeSentences = 'First sentence. Second sentence. Third sentence.';
-  const twoSentences = 'First sentence. Second sentence.';
   const blankLineBody = 'First line.\n\nSecond line.';
   const tableLikeBody = '| a | b |\n| 1 | 2 |';
   // Postable (see fixtureEnv) — the fix-round reorder (review item 2) means the guard only
@@ -372,24 +371,15 @@ describe('C1 — plain-text guard (subprocess: exit codes and the refusal messag
     expect(result.stderr).toMatch(/teams-post 19:postable@thread\.v2 --text/);
   });
 
-  it('C1b: a plain 2-sentence body (the non-triggering side) is NOT refused — reaches the same allowlist gate as before', async () => {
-    const result = await runCli('post.ts', ['19:readonly@thread.v2'], fixtureEnv(), twoSentences);
-
-    expect(result.code).toBe(3); // allowlisted but not postable — the guard let it through
-    expect(result.stdout).toBe('');
-  });
-
-  it('C1c: --text overrides the guard even on a 3-sentence body — reaches the allowlist gate, not the refusal', async () => {
-    const result = await runCli(
-      'post.ts',
-      ['19:readonly@thread.v2', '--text'],
-      fixtureEnv(),
-      threeSentences,
-    );
-
-    expect(result.code).toBe(3);
-    expect(result.stdout).toBe('');
-  });
+  // C1b and C1c were DELETED here (review round 2, BLOCKER 2): both ran against the read-only
+  // chat, which exits 3 at allowlist.assertPostable REGARDLESS of what the guard/override do —
+  // a classifier that refuses EVERYTHING, or an override that does nothing at all, would have
+  // left both green (reviewer-verified: mutation M-B, "refuse everything", leaves them green).
+  // The "2-sentence body is not refused" claim is carried by the structuredTextReason corpus
+  // test below (the exact 'One sentence. Two sentences.' row); the "--text overrides the guard"
+  // claim is carried by the in-process 'doPost: html=false, plainTextOverride=true...' test
+  // above, which uses the POSTABLE chat and an unwrapped 3-sentence body — a real trigger the
+  // override must actually suppress, not a chat that would have exited 3 either way.
 
   it('C1d: --html and --text together is an error, exit 2', async () => {
     const result = await runCli(
@@ -403,17 +393,12 @@ describe('C1 — plain-text guard (subprocess: exit codes and the refusal messag
     expect(result.stderr).toMatch(/mutually exclusive/);
   });
 
-  it('C1e: --html bypasses the guard even on a body that would otherwise be refused', async () => {
-    const result = await runCli(
-      'post.ts',
-      ['19:readonly@thread.v2', '--html'],
-      fixtureEnv(),
-      threeSentences,
-    );
-
-    expect(result.code).toBe(3); // reaches the allowlist gate, not the plain-text refusal
-    expect(result.stdout).toBe('');
-  });
+  // C1e was DELETED here (review round 2, BLOCKER 2): same "unconditional allowlist exit" flaw
+  // as C1b/C1c above, for the "--html bypasses the guard" claim — that claim is now carried by
+  // the in-process 'doPost/doReply/doEdit: html=true, body whose terminators ARE followed by
+  // whitespace...' tests (see the describe block above this one), which use a body that would
+  // genuinely trip the guard were html not bypassing it, and assert the html send method itself
+  // ran — reviewer-verified against mutation M-G (`if (html || override)` -> `if (override)`).
 
   it('C1f: a body with a blank line is refused even with fewer than 3 sentence terminators', async () => {
     const result = await runCli('post.ts', [postable], fixtureEnv(), blankLineBody);
@@ -451,25 +436,19 @@ describe('C1 — plain-text guard (subprocess: exit codes and the refusal messag
     expect(result.stderr).toMatch(/teams-edit 19:postable@thread\.v2 msg-1 --text/);
   });
 
-  // C1j (fix round, 2026-09-22, BLOCKING MAJOR from review round 1): the naive "count every
-  // . ! ? character" classifier refused ordinary one-sentence operational status posts that
-  // happen to contain a version number, a filename, a URL, a decimal, or a path — reviewer-
-  // reproduced against the built CLI, all six wrongly exit 2 before the fix. Every one of these
-  // MUST pass as plain (exit 3, reaching the allowlist gate, not the refusal) after the fix.
-  const reviewerCorpus = [
-    'Shipped teams-assistant-mcp v0.7.2 to the server.',
-    'See findings.md and notes.md in the workspace.',
-    'The build is at https://dev.azure.com/if/CTP/_build?id=42.',
-    'Compliance moved from 30.9 percent to 48.0 percent.',
-    'Config lives at /home/johan/.claude/settings.json and .env.',
-    'Run: cat x | grep y | head',
-  ];
-  it.each(reviewerCorpus)('C1j: reviewer body %j is NOT refused — reaches the allowlist gate', async (body) => {
-    const result = await runCli('post.ts', ['19:readonly@thread.v2'], fixtureEnv(), body);
-
-    expect(result.code).toBe(3);
-    expect(result.stdout).toBe('');
-  });
+  // C1j was DELETED here (review round 2, BLOCKER 2, reviewer evidence): all 6 rows ran the
+  // reviewer's bodies against the READ-ONLY chat and asserted exit 3 — which
+  // allowlist.assertPostable produces UNCONDITIONALLY for that chat, before the guard ever runs.
+  // Reverting to the naive round-1 terminator count (the exact MAJOR this was meant to catch)
+  // left every C1j row green; only the structuredTextReason unit corpus rows below went red. The
+  // six reviewer bodies are pinned there instead — as `notStructured` rows in the
+  // 'structuredTextReason — the plain-text guard's classifier' describe block further down —
+  // where the classifier's actual return value is asserted directly, not shadowed by an
+  // allowlist gate that would produce the same exit code however the classifier behaved. (A
+  // postable-chat + "code !== 2 && no /refusing to send/" version was considered and rejected:
+  // it requires a real Graph/token-acquisition attempt with fake credentials past the guard,
+  // which is slow and non-deterministic in a test environment — see this file's own
+  // "no network reached" doctrine throughout the rest of this describe block.)
 
   // C1k (fix round, review item 2): the guard now runs AFTER allowlist.assertPostable, per the
   // README's documented exit-code contract (3 before 2) — a chat that fails the allowlist gate
@@ -504,6 +483,13 @@ describe('structuredTextReason — the plain-text guard\'s classifier (C1, fix r
     ['See e.g. the notes.', 'a lone abbreviation does not by itself reach the 3-terminator threshold'],
     ['It costs $3.50 per unit.', 'a currency decimal is not a sentence end'],
     ['Node v20.11.0 shipped.', 'a semver\'s dots are not sentence ends'],
+    // MINOR 2 (review round 2): abbreviation-final dots ARE followed by whitespace, so the base
+    // lookahead alone counts them as real terminators — these would each be 3 raw terminators
+    // without the explicit exemption list below, and 2 with it.
+    ['Send it e.g. tomorrow morning. Thanks.', '"e.g." is on the abbreviation exemption list'],
+    ['Note i.e. this matters a lot. OK.', '"i.e." is on the abbreviation exemption list'],
+    ['Meet kl. 14.30 today. See you.', 'Swedish "kl." (klockan) is on the abbreviation exemption list'],
+    ['See No. 42 in the list. Thanks.', '"No." (capital N) is on the abbreviation exemption list'],
   ];
   it.each(notStructured)('NOT structured: %j (%s)', (text) => {
     expect(structuredTextReason(text)).toBeUndefined();
@@ -523,6 +509,19 @@ describe('structuredTextReason — the plain-text guard\'s classifier (C1, fix r
     [
       Array.from({ length: 200 }, (_, i) => `word${i}`).join(' ') + '.',
       'a 200-word single paragraph with only one terminator (recall gap, review item 1)',
+    ],
+    // MINOR 2 (review round 2): the exemption list must not defeat real detection — a body with
+    // an exempted abbreviation PLUS enough genuine sentences to still cross the threshold must
+    // still refuse.
+    [
+      'See e.g. the file. It works well. Great job. Thanks.',
+      'one exempted "e.g." plus four real sentences — still well over the threshold',
+    ],
+    // The deliberate case-sensitivity boundary on "No." (capital N only): the common lowercase
+    // word "no." ending an ordinary sentence must NOT be silently exempted.
+    [
+      'I said no. Then I left. It happened fast.',
+      'lowercase "no." is an ordinary word, not the "No." abbreviation — three real sentences',
     ],
   ];
   it.each(structured)('structured: %j (%s)', (text) => {
@@ -560,6 +559,13 @@ describe('doPost / doReply / doEdit — the plain-text guard (in-process, no sub
 
   const allowlist = new ChatAllowlist([{ id: '19:a@thread.v2', label: 'chat A', canPost: true }]);
   const structured = 'First sentence. Second sentence. Third sentence.';
+  // BLOCKER 1 (review round 2): `<p>${structured}</p>` (used below) is a WEAK html=true repro —
+  // its third terminator is followed by "</p>" (the closing tag), not whitespace, so it never
+  // reaches the 3-terminator threshold in the first place; mutating `if (html || override)` to
+  // `if (override)` (--html no longer bypasses the guard) left that test green by accident. This
+  // body's three terminators are each followed by a real space, so it WOULD trip the guard were
+  // html not bypassing it — the mutation must turn this test red.
+  const structuredWithWhitespaceTerminators = '<div>One. Two. Three. </div>';
 
   it('doPost: html=false, no override, structured text — rejects with PlainTextRefusedError BEFORE any send', async () => {
     const sendMessage = vi.fn();
@@ -595,6 +601,39 @@ describe('doPost / doReply / doEdit — the plain-text guard (in-process, no sub
 
     expect(sendHtmlMessage).toHaveBeenCalledWith('19:a@thread.v2', `<p>${structured}</p>`, []);
     expect(result).toEqual({ action: 'post', id: 'm1', chat: 'chat A' });
+  });
+
+  // BLOCKER 1 fix (review round 2): the load-bearing case the test above accidentally could not
+  // catch — see structuredWithWhitespaceTerminators' own comment. Kill verified against mutation
+  // M-G (`if (html || override)` -> `if (override)`) below.
+  it('doPost: html=true, body whose terminators ARE followed by whitespace — the guard still does not apply, sendHtmlMessage still runs', async () => {
+    const sendHtmlMessage = vi.fn(async () => ({
+      id: 'm1b',
+      chatId: '19:a@thread.v2',
+      createdDateTime: '2026-09-22T10:00:00Z',
+      from: 'Assistant',
+      text: '',
+      isDeleted: false,
+      attachments: [],
+    }));
+    const chats = new ReliableTeamsChats(fakePort({ sendHtmlMessage }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    const result = await doPost(
+      { chats, allowlist },
+      '19:a@thread.v2',
+      structuredWithWhitespaceTerminators,
+      true,
+    );
+
+    expect(sendHtmlMessage).toHaveBeenCalledWith(
+      '19:a@thread.v2',
+      structuredWithWhitespaceTerminators,
+      [],
+    );
+    expect(result).toEqual({ action: 'post', id: 'm1b', chat: 'chat A' });
   });
 
   it('doPost: html=false, plainTextOverride=true, structured text — the override bypasses the guard, sendMessage still runs', async () => {
@@ -633,6 +672,40 @@ describe('doPost / doReply / doEdit — the plain-text guard (in-process, no sub
     expect(replyToMessage).not.toHaveBeenCalled();
   });
 
+  // BLOCKER 1 fix (review round 2): same whitespace-terminator repro as doPost above, on the
+  // reply path.
+  it('doReply: html=true, body whose terminators ARE followed by whitespace — the guard still does not apply, replyToHtmlMessage still runs', async () => {
+    const replyToHtmlMessage = vi.fn(async () => ({
+      id: 'r1b',
+      chatId: '19:a@thread.v2',
+      createdDateTime: '2026-09-22T10:00:00Z',
+      from: 'Assistant',
+      text: '',
+      isDeleted: false,
+      attachments: [],
+    }));
+    const chats = new ReliableTeamsChats(fakePort({ replyToHtmlMessage }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    const result = await doReply(
+      { chats, allowlist },
+      '19:a@thread.v2',
+      'orig-1',
+      structuredWithWhitespaceTerminators,
+      true,
+    );
+
+    expect(replyToHtmlMessage).toHaveBeenCalledWith(
+      '19:a@thread.v2',
+      'orig-1',
+      structuredWithWhitespaceTerminators,
+      [],
+    );
+    expect(result).toEqual({ action: 'reply', id: 'r1b', inReplyTo: 'orig-1', chat: 'chat A' });
+  });
+
   it('doEdit: html=false, no override, structured text — rejects with PlainTextRefusedError BEFORE any send', async () => {
     const editMessage = vi.fn();
     const chats = new ReliableTeamsChats(fakePort({ editMessage }), {
@@ -644,6 +717,32 @@ describe('doPost / doReply / doEdit — the plain-text guard (in-process, no sub
       doEdit({ chats, allowlist }, '19:a@thread.v2', 'msg-1', structured, false),
     ).rejects.toThrow(PlainTextRefusedError);
     expect(editMessage).not.toHaveBeenCalled();
+  });
+
+  // BLOCKER 1 fix (review round 2): same whitespace-terminator repro as doPost above, on the
+  // edit path.
+  it('doEdit: html=true, body whose terminators ARE followed by whitespace — the guard still does not apply, editHtmlMessage still runs', async () => {
+    const editHtmlMessage = vi.fn(async () => undefined);
+    const chats = new ReliableTeamsChats(fakePort({ editHtmlMessage }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    const result = await doEdit(
+      { chats, allowlist },
+      '19:a@thread.v2',
+      'msg-1',
+      structuredWithWhitespaceTerminators,
+      true,
+    );
+
+    expect(editHtmlMessage).toHaveBeenCalledWith(
+      '19:a@thread.v2',
+      'msg-1',
+      structuredWithWhitespaceTerminators,
+      [],
+    );
+    expect(result).toEqual({ action: 'edit', id: 'msg-1', chat: 'chat A' });
   });
 });
 
