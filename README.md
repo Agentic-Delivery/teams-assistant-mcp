@@ -437,11 +437,12 @@ for read-budget headroom.
 ## The standalone CLIs
 
 Ten small commands ship beside the server for scripts, cron jobs and background monitors that
-need Teams without a running MCP session: `teams-post <chatId> [--html] [--mention "Name"]...`
-(text on stdin), `teams-reply <chatId> <messageId> [--html] [--mention "Name"]...` (text on
-stdin), `teams-edit <chatId> <messageId> [--html] [--mention "Name"]...` (new text on stdin),
-`teams-react <chatId> <messageId> <emoji>`, `teams-read <chatId> [--limit N] [--since ISO]`,
-`teams-pin <chatId> <messageId>`, `teams-unpin <chatId> <messageId>`, `teams-send-file <chatId>
+need Teams without a running MCP session: `teams-post <chatId> [--html | --text] [--mention
+"Name"]...` (text on stdin), `teams-reply <chatId> <messageId> [--html | --text] [--mention
+"Name"]...` (text on stdin), `teams-edit <chatId> <messageId> [--html | --text] [--mention
+"Name"]...` (new text on stdin), `teams-react <chatId> <messageId> <emoji>`, `teams-read <chatId>
+[--limit N] [--since ISO]`, `teams-pin <chatId> <messageId>`, `teams-unpin <chatId> <messageId>`,
+`teams-send-file <chatId>
 <path> [more paths...] [--caption "text"] [--grant-to <id>[,<id>...] | --no-grant]`,
 `teams-attachments <chatId> <messageId> [--list]
 [--name <filter>] [--out <dir>]` and `teams-delete <chatId> <messageId> [--undo] [--force]`.
@@ -451,7 +452,32 @@ code paths as the server tools — including the send reliability below. `--html
 caller is responsible for entity-escaping their own `<`, `>`, `&`; see the `teams-styling` plugin
 for the verified vocabulary. `--mention
 "Name"` (repeatable) @mentions that person, same resolution and placement rules as the
-`mentions` tool parameter — see "@mentions" above. `teams-send-file` uploads and shares one or
+`mentions` tool parameter — see "@mentions" above. Flags parse anywhere in argv on `teams-post`/
+`teams-reply`/`teams-edit`/`teams-send-file` — `teams-post --html <chatId>` and `teams-post
+<chatId> --html` are equivalent (0.7.2: the chat id used to be a fixed positional taken BEFORE
+flags were parsed, so a flag placed before it was silently misread as the chat id itself); a
+resolved chat id that still looks like a flag (starts with `--`) is refused rather than
+misparsed.
+
+**Plain-text guard (0.7.2, classifier corrected in two fix rounds, 2026-09-22).** `teams-post`/
+`teams-reply`/`teams-edit`, given a plain (no `--html`) body, refuse to send it (exit 2) rather
+than post it unstyled when it reads as three or more real sentences (a `.`/`!`/`?` only counts
+when followed by whitespace or the end of the body — a version number, filename, URL, decimal or
+path never trips this on its own; a short fixed list of abbreviations, `e.g.`/`i.e.`/Swedish
+`kl.`/`No.`, is exempted too), has a blank line, has a REAL pipe-table-looking line (a line that
+both starts and ends with a pipe — a shell pipeline like `cat x | grep y | head` does not count),
+or is long/many-lined enough on its own (4+ non-empty lines, or over 400 characters) that it is
+obviously not a short conversational reply. This closes the audit-measured failure mode: 31% of
+messages that should have been styled were, and the failure was purely one-directional (plain
+text going out unstyled), never the reverse. The refusal names the `teams-styling` skill, the
+correct invocation (chat id first, then `--html`), and the deliberate override, `--text`, which
+sends the body as plain text regardless of its shape. `--html` and `--text` together is an error.
+The guard runs AFTER the allowlist gate (a chat that fails allowlist still exits 3, never
+shadowed by the guard's exit 2). The guard is CLI-only — the MCP `send_chat_message`/
+`reply_chat_message`/`edit_chat_message` tools are unaffected; an agent driving the server
+directly is expected to have read the skill already (see its trigger list).
+
+`teams-send-file` uploads and shares one or
 more files in one call (one `send_chat_file` per path); `--caption` (optional, anywhere in argv)
 is shown above the FIRST file's card only, never repeated on every card. `--grant-to
 <id>[,<id>...]` (0.6.0) skips roster resolution entirely and grants read access to exactly the
@@ -465,7 +491,11 @@ downloads every downloadable attachment on a message into `--out` (else
 metadata instead and downloads nothing; `--name` narrows the download by case-insensitive
 substring — see "Downloading attachments" above for the sanitization, collision and permission
 story. `teams-read` includes each message's attachment metadata whenever there is any, so a
-script reading a chat can tell there is something to fetch. `teams-delete` soft-deletes one of
+script reading a chat can tell there is something to fetch, and (0.7.2) each message's `format`
+(`"html"` or `"text"`, derived from Graph's own `contentType`) — the flattened `text` field is
+unchanged, `format` is additive, and is what lets a script measure its own styling compliance
+from the read path instead of only from its own send-time records. `teams-delete` soft-deletes
+one of
 this account's own messages (`--undo` restores it; `--force` skips the own-message check) — see
 "Withdrawing a message" above. A consuming machine that keeps the `~/.teams-assistant/*.mjs`
 shim convention adds one more shim for it, `delete.mjs`, importing `dist/cli/delete.js` like
@@ -474,7 +504,9 @@ the others.
 Their output contract exists because of a real incident (2026-08-24): an ad-hoc wrapper's
 caller grepped for a success token the wrapper never printed, read eleven successful posts as
 eleven throttles, and re-posted a broadcast ten times. So: success is exactly one JSON line on
-stdout and exit 0; failure is prose on stderr and a non-zero exit (2 usage, 3 allowlist, 4
+stdout and exit 0; failure is prose on stderr and a non-zero exit (2 usage — including the
+plain-text guard's refusal and the flag-like-chat-id refusal above, both a caller-input problem
+the same shape as a bad flag; 3 allowlist; 4
 teams-delete's own-message check refusing — `MessageOwnershipError` — 1 anything else, a
 throttled `/me` during that same check included, since that is an ordinary Graph failure, not an
 ownership refusal). **Branch on the exit code, never on output text.** `teams-send-file` with

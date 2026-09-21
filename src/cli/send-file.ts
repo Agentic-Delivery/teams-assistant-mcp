@@ -23,9 +23,15 @@ const USAGE =
   '[--grant-to <id>[,<id>...] | --no-grant]';
 
 await run(async () => {
-  const chatId = process.argv[2];
+  // Flags parse anywhere in argv (C2, audit fix 2026-09-21): parseSendFileFlags already
+  // collects every non-flag positional, in order, into `paths` — feeding it the FULL argv
+  // (including the chat id) means `teams-send-file --caption "x" <chatId> <path>` resolves the
+  // same way as `teams-send-file <chatId> <path> --caption "x"`. The chat id is simply the
+  // first surviving positional; everything after it is the file list.
+  const { caption, paths: positionals, grantTo, noGrant } = parseSendFileFlags(process.argv.slice(2));
+  const chatId = positionals[0];
   if (!chatId) usage(USAGE);
-  const { caption, paths, grantTo, noGrant } = parseSendFileFlags(process.argv.slice(3));
+  const paths = positionals.slice(1);
   if (paths.length === 0) {
     usage(USAGE);
   }

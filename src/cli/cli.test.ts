@@ -25,7 +25,9 @@ import {
   parseDeleteFlags,
   parseSendFileFlags,
   parseSendFlags,
+  PlainTextRefusedError,
   run,
+  structuredTextReason,
   succeed,
   writeLine,
 } from './common.js';
@@ -39,7 +41,15 @@ interface CliRun {
   stderr: string;
 }
 
-function runCli(script: string, args: string[], env: Record<string, string>): Promise<CliRun> {
+// `stdin` defaults to a short, guard-safe body ("the message text" — zero sentence terminators,
+// no blank line, no pipe-table line) so every existing caller keeps getting the plain send it
+// always got; the C1 plain-text-guard tests below pass a deliberately structured body instead.
+function runCli(
+  script: string,
+  args: string[],
+  env: Record<string, string>,
+  stdin = 'the message text',
+): Promise<CliRun> {
   return new Promise((resolve) => {
     const child = execFile(
       tsx,
@@ -53,7 +63,7 @@ function runCli(script: string, args: string[], env: Record<string, string>): Pr
         });
       },
     );
-    child.stdin?.end('the message text');
+    child.stdin?.end(stdin);
   });
 }
 
@@ -66,6 +76,11 @@ function fixtureEnv(): Record<string, string> {
       assistantDisplayName: 'Assistant',
       allowedChats: [
         { id: '19:readonly@thread.v2', label: 'read-only chat', canPost: false },
+        // Postable (2026-09-22 fix round, review item 2): the C1 guard now runs AFTER
+        // allowlist.assertPostable, per the README's exit-code contract (3 before 2) — a
+        // subprocess test proving the GUARD fires (exit 2) needs a chat that clears the
+        // allowlist gate first, or it would only ever prove the allowlist gate fires (exit 3).
+        { id: '19:postable@thread.v2', label: 'postable chat', canPost: true },
       ],
     }),
   );
@@ -241,6 +256,493 @@ describe('the CLI contract — exit codes, and nothing but the JSON line on stdo
 
     expect(result.code).toBe(2);
     expect(result.stdout).toBe('');
+  });
+});
+
+// C2 (audit fix, 2026-09-21): chatId used to be taken as the fixed positional argv[2], BEFORE
+// any flag parsing ran — `post.mjs --html <chat>` consumed "--html" itself as the chat id and
+// the real chat id was silently dropped, producing a misleading allowlist error that named
+// "--html", not the chat the caller meant. Flags now parse across the whole argv first; the
+// first surviving positional is the chat id, in whichever position the caller put it.
+describe('C2 — flags parse anywhere in argv; a flag-like resolved chat id is refused', () => {
+  it('C2a: teams-post --html <chatId> resolves the REAL chat id, not "--html" (stderr names the real chat)', async () => {
+    const result = await runCli('post.ts', ['--html', '19:readonly@thread.v2'], fixtureEnv());
+
+    expect(result.code).toBe(3);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('19:readonly@thread.v2');
+    expect(result.stderr).not.toContain('Chat --html');
+  });
+
+  it('C2b: teams-reply --html <chatId> <messageId> resolves the REAL chat id the same way', async () => {
+    const result = await runCli(
+      'reply.ts',
+      ['--html', '19:readonly@thread.v2', 'msg-1'],
+      fixtureEnv(),
+    );
+
+    expect(result.code).toBe(3);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('19:readonly@thread.v2');
+    expect(result.stderr).not.toContain('Chat --html');
+  });
+
+  it('C2c: teams-edit --html <chatId> <messageId> resolves the REAL chat id the same way', async () => {
+    const result = await runCli(
+      'edit.ts',
+      ['--html', '19:readonly@thread.v2', 'msg-1'],
+      fixtureEnv(),
+    );
+
+    expect(result.code).toBe(3);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('19:readonly@thread.v2');
+    expect(result.stderr).not.toContain('Chat --html');
+  });
+
+  it('C2d: teams-send-file --caption "hi" <chatId> <path> resolves the REAL chat id the same way', async () => {
+    const result = await runCli(
+      'send-file.ts',
+      ['--caption', 'hi', '19:readonly@thread.v2', '/tmp/does-not-matter.txt'],
+      fixtureEnv(),
+    );
+
+    expect(result.code).toBe(3);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('19:readonly@thread.v2');
+  });
+
+  // Non-triggering side: ordinary "chat id first" invocations are completely unaffected.
+  it('C2e: teams-post <chatId> --html still works exactly as before (order does not matter)', async () => {
+    const result = await runCli('post.ts', ['19:readonly@thread.v2', '--html'], fixtureEnv());
+
+    expect(result.code).toBe(3);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('19:readonly@thread.v2');
+  });
+
+  it('C2f: teams-post --bogus (an unrecognised flag left with nothing after it) refuses naming the flag-first mistake', async () => {
+    const result = await runCli('post.ts', ['--bogus'], fixtureEnv());
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toBe('that looks like a flag; the chat id comes first\n');
+  });
+
+  it('C2g: teams-reply --bogus msg-1 — same refusal on the reply CLI', async () => {
+    const result = await runCli('reply.ts', ['--bogus', 'msg-1'], fixtureEnv());
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toBe('that looks like a flag; the chat id comes first\n');
+  });
+
+  // No send-file equivalent of C2f/C2g: parseSendFileFlags (unlike parseSendFlags) already
+  // refuses any UNRECOGNISED --flag outright, immediately, regardless of position (see its own
+  // doc comment) — so an unrecognised flag can never reach send-file.ts's positional-resolution
+  // step in the first place to be mistaken for the chat id. A RECOGNISED flag before the chat id
+  // (--caption, --grant-to, --no-grant) is exactly the C2d shape above, already covered.
+});
+
+// C1 (audit fix, 2026-09-21, the audit's highest-leverage fix): the highest-measured failure was
+// plain text going out for bodies that should have been styled — 31% overall compliance, and a
+// 4.8x gap between sessions that had loaded the teams-styling skill and ones that hadn't. This
+// guard makes the refusal happen at the one place guaranteed to run regardless of whether the
+// skill was ever read: the CLI send path itself.
+describe('C1 — plain-text guard (subprocess: exit codes and the refusal message)', () => {
+  const threeSentences = 'First sentence. Second sentence. Third sentence.';
+  const blankLineBody = 'First line.\n\nSecond line.';
+  const tableLikeBody = '| a | b |\n| 1 | 2 |';
+  // Postable (see fixtureEnv) — the fix-round reorder (review item 2) means the guard only
+  // fires after assertPostable passes, so every test that means to PROVE THE GUARD fires needs
+  // a chat that clears the allowlist gate first.
+  const postable = '19:postable@thread.v2';
+
+  it('C1a: a plain 3-sentence body with no --html/--text is refused, exit 2', async () => {
+    const result = await runCli('post.ts', [postable], fixtureEnv(), threeSentences);
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/teams-styling/);
+    // (b) the correct invocation shape — chat id first, then --html — not the trap order.
+    expect(result.stderr).toMatch(/teams-post 19:postable@thread\.v2 --html/);
+    expect(result.stderr).not.toMatch(/--html 19:postable@thread\.v2/);
+    // (c) the deliberate override is named.
+    expect(result.stderr).toMatch(/teams-post 19:postable@thread\.v2 --text/);
+  });
+
+  // C1b and C1c were DELETED here (review round 2, BLOCKER 2): both ran against the read-only
+  // chat, which exits 3 at allowlist.assertPostable REGARDLESS of what the guard/override do —
+  // a classifier that refuses EVERYTHING, or an override that does nothing at all, would have
+  // left both green (reviewer-verified: mutation M-B, "refuse everything", leaves them green).
+  // The "2-sentence body is not refused" claim is carried by the structuredTextReason corpus
+  // test below (the exact 'One sentence. Two sentences.' row); the "--text overrides the guard"
+  // claim is carried by the in-process 'doPost: html=false, plainTextOverride=true...' test
+  // above, which uses the POSTABLE chat and an unwrapped 3-sentence body — a real trigger the
+  // override must actually suppress, not a chat that would have exited 3 either way.
+
+  it('C1d: --html and --text together is an error, exit 2', async () => {
+    const result = await runCli(
+      'post.ts',
+      ['19:readonly@thread.v2', '--html', '--text'],
+      fixtureEnv(),
+    );
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/mutually exclusive/);
+  });
+
+  // C1e was DELETED here (review round 2, BLOCKER 2): same "unconditional allowlist exit" flaw
+  // as C1b/C1c above, for the "--html bypasses the guard" claim — that claim is now carried by
+  // the in-process 'doPost/doReply/doEdit: html=true, body whose terminators ARE followed by
+  // whitespace...' tests (see the describe block above this one), which use a body that would
+  // genuinely trip the guard were html not bypassing it, and assert the html send method itself
+  // ran — reviewer-verified against mutation M-G (`if (html || override)` -> `if (override)`).
+
+  it('C1f: a body with a blank line is refused even with fewer than 3 sentence terminators', async () => {
+    const result = await runCli('post.ts', [postable], fixtureEnv(), blankLineBody);
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/blank line/);
+  });
+
+  it('C1g: a body with a REAL pipe-table-looking line is refused', async () => {
+    const result = await runCli('post.ts', [postable], fixtureEnv(), tableLikeBody);
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/pipe-table/);
+  });
+
+  it('C1h: teams-reply applies the same guard, naming teams-reply\'s own invocation shape', async () => {
+    const result = await runCli('reply.ts', [postable, 'msg-1'], fixtureEnv(), threeSentences);
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/teams-styling/);
+    expect(result.stderr).toMatch(/teams-reply 19:postable@thread\.v2 msg-1 --html/);
+    expect(result.stderr).toMatch(/teams-reply 19:postable@thread\.v2 msg-1 --text/);
+  });
+
+  it('C1i: teams-edit applies the same guard, naming teams-edit\'s own invocation shape', async () => {
+    const result = await runCli('edit.ts', [postable, 'msg-1'], fixtureEnv(), threeSentences);
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/teams-styling/);
+    expect(result.stderr).toMatch(/teams-edit 19:postable@thread\.v2 msg-1 --html/);
+    expect(result.stderr).toMatch(/teams-edit 19:postable@thread\.v2 msg-1 --text/);
+  });
+
+  // C1j was DELETED here (review round 2, BLOCKER 2, reviewer evidence): all 6 rows ran the
+  // reviewer's bodies against the READ-ONLY chat and asserted exit 3 — which
+  // allowlist.assertPostable produces UNCONDITIONALLY for that chat, before the guard ever runs.
+  // Reverting to the naive round-1 terminator count (the exact MAJOR this was meant to catch)
+  // left every C1j row green; only the structuredTextReason unit corpus rows below went red. The
+  // six reviewer bodies are pinned there instead — as `notStructured` rows in the
+  // 'structuredTextReason — the plain-text guard's classifier' describe block further down —
+  // where the classifier's actual return value is asserted directly, not shadowed by an
+  // allowlist gate that would produce the same exit code however the classifier behaved. (A
+  // postable-chat + "code !== 2 && no /refusing to send/" version was considered and rejected:
+  // it requires a real Graph/token-acquisition attempt with fake credentials past the guard,
+  // which is slow and non-deterministic in a test environment — see this file's own
+  // "no network reached" doctrine throughout the rest of this describe block.)
+
+  // C1k (fix round, review item 2): the guard now runs AFTER allowlist.assertPostable, per the
+  // README's documented exit-code contract (3 before 2) — a chat that fails the allowlist gate
+  // must exit 3 even when its body would ALSO have tripped the plain-text guard; the guard never
+  // gets the chance to run.
+  it('C1k: a non-postable chat with a structured body exits 3 (allowlist), not 2 (the guard never runs)', async () => {
+    const result = await runCli('post.ts', ['19:readonly@thread.v2'], fixtureEnv(), threeSentences);
+
+    expect(result.code).toBe(3);
+    expect(result.stdout).toBe('');
+  });
+});
+
+describe('structuredTextReason — the plain-text guard\'s classifier (C1, fix round 2026-09-22)', () => {
+  // Table-driven corpus (review item 3, root cause of the MAJOR): a plain assertion per case
+  // would not have caught the naive-terminator-count bug, because none of the ORIGINAL tests
+  // exercised a realistic body containing a version number/URL/path/decimal/filename — every
+  // case here is a REAL message shape, not a synthetic "One. Two. Three." Each row states the
+  // reason a human would give for the expected verdict, so a future classifier tweak that
+  // breaks one of these fails with that reason visible in the test name.
+  const notStructured: Array<[string, string]> = [
+    ['no terminator here', 'no terminator, no blank line, no table line'],
+    ['One sentence.', 'a single real sentence'],
+    ['One sentence. Two sentences.', 'exactly two real sentences — the skill\'s own threshold'],
+    ['Shipped teams-assistant-mcp v0.7.2 to the server.', 'a version number\'s dots are not sentence ends'],
+    ['See findings.md and notes.md in the workspace.', 'filenames\' dots are not sentence ends'],
+    ['The build is at https://dev.azure.com/if/CTP/_build?id=42.', 'a URL\'s dots are not sentence ends'],
+    ['Compliance moved from 30.9 percent to 48.0 percent.', 'decimal points are not sentence ends'],
+    ['Config lives at /home/johan/.claude/settings.json and .env.', 'a path\'s dots are not sentence ends'],
+    ['Run: cat x | grep y | head', 'a shell pipeline is not a table row (no leading/trailing pipe)'],
+    ['a | b', 'a single mid-line pipe is not a table row'],
+    ['See e.g. the notes.', 'a lone abbreviation does not by itself reach the 3-terminator threshold'],
+    ['It costs $3.50 per unit.', 'a currency decimal is not a sentence end'],
+    ['Node v20.11.0 shipped.', 'a semver\'s dots are not sentence ends'],
+    // MINOR 2 (review round 2): abbreviation-final dots ARE followed by whitespace, so the base
+    // lookahead alone counts them as real terminators — these would each be 3 raw terminators
+    // without the explicit exemption list below, and 2 with it.
+    ['Send it e.g. tomorrow morning. Thanks.', '"e.g." is on the abbreviation exemption list'],
+    ['Note i.e. this matters a lot. OK.', '"i.e." is on the abbreviation exemption list'],
+    ['Meet kl. 14.30 today. See you.', 'Swedish "kl." (klockan) is on the abbreviation exemption list'],
+    ['See No. 42 in the list. Thanks.', '"No." (capital N) is on the abbreviation exemption list'],
+  ];
+  it.each(notStructured)('NOT structured: %j (%s)', (text) => {
+    expect(structuredTextReason(text)).toBeUndefined();
+  });
+
+  const structured: Array<[string, string]> = [
+    ['One. Two. Three.', 'three real sentence terminators, each followed by whitespace'],
+    ['Really? Yes! Confirmed.', 'a mix of . ! ? still counts toward the 3-terminator threshold'],
+    ['Done! Ready for review? Yes.', 'three genuinely separate real sentences'],
+    ['first line\n\nsecond line', 'a blank line, even with zero sentence terminators'],
+    ['| a | b |', 'a real single-row table line (starts AND ends with a pipe)'],
+    ['| a | b |\n| 1 | 2 |', 'a real two-row markdown table'],
+    [
+      Array.from({ length: 10 }, (_, i) => `- item ${i}`).join('\n'),
+      'a 10-line bulleted list with no terminators and no blank lines at all (recall gap, review item 1)',
+    ],
+    [
+      Array.from({ length: 200 }, (_, i) => `word${i}`).join(' ') + '.',
+      'a 200-word single paragraph with only one terminator (recall gap, review item 1)',
+    ],
+    // MINOR 2 (review round 2): the exemption list must not defeat real detection — a body with
+    // an exempted abbreviation PLUS enough genuine sentences to still cross the threshold must
+    // still refuse.
+    [
+      'See e.g. the file. It works well. Great job. Thanks.',
+      'one exempted "e.g." plus four real sentences — still well over the threshold',
+    ],
+    // The deliberate case-sensitivity boundary on "No." (capital N only): the common lowercase
+    // word "no." ending an ordinary sentence must NOT be silently exempted.
+    [
+      'I said no. Then I left. It happened fast.',
+      'lowercase "no." is an ordinary word, not the "No." abbreviation — three real sentences',
+    ],
+  ];
+  it.each(structured)('structured: %j (%s)', (text) => {
+    expect(structuredTextReason(text)).toBeDefined();
+  });
+});
+
+describe('doPost / doReply / doEdit — the plain-text guard (in-process, no subprocess, no network — C1)', () => {
+  function fakePort(overrides: Partial<TeamsChatsPort>): TeamsChatsPort {
+    const reject = () => Promise.reject(new Error('not part of this test'));
+    return {
+      listChats: reject,
+      readMessages: async () => ({ messages: [] }) as unknown as ReadResult,
+      resolveMentions: reject,
+      sendMessage: reject,
+      sendHtmlMessage: reject,
+      sendImage: reject,
+      sendFile: reject,
+      replyToMessage: reject,
+      replyToHtmlMessage: reject,
+      editMessage: reject,
+      editHtmlMessage: reject,
+      deleteMessage: reject,
+      undoDeleteMessage: reject,
+      setReaction: reject,
+      getAttachment: reject,
+      listAttachments: reject,
+      getAttachments: reject,
+      pinMessage: reject,
+      unpinMessage: reject,
+      listPinnedMessages: reject,
+      ...overrides,
+    } as TeamsChatsPort;
+  }
+
+  const allowlist = new ChatAllowlist([{ id: '19:a@thread.v2', label: 'chat A', canPost: true }]);
+  const structured = 'First sentence. Second sentence. Third sentence.';
+  // BLOCKER 1 (review round 2): `<p>${structured}</p>` (used below) is a WEAK html=true repro —
+  // its third terminator is followed by "</p>" (the closing tag), not whitespace, so it never
+  // reaches the 3-terminator threshold in the first place; mutating `if (html || override)` to
+  // `if (override)` (--html no longer bypasses the guard) left that test green by accident. This
+  // body's three terminators are each followed by a real space, so it WOULD trip the guard were
+  // html not bypassing it — the mutation must turn this test red.
+  const structuredWithWhitespaceTerminators = '<div>One. Two. Three. </div>';
+
+  it('doPost: html=false, no override, structured text — rejects with PlainTextRefusedError BEFORE any send', async () => {
+    const sendMessage = vi.fn();
+    const sendHtmlMessage = vi.fn();
+    const chats = new ReliableTeamsChats(fakePort({ sendMessage, sendHtmlMessage }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    await expect(doPost({ chats, allowlist }, '19:a@thread.v2', structured, false)).rejects.toThrow(
+      PlainTextRefusedError,
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(sendHtmlMessage).not.toHaveBeenCalled();
+  });
+
+  it('doPost: html=true, structured text — the guard does not apply, sendHtmlMessage still runs', async () => {
+    const sendHtmlMessage = vi.fn(async () => ({
+      id: 'm1',
+      chatId: '19:a@thread.v2',
+      createdDateTime: '2026-09-21T10:00:00Z',
+      from: 'Assistant',
+      text: '',
+      isDeleted: false,
+      attachments: [],
+    }));
+    const chats = new ReliableTeamsChats(fakePort({ sendHtmlMessage }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    const result = await doPost({ chats, allowlist }, '19:a@thread.v2', `<p>${structured}</p>`, true);
+
+    expect(sendHtmlMessage).toHaveBeenCalledWith('19:a@thread.v2', `<p>${structured}</p>`, []);
+    expect(result).toEqual({ action: 'post', id: 'm1', chat: 'chat A' });
+  });
+
+  // BLOCKER 1 fix (review round 2): the load-bearing case the test above accidentally could not
+  // catch — see structuredWithWhitespaceTerminators' own comment. Kill verified against mutation
+  // M-G (`if (html || override)` -> `if (override)`) below.
+  it('doPost: html=true, body whose terminators ARE followed by whitespace — the guard still does not apply, sendHtmlMessage still runs', async () => {
+    const sendHtmlMessage = vi.fn(async () => ({
+      id: 'm1b',
+      chatId: '19:a@thread.v2',
+      createdDateTime: '2026-09-22T10:00:00Z',
+      from: 'Assistant',
+      text: '',
+      isDeleted: false,
+      attachments: [],
+    }));
+    const chats = new ReliableTeamsChats(fakePort({ sendHtmlMessage }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    const result = await doPost(
+      { chats, allowlist },
+      '19:a@thread.v2',
+      structuredWithWhitespaceTerminators,
+      true,
+    );
+
+    expect(sendHtmlMessage).toHaveBeenCalledWith(
+      '19:a@thread.v2',
+      structuredWithWhitespaceTerminators,
+      [],
+    );
+    expect(result).toEqual({ action: 'post', id: 'm1b', chat: 'chat A' });
+  });
+
+  it('doPost: html=false, plainTextOverride=true, structured text — the override bypasses the guard, sendMessage still runs', async () => {
+    const sendMessage = vi.fn(async () => ({
+      id: 'm2',
+      chatId: '19:a@thread.v2',
+      createdDateTime: '2026-09-21T10:00:00Z',
+      from: 'Assistant',
+      text: '',
+      isDeleted: false,
+      attachments: [],
+    }));
+    const chats = new ReliableTeamsChats(fakePort({ sendMessage }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    const result = await doPost({ chats, allowlist }, '19:a@thread.v2', structured, false, [], {
+      plainTextOverride: true,
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith('19:a@thread.v2', structured, []);
+    expect(result).toEqual({ action: 'post', id: 'm2', chat: 'chat A' });
+  });
+
+  it('doReply: html=false, no override, structured text — rejects with PlainTextRefusedError BEFORE any send', async () => {
+    const replyToMessage = vi.fn();
+    const chats = new ReliableTeamsChats(fakePort({ replyToMessage }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    await expect(
+      doReply({ chats, allowlist }, '19:a@thread.v2', 'orig-1', structured, false),
+    ).rejects.toThrow(PlainTextRefusedError);
+    expect(replyToMessage).not.toHaveBeenCalled();
+  });
+
+  // BLOCKER 1 fix (review round 2): same whitespace-terminator repro as doPost above, on the
+  // reply path.
+  it('doReply: html=true, body whose terminators ARE followed by whitespace — the guard still does not apply, replyToHtmlMessage still runs', async () => {
+    const replyToHtmlMessage = vi.fn(async () => ({
+      id: 'r1b',
+      chatId: '19:a@thread.v2',
+      createdDateTime: '2026-09-22T10:00:00Z',
+      from: 'Assistant',
+      text: '',
+      isDeleted: false,
+      attachments: [],
+    }));
+    const chats = new ReliableTeamsChats(fakePort({ replyToHtmlMessage }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    const result = await doReply(
+      { chats, allowlist },
+      '19:a@thread.v2',
+      'orig-1',
+      structuredWithWhitespaceTerminators,
+      true,
+    );
+
+    expect(replyToHtmlMessage).toHaveBeenCalledWith(
+      '19:a@thread.v2',
+      'orig-1',
+      structuredWithWhitespaceTerminators,
+      [],
+    );
+    expect(result).toEqual({ action: 'reply', id: 'r1b', inReplyTo: 'orig-1', chat: 'chat A' });
+  });
+
+  it('doEdit: html=false, no override, structured text — rejects with PlainTextRefusedError BEFORE any send', async () => {
+    const editMessage = vi.fn();
+    const chats = new ReliableTeamsChats(fakePort({ editMessage }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    await expect(
+      doEdit({ chats, allowlist }, '19:a@thread.v2', 'msg-1', structured, false),
+    ).rejects.toThrow(PlainTextRefusedError);
+    expect(editMessage).not.toHaveBeenCalled();
+  });
+
+  // BLOCKER 1 fix (review round 2): same whitespace-terminator repro as doPost above, on the
+  // edit path.
+  it('doEdit: html=true, body whose terminators ARE followed by whitespace — the guard still does not apply, editHtmlMessage still runs', async () => {
+    const editHtmlMessage = vi.fn(async () => undefined);
+    const chats = new ReliableTeamsChats(fakePort({ editHtmlMessage }), {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    const result = await doEdit(
+      { chats, allowlist },
+      '19:a@thread.v2',
+      'msg-1',
+      structuredWithWhitespaceTerminators,
+      true,
+    );
+
+    expect(editHtmlMessage).toHaveBeenCalledWith(
+      '19:a@thread.v2',
+      'msg-1',
+      structuredWithWhitespaceTerminators,
+      [],
+    );
+    expect(result).toEqual({ action: 'edit', id: 'msg-1', chat: 'chat A' });
   });
 });
 
@@ -839,22 +1341,31 @@ describe('writeLine() — the per-file streaming primitive teams-send-file uses 
   });
 });
 
-describe('parseSendFlags — --html and repeatable --mention', () => {
+describe('parseSendFlags — --html, --text and repeatable --mention', () => {
+  // `text: false` added to every pre-existing toEqual below (2026-09-21, C1): the return shape
+  // grew a `text` field for the new --text override flag — the schema change breaks the exact
+  // toEqual match, not any behaviour these particular cases exercise.
   it('finds no flags in an empty argv', () => {
-    expect(parseSendFlags([])).toEqual({ html: false, mentions: [], rest: [] });
+    expect(parseSendFlags([])).toEqual({ html: false, text: false, mentions: [], rest: [] });
   });
 
   it('finds a bare --html', () => {
-    expect(parseSendFlags(['--html'])).toEqual({ html: true, mentions: [], rest: [] });
+    expect(parseSendFlags(['--html'])).toEqual({ html: true, text: false, mentions: [], rest: [] });
+  });
+
+  // C1: --text is the plain-text guard's deliberate override, same bare-flag shape as --html.
+  it('finds a bare --text', () => {
+    expect(parseSendFlags(['--text'])).toEqual({ html: false, text: true, mentions: [], rest: [] });
   });
 
   it('collects one --mention', () => {
-    expect(parseSendFlags(['--mention', 'Mika'])).toEqual({ html: false, mentions: ['Mika'], rest: [] });
+    expect(parseSendFlags(['--mention', 'Mika'])).toEqual({ html: false, text: false, mentions: ['Mika'], rest: [] });
   });
 
   it('collects several repeated --mention flags, in order', () => {
     expect(parseSendFlags(['--mention', 'Mika', '--mention', 'Johan'])).toEqual({
       html: false,
+      text: false,
       mentions: ['Mika', 'Johan'],
       rest: [],
     });
@@ -863,13 +1374,19 @@ describe('parseSendFlags — --html and repeatable --mention', () => {
   it('mixes --html and --mention in any order', () => {
     expect(parseSendFlags(['--mention', 'Mika', '--html'])).toEqual({
       html: true,
+      text: false,
       mentions: ['Mika'],
       rest: [],
     });
   });
 
   it('leaves unrecognised arguments in rest, untouched', () => {
-    expect(parseSendFlags(['--weird', 'value'])).toEqual({ html: false, mentions: [], rest: ['--weird', 'value'] });
+    expect(parseSendFlags(['--weird', 'value'])).toEqual({
+      html: false,
+      text: false,
+      mentions: [],
+      rest: ['--weird', 'value'],
+    });
   });
 });
 
@@ -1439,8 +1956,8 @@ describe('teams-read — attachment metadata in the output (0.5.0: a file used t
 
   it('doRead includes id/name/contentType when a message carries attachments, and omits the field when not', async () => {
     const messages: ChatMessage[] = [
-      { id: 'm1', chatId: '19:r@thread.v2', createdDateTime: '2026-09-02T08:00:00Z', from: 'Maja', text: 'plain', isDeleted: false, attachments: [] },
-      { id: 'm2', chatId: '19:r@thread.v2', createdDateTime: '2026-09-02T08:01:00Z', from: 'Maja', text: 'file attached', isDeleted: false,
+      { id: 'm1', chatId: '19:r@thread.v2', createdDateTime: '2026-09-02T08:00:00Z', from: 'Maja', text: 'plain', isDeleted: false, attachments: [], format: 'text' },
+      { id: 'm2', chatId: '19:r@thread.v2', createdDateTime: '2026-09-02T08:01:00Z', from: 'Maja', text: 'file attached', isDeleted: false, format: 'html',
         attachments: [{ id: 'att-1', name: 'plan.xlsx', contentType: 'reference', contentUrl: 'https://x/p' }] },
     ];
     const readMessages = vi.fn(async () => ({ messages }) as ReadResult);
@@ -1459,6 +1976,60 @@ describe('teams-read — attachment metadata in the output (0.5.0: a file used t
     expect(result.messages[1]?.attachments).toEqual([
       { id: 'att-1', name: 'plan.xlsx', contentType: 'reference' },
     ]);
+  });
+
+  // C3 (audit fix, 2026-09-21): messages.ts:184 used to flatten HTML and discard contentType,
+  // so a caller reading back its own sends could never tell whether the plain-text guard (C1)
+  // was actually being honoured — this is the field the harvest ritual now measures compliance
+  // from. Additive only: `text` keeps carrying the exact same flattened string as before either
+  // way (asserted below), `format` is the new field.
+  it('C3a: an html-contentType message reads back format: "html", text still flattened the same way', async () => {
+    const messages: ChatMessage[] = [
+      {
+        id: 'm3',
+        chatId: '19:r@thread.v2',
+        createdDateTime: '2026-09-21T08:00:00Z',
+        from: 'Assistant',
+        text: 'Styled update\nSecond line',
+        isDeleted: false,
+        attachments: [],
+        format: 'html',
+      },
+    ];
+    const readMessages = vi.fn(async () => ({ messages }) as ReadResult);
+    const chats = new ReliableTeamsChats({ readMessages } as unknown as TeamsChatsPort, {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    const result = await doRead({ chats, allowlist }, '19:r@thread.v2', { limit: 5 });
+
+    expect(result.messages[0]).toMatchObject({ format: 'html', text: 'Styled update\nSecond line' });
+  });
+
+  // C3b: the non-triggering side — a plain-contentType message reads back format: "text".
+  it('C3b: a text-contentType message reads back format: "text"', async () => {
+    const messages: ChatMessage[] = [
+      {
+        id: 'm4',
+        chatId: '19:r@thread.v2',
+        createdDateTime: '2026-09-21T08:00:00Z',
+        from: 'Assistant',
+        text: 'plain update',
+        isDeleted: false,
+        attachments: [],
+        format: 'text',
+      },
+    ];
+    const readMessages = vi.fn(async () => ({ messages }) as ReadResult);
+    const chats = new ReliableTeamsChats({ readMessages } as unknown as TeamsChatsPort, {
+      selfDisplayName: 'Assistant',
+      sleepFn: async () => {},
+    });
+
+    const result = await doRead({ chats, allowlist }, '19:r@thread.v2', { limit: 5 });
+
+    expect(result.messages[0]).toMatchObject({ format: 'text', text: 'plain update' });
   });
 });
 

@@ -16,10 +16,11 @@ import { MessageOwnershipError, type MentionTarget, type PinnedMessage } from '.
  * The output contract is the whole point, learned the hard way on 2026-08-24 when a caller
  * grepped for a success token the old ad-hoc script never printed and re-posted a broadcast
  * ten extra times: SUCCESS is exactly one JSON line on stdout and exit 0 — nothing else ever
- * reaches stdout. Failure is prose on stderr and a non-zero exit (2 usage, 3 allowlist,
- * 4 ownership refusal — teams-delete's own-message gate, MessageOwnershipError, FINDING 4 of the
- * message-withdrawal review — 1 everything else). Callers branch on the exit code, never on
- * output text.
+ * reaches stdout. Failure is prose on stderr and a non-zero exit (2 usage — including the C1
+ * plain-text guard below, PlainTextRefusedError, a caller-input problem the same shape as a bad
+ * flag; 3 allowlist; 4 ownership refusal — teams-delete's own-message gate, MessageOwnershipError,
+ * FINDING 4 of the message-withdrawal review — 1 everything else). Callers branch on the exit
+ * code, never on output text.
  *
  * ONE exception, documented here rather than only in README/SETUP (2026-09-02 re-review MINOR —
  * a contract stated once in the code it governs, not just in the docs describing it): teams-
@@ -41,19 +42,28 @@ export function buildContext(): CliContext {
 }
 
 /**
- * Parses the flags teams-post and teams-edit share off their trailing argv: `--html` (a bare
- * flag) and repeatable `--mention <name>` (one name per occurrence, in order). Anything else is
- * left in `rest` untouched — callers that take positional args after the chat/message ids
- * (none currently do) are free to inspect it.
+ * Parses the flags teams-post, teams-reply and teams-edit share, ANYWHERE in their argv (C2,
+ * audit fix 2026-09-21 — the caller-facing entry points feed this the WHOLE trailing argv,
+ * chat/message id included, and take their positionals off `rest`; see post.ts/reply.ts/edit.ts):
+ * `--html` (a bare flag), `--text` (a bare flag, the deliberate plain-text override for the
+ * guard in doPost/doReply/doEdit below — see common.ts's CliContext doc comment for the exit
+ * code), and repeatable `--mention <name>` (one name per occurrence, in order). `--html` and
+ * `--text` together is refused — the caller must pick one. Anything else (including the
+ * chat/message id) is left in `rest`, in order, untouched.
  */
-export function parseSendFlags(args: readonly string[]): { html: boolean; mentions: string[]; rest: string[] } {
+export function parseSendFlags(
+  args: readonly string[],
+): { html: boolean; text: boolean; mentions: string[]; rest: string[] } {
   let html = false;
+  let text = false;
   const mentions: string[] = [];
   const rest: string[] = [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (arg === '--html') {
       html = true;
+    } else if (arg === '--text') {
+      text = true;
     } else if (arg === '--mention') {
       const value = args[i + 1];
       // A missing value AND a flag-like value ("--mention --html", the next flag swallowed as
@@ -73,7 +83,13 @@ export function parseSendFlags(args: readonly string[]): { html: boolean; mentio
       rest.push(arg as string);
     }
   }
-  return { html, mentions, rest };
+  if (html && text) {
+    usage(
+      '--html and --text are mutually exclusive: --html sends styled markup, --text forces ' +
+        'plain text regardless of length. Pick one.',
+    );
+  }
+  return { html, text, mentions, rest };
 }
 
 /**
@@ -249,6 +265,7 @@ export async function doRead(
     from: string;
     deleted: boolean;
     text: string;
+    format: 'html' | 'text';
     attachments?: Array<{ id: string; name?: string; contentType?: string }>;
   }>;
 }> {
@@ -263,6 +280,13 @@ export async function doRead(
       from: m.from,
       deleted: m.isDeleted,
       text: m.text,
+      // C3 (audit fix, 2026-09-21): additive only — `text` above is still the exact same
+      // flattened string as before; `format` is the new field, derived by toChatMessage
+      // (messages.ts) from Graph's body.contentType. `m.format` is only optional on ChatMessage
+      // for hand-built fixtures elsewhere that never reach this path; anything actually read
+      // from Graph always has it set, but the ternary mirrors toChatMessage's own "not literally
+      // html ⇒ text" rule rather than assuming that.
+      format: m.format === 'html' ? 'html' : 'text',
       ...(m.attachments.length > 0
         ? {
             attachments: m.attachments.map((a) => ({
@@ -361,6 +385,125 @@ async function resolveMentions(
 }
 
 /**
+ * Thrown by the C1 plain-text guard below (doPost/doReply/doEdit) when a plain (html === false)
+ * body looks structured and no override was given. `run()` maps it to exit 2 — the same "bad
+ * caller input" bucket as every other usage() refusal — NOT process.exit itself: doPost/doReply/
+ * doEdit are called directly, in-process, by this file's own unit tests (no subprocess), so a
+ * process.exit() here would kill the test runner instead of failing one assertion.
+ */
+export class PlainTextRefusedError extends Error {}
+
+// A REAL markdown/pipe-table row: the line both STARTS and ENDS with a pipe (ignoring leading/
+// trailing whitespace), e.g. "| a | b |" or "|---|---|" — narrower than "any line with two
+// pipes" (fix round, 2026-09-22, BLOCKING MAJOR review round 1: a shell pipeline like
+// "cat x | grep y | head" has two pipes on one line but is not a table row — it starts with
+// "cat" and ends with "head", neither a pipe).
+const TABLE_LIKE_LINE = /^[ \t]*\|.*\|[ \t]*$/m;
+// A run of two or more newlines — Teams renders a blank-line-separated body as multiple
+// paragraphs, itself a styling decision the skill says needs <div>&nbsp;</div> air, not a
+// plain-text double linebreak.
+const BLANK_LINE = /\n[ \t]*\r?\n/;
+// A . ! ? only counts as a candidate sentence terminator when it is followed by whitespace or
+// the end of the string. Fix round, 2026-09-22 (BLOCKING MAJOR, review round 1): counting every
+// literal . ! ? character refused ordinary one-sentence status posts containing a version number
+// ("v0.7.2"), a filename ("findings.md"), a URL, a decimal ("30.9 percent"), or a path — a
+// decimal/semver/extension dot is by construction never followed by whitespace (the next
+// character is a digit or letter), so this lookahead excludes those for free, with no maintained
+// list. It does NOT exclude a genuine sentence-ending abbreviation ("e.g. ", "kl. ") — those ARE
+// followed by whitespace, so they still match here; ABBREVIATION_TERMINATOR_CI/CS below (fix
+// round, 2026-09-22, review round 2, MINOR 2) subtract the short fixed list of those out of the
+// count separately, rather than trying to make this one regex do both jobs.
+const SENTENCE_TERMINATOR = /[.!?](?=\s|$)/g;
+// A short, deliberately non-exhaustive list of abbreviations whose final dot reads as a sentence
+// terminator by the rule above (it IS followed by whitespace) but isn't one. Case-insensitive for
+// "e.g."/"i.e."/Swedish "kl." (klockan, a time-of-day marker, e.g. "kl. 14.30"); "No." (as in
+// "item No. 42") is deliberately case-SENSITIVE (capital N only) so the common word "no." ending
+// an ordinary sentence ("I said no. Then I left.") is not silently exempted. This is a known,
+// bounded gap, not a general abbreviation detector — MINOR 2, review round 2.
+const ABBREVIATION_TERMINATOR_CI = /\b(?:e\.g|i\.e|kl)\.(?=\s|$)/gi;
+const ABBREVIATION_TERMINATOR_CS = /\bNo\.(?=\s|$)/g;
+
+function countAbbreviationTerminators(text: string): number {
+  const ci = text.match(ABBREVIATION_TERMINATOR_CI)?.length ?? 0;
+  const cs = text.match(ABBREVIATION_TERMINATOR_CS)?.length ?? 0;
+  return ci + cs;
+}
+// Recall gap (fix round, 2026-09-22, review item 1): a body can be structured with NO
+// terminators and NO blank line at all — a bulleted list (one short line per item, nothing to
+// end a "sentence") or a very long single paragraph. Thresholds picked well clear of the
+// reviewer's six one-liner repro bodies (max 59 characters, 1 line each) and well under a
+// realistic long paragraph (a 200-word paragraph runs ~1500 characters) — see the corpus test
+// for both boundaries exercised together.
+const MANY_LINES_THRESHOLD = 4;
+const LONG_BODY_THRESHOLD = 400;
+
+/**
+ * Classifies a plain-text body against the teams-styling skill's own threshold ("more than two
+ * sentences ⇒ not plain text"): three or more sentence terminators (. ! ?, each followed by
+ * whitespace or end-of-string, MINUS the short fixed list of abbreviation-final dots that shape
+ * also matches — see ABBREVIATION_TERMINATOR_CI/CS above), OR any blank line, OR a real
+ * pipe-table-looking line, OR the body is long/many-lined enough that it is obviously not a short
+ * conversational reply even with none of the above. Returns the reason phrase to quote in the
+ * refusal, or undefined when the body is short/plain enough to send as-is. C1 (audit fix,
+ * 2026-09-21; classifier corrected in the 2026-09-22 fix rounds after review found the naive
+ * terminator count over-triggered on ordinary operational text, and on ordinary abbreviations) —
+ * measured 31% styling compliance, traced to plain text being the tool's silent default for
+ * bodies exactly this shape.
+ */
+export function structuredTextReason(text: string): string | undefined {
+  const rawTerminators = text.match(SENTENCE_TERMINATOR)?.length ?? 0;
+  const terminators = Math.max(0, rawTerminators - countAbbreviationTerminators(text));
+  if (terminators >= 3) {
+    return `it reads as ${terminators} sentences — more than two is not plain text, per the teams-styling skill`;
+  }
+  if (BLANK_LINE.test(text)) {
+    return 'it has a blank line';
+  }
+  if (TABLE_LIKE_LINE.test(text)) {
+    return 'it has a pipe-table-looking line';
+  }
+  const nonEmptyLines = text.split('\n').filter((line) => line.trim() !== '').length;
+  if (nonEmptyLines >= MANY_LINES_THRESHOLD) {
+    return `it has ${nonEmptyLines} lines — that reads as a list, not a short reply`;
+  }
+  if (text.length > LONG_BODY_THRESHOLD) {
+    return `it is ${text.length} characters long — too long for a short reply`;
+  }
+  return undefined;
+}
+
+/**
+ * The C1 guard itself, shared by doPost/doReply/doEdit below. Only applies on the plain-text
+ * path (html === false) with no --text override — --html content is never plain text in the
+ * first place, and --text is the caller's deliberate "send it anyway" (audit fix C1,
+ * 2026-09-21: CLI entry points only, per the brief — server.ts's MCP send tools have their own,
+ * separate implementation and are untouched). `usageStyled`/`usageOverride` are the exact
+ * corrected commands to show the caller: (b) chat id FIRST, then --html — the C2 trap this skips
+ * around entirely by never taking a fixed argv position — and (c) the deliberate override.
+ */
+function assertPlainTextAllowed(
+  cli: string,
+  usageStyled: string,
+  usageOverride: string,
+  text: string,
+  html: boolean,
+  override: boolean,
+): void {
+  if (html || override) {
+    return;
+  }
+  const reason = structuredTextReason(text);
+  if (!reason) {
+    return;
+  }
+  throw new PlainTextRefusedError(
+    `${cli}: refusing to send this as plain text — ${reason}. Read the teams-styling skill before ` +
+      `composing a message like this. Resend styled: "${usageStyled}" (the chat id comes first, ` +
+      `then --html). To send this exact text as plain anyway: "${usageOverride}".`,
+  );
+}
+
+/**
  * teams-post's --html routing, pulled out of post.ts so it is unit-testable without a live
  * send: a subprocess test cannot distinguish "the --html branch runs" from "the flag was
  * ignored", because assertPostable always throws (or not) before either send path is ever
@@ -373,8 +516,22 @@ export async function doPost(
   text: string,
   html: boolean,
   mentions: readonly string[] = [],
+  options: { plainTextOverride?: boolean } = {},
 ): Promise<{ action: 'post'; id: string; chat: string }> {
+  // Allowlist gate FIRST (fix round, 2026-09-22, review item 2): the README's exit-code contract
+  // documents 3 (allowlist) as a distinct, prior failure class from 2 (usage, including this
+  // guard) — a chat that fails the allowlist gate must exit 3 regardless of what its body looks
+  // like, not be shadowed by a plain-text refusal that never even reached a chat Graph will
+  // refuse anyway.
   const entry = allowlist.assertPostable(chatId);
+  assertPlainTextAllowed(
+    'teams-post',
+    `teams-post ${chatId} --html`,
+    `teams-post ${chatId} --text`,
+    text,
+    html,
+    options.plainTextOverride ?? false,
+  );
   const resolved = await resolveMentions(chats, chatId, mentions);
   const sent = html
     ? await chats.sendHtmlMessage(chatId, text, resolved)
@@ -390,8 +547,18 @@ export async function doEdit(
   newText: string,
   html: boolean,
   mentions: readonly string[] = [],
+  options: { plainTextOverride?: boolean } = {},
 ): Promise<{ action: 'edit'; id: string; chat: string }> {
+  // Allowlist gate FIRST — same ordering rationale as doPost above.
   const entry = allowlist.assertPostable(chatId);
+  assertPlainTextAllowed(
+    'teams-edit',
+    `teams-edit ${chatId} ${messageId} --html`,
+    `teams-edit ${chatId} ${messageId} --text`,
+    newText,
+    html,
+    options.plainTextOverride ?? false,
+  );
   const resolved = await resolveMentions(chats, chatId, mentions);
   if (html) {
     await chats.editHtmlMessage(chatId, messageId, newText, resolved);
@@ -413,8 +580,18 @@ export async function doReply(
   text: string,
   html: boolean,
   mentions: readonly string[] = [],
+  options: { plainTextOverride?: boolean } = {},
 ): Promise<{ action: 'reply'; id: string; inReplyTo: string; chat: string }> {
+  // Allowlist gate FIRST — same ordering rationale as doPost above.
   const entry = allowlist.assertPostable(chatId);
+  assertPlainTextAllowed(
+    'teams-reply',
+    `teams-reply ${chatId} ${replyToMessageId} --html`,
+    `teams-reply ${chatId} ${replyToMessageId} --text`,
+    text,
+    html,
+    options.plainTextOverride ?? false,
+  );
   const resolved = await resolveMentions(chats, chatId, mentions);
   const sent = html
     ? await chats.replyToHtmlMessage(chatId, replyToMessageId, text, resolved)
@@ -577,9 +754,17 @@ export async function run(main: () => Promise<void>): Promise<void> {
     // "the ownership check refused this" without parsing stderr text. A throttled /me during that
     // same gate is NOT this: it is the package's ordinary 429-shaped GraphError and exits 1, same
     // as any other Graph failure — see assertOwnMessage's own doc comment (teams-chats.ts) for why
-    // the two are deliberately different exception types.
+    // the two are deliberately different exception types. PlainTextRefusedError (C1, 2026-09-21)
+    // shares exit 2 with usage() — it is the same class of problem (bad caller input, no network
+    // reached), not a new code.
     process.exit(
-      caught instanceof ChatNotAllowedError ? 3 : caught instanceof MessageOwnershipError ? 4 : 1,
+      caught instanceof ChatNotAllowedError
+        ? 3
+        : caught instanceof MessageOwnershipError
+          ? 4
+          : caught instanceof PlainTextRefusedError
+            ? 2
+            : 1,
     );
   }
 }

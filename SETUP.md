@@ -340,8 +340,9 @@ when to tag someone versus just naming them.
 ## The standalone CLIs
 
 Beside the server, `npm run build` produces ten commands under `dist/cli/` (also exposed as
-package bins): `teams-post [--html] [--mention "Name"]...`, `teams-reply [--html] [--mention
-"Name"]...`, `teams-edit [--html] [--mention "Name"]...`, `teams-react`, `teams-read`,
+package bins): `teams-post [--html | --text] [--mention "Name"]...`, `teams-reply [--html |
+--text] [--mention "Name"]...`, `teams-edit [--html | --text] [--mention "Name"]...`,
+`teams-react`, `teams-read`,
 `teams-pin`, `teams-unpin`, `teams-send-file <chatId> <path> [more paths...] [--caption "text"]`,
 `teams-attachments <chatId> <messageId> [--list] [--name <filter>] [--out <dir>]` (download all,
 or `--list` for metadata only — see README's "Downloading attachments") and `teams-delete
@@ -351,7 +352,18 @@ Same env
 vars, same allowlist, same send-reliability code paths as the server tools. `--html` on
 `teams-post`/`teams-reply`/`teams-edit` posts stdin as raw HTML verbatim, same contract as
 `format: 'html'` above; `--mention "Name"` (repeatable) works the same as the `mentions` tool
-parameter.
+parameter. Flags parse anywhere in argv (0.7.2) — the chat id is whichever positional survives
+flag parsing, not a fixed argv slot, so `--html`/`--text` can come before or after it; a chat id
+that still looks like a flag is refused. `--text` (0.7.2) is the deliberate override for the
+plain-text guard: given a plain body (`--html` not set) that reads as three-or-more real
+sentences (a terminator followed by whitespace/end, excluding a short fixed abbreviation list —
+`e.g.`/`i.e.`/`kl.`/`No.`), has a blank line, has a REAL pipe-table-looking line (starts AND ends
+with a pipe — not any line with pipes, so a shell pipeline doesn't count), or is 4+ non-empty
+lines or over 400 characters on its own, `teams-post`/`teams-reply`/`teams-edit` refuse to send
+it (exit 2, naming the `teams-styling` skill and the correct invocation) unless `--text` is
+given — see README's "The standalone CLIs" for the full contract. `--html` and `--text` together
+is an error; the guard runs after the allowlist gate. `teams-read`'s output also carries each message's `format`
+(`"html"`/`"text"`, from Graph's `contentType`) alongside the existing flattened `text` field.
 `teams-send-file` sends one or more local files (`--caption`, optional, shown on the first file
 only), streaming one JSON line to stdout as EACH file lands rather than buffering until the whole
 batch finishes — see README's "The standalone CLIs" for why a mid-batch failure still needs the
