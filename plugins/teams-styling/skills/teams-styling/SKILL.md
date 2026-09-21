@@ -171,16 +171,29 @@ sufficient; deterministic enforcement is required alongside it, at two points:
   without `--html`/`format: 'html'` unless the caller passes an explicit `--text` override, from
   the version that ships the guard onward. This is the one enforcement that reaches every
   consumer automatically and holds regardless of model, session or harness.
-- **A `PreToolUse` deny hook on `Bash` in the consuming project** — match
-  `(post|reply|edit)\.mjs`, deny when `--html` is absent and the body is over the threshold, and
-  name this skill in the denial text together with the correct argument order (the chat id is
-  positional-first, so `post.mjs --html <chat>` parses `--html` as the chat id). This is the only
-  fix that carries the rule into context at the failing instant. A hook template will ship with
-  this plugin in a later version; until then, write it against the consuming project's own hook
-  conventions.
+- **A `PreToolUse` deny hook on `Bash`** — matches `(post|reply|edit)\.mjs` and the
+  `teams-post`/`teams-reply`/`teams-edit` CLI names, denies when neither `--html` nor `--text` is
+  on the send's own line and the body reads as structured text, and names this skill in the
+  denial text together with the correct argument order (the chat id is positional-first, so
+  `post.mjs --html <chat>` parses `--html` as the chat id). This is the only fix that carries the
+  rule into context at the failing instant. **From 0.2.0 this plugin ships that hook** —
+  `hooks/enforce-teams-styling.sh`, registered by `hooks/hooks.json`, carrying the same
+  classifier as the CLI guard so it never denies what the tool would allow. No per-project hook
+  installation is needed any more.
 
 With the mandate line but neither enforcement point, expect agents to fall back to plain-text
 walls roughly two times in three.
+
+**How the shipped hook takes effect.** Plugin hooks are registered **when a session starts** (or
+on `/reload-plugins`) — never live. Installing or upgrading to 0.2.0 mid-session does nothing to
+that session; the hook fires from the next one. Plugin hooks **merge** with any project or user
+`settings.json` hooks rather than replacing them: every matching hook runs, and a single deny
+from any of them blocks the call. A project that hand-installed the earlier copy of this hook is
+therefore safe running both — it should remove its local copy and the matching `settings.json`
+entry once it has confirmed in a fresh session that the plugin hook fires, so there is one source
+of truth. The hook needs `jq` on `PATH`, and its own test battery lives beside it at
+`hooks/tests/hook-teams-styling-cases.sh` (19 cases; run it from the installed cache copy to
+verify an upgrade).
 
 **Where that line lives — and nothing of this package beside it.** No package artifact goes
 into a customer's repository: this skill is read from the plugin cache, and everything a
